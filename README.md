@@ -52,7 +52,7 @@ work on booting can start as soon as one is available to a developer.
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
 | PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, checked on one GPU. No shader views, pipelines, draws or swapchain yet ([plan](docs/d3d12_vulkan.md)) |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, frames are presented to a window (milestone M0 passes in a synthetic test), and compute and graphics pipelines dispatch and draw with root arguments through a GPU address arena (milestone M1 passes with stand-in shaders), checked on one GPU. No bindless descriptors yet (so translated game shaders that declare bindings are refused), and the game's own present call is not hooked up ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build

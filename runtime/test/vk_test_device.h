@@ -19,11 +19,16 @@ inline unsigned& validation_error_count() {
     return count;
 }
 
+// Only validation-type errors fail a test. General messages come from the loader and the layers around the
+// application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
+// general error that says nothing about this code, so it is printed but not counted.
 inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                    VkDebugUtilsMessageTypeFlagsEXT,
+                                                    VkDebugUtilsMessageTypeFlagsEXT types,
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
-    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ++validation_error_count();
-    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+    const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
+    if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) ++validation_error_count();
+    std::fprintf(stderr, "%s: %s\n", validation ? "validation" : "vulkan (not counted)",
+                 data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
 
@@ -80,7 +85,8 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() {
+    // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
+    bool create(bool presentation = false) {
         instance_proc = load_vulkan();
         if (!instance_proc) return false;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
@@ -110,6 +116,11 @@ public:
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instance_info.pApplicationInfo = &app;
+        std::vector<const char*> extensions;
+        if (presentation) {
+            extensions.push_back("VK_KHR_surface");
+            extensions.push_back("VK_KHR_win32_surface");
+        }
         if (validation) {
             std::uint32_t count = 0;
             enumerate_layers(&count, nullptr);
@@ -124,9 +135,10 @@ public:
             instance_info.pNext = &messenger_info;
             instance_info.enabledLayerCount = 1;
             instance_info.ppEnabledLayerNames = &layer;
-            instance_info.enabledExtensionCount = 1;
-            instance_info.ppEnabledExtensionNames = &debug_utils;
+            extensions.push_back(debug_utils);
         }
+        instance_info.enabledExtensionCount = std::uint32_t(extensions.size());
+        instance_info.ppEnabledExtensionNames = extensions.data();
         if (create_instance(&instance_info, nullptr, &instance) != VK_SUCCESS) return false;
         if (validation &&
             instance_fn<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(
@@ -171,7 +183,7 @@ public:
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features12};
         instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &features);
         if (!features13.dynamicRendering || !features13.synchronization2 || !features12.timelineSemaphore ||
-            !features12.separateDepthStencilLayouts) {
+            !features12.separateDepthStencilLayouts || !features12.bufferDeviceAddress) {
             std::fprintf(stderr, "the device lacks dynamicRendering, synchronization2, timelineSemaphore or "
                                  "separateDepthStencilLayouts\n");
             return false;
@@ -182,6 +194,7 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        enable12.bufferDeviceAddress = VK_TRUE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -195,6 +208,11 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
+        const char* swapchain = "VK_KHR_swapchain";
+        if (presentation) {
+            device_info.enabledExtensionCount = 1;
+            device_info.ppEnabledExtensionNames = &swapchain;
+        }
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");

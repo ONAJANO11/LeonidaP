@@ -130,7 +130,7 @@ int main() {
         group.NumBarriers = 1;
         group.pTextureBarriers = &texture;
         list->Barrier(1, &group);
-        list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
+        list->SetMarker(0, nullptr, 0);  // not implemented: reported once by its generated stub, recording continues
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 
