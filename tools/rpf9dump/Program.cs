@@ -4,7 +4,19 @@ using System.Diagnostics;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir>"); return 2; }
+if (args.Length < 3)
+{
+    Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir>");
+    Console.WriteLine("models options: --skeleton-system <system-page-file> --skeleton-drawable-offset <decimal-offset>");
+    return 2;
+}
+SkeletonExport? skeletonExport;
+try { skeletonExport = SkeletonExport.FromArguments(args); }
+catch (Exception ex) when (ex is ArgumentException or InvalidDataException or IOException or UnauthorizedAccessException)
+{
+    Console.Error.WriteLine(ex.Message);
+    return 2;
+}
 string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
@@ -133,7 +145,11 @@ else if (mode is "models" or "textures")
                     continue;
                 }
                 string obj = Path.Combine(sub, stem + ".obj");
+                // Resolve the complete model before creating any sidecar or geometry output.
+                object? skeletonMetadata = skeletonExport?.CreateMetadata(m);
                 if (!File.Exists(obj)) Util.WriteAllText(obj, RageModelDecoder.CreateObj(m));
+                if (skeletonMetadata is not null)
+                    SkeletonExport.WriteMetadata(Path.Combine(sub, stem + ".skeleton.json"), skeletonMetadata, json);
                 if (m.EmbeddedTextures != null && m.EmbeddedTextureDictionaryOffset is int dOff)
                 {
                     string td = Path.Combine(sub, stem + "_tex"); Directory.CreateDirectory(td);
@@ -183,4 +199,4 @@ else if (mode is "models" or "textures")
     File.Move(partial, manifestPath, true);
 }
 Console.WriteLine($"{mode} {baseName}: ok={ok} fail={fail} skip={skip} in {sw.Elapsed.TotalSeconds:0}s");
-return 0;
+return skeletonExport is not null && fail > 0 ? 1 : 0;

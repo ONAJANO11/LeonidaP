@@ -64,6 +64,14 @@ jobs:
           cmake --build runtime/build --config RelWithDebInfo
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
+      - name: Synthetic exporter and skeleton checks
+        run: |
+          dotnet run --project tests/Rpf9DumpDiagnostics -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet run --project tests/Rpf9DumpSkeletonExport -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet run --project third_party/rpf9-explorer/Tests/SkeletonSmoke -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: No game data tracked
         shell: bash
         run: |
