@@ -19,6 +19,7 @@
 #include <iterator>
 #include <map>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -39,6 +40,60 @@ void log_once(const char* what, int value) {
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
+
+// make_game.py puts the pipeline checker's cache next to gta6rt.exe. Use that location even when the process
+// was started with a different working directory.
+std::filesystem::path pipeline_cache_path() {
+    std::wstring path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
+    if (!length || length >= path.size()) return {};
+    path.resize(length);
+    return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
+}
+
+// Corpus caches can be several GiB. Map the file read-only to avoid copying it into an equally large vector
+// before handing it to the driver. Keep the file open without write sharing while Vulkan reads the mapping.
+class PipelineCacheFile {
+public:
+    explicit PipelineCacheFile(const std::filesystem::path& path) {
+        if (path.empty()) return;
+        file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER length{};
+        if (!GetFileSizeEx(file_, &length) || length.QuadPart < LONGLONG(sizeof(VkPipelineCacheHeaderVersionOne)))
+            return;
+        const HANDLE mapping = CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!mapping) return;
+        data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mapping);
+        if (data) size = std::size_t(length.QuadPart);
+    }
+
+    ~PipelineCacheFile() {
+        if (data) UnmapViewOfFile(data);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+
+    PipelineCacheFile(const PipelineCacheFile&) = delete;
+    PipelineCacheFile& operator=(const PipelineCacheFile&) = delete;
+
+    bool compatible(const VkPhysicalDeviceProperties& properties) const {
+        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
+        if (!data) return false;
+        VkPipelineCacheHeaderVersionOne header{};
+        std::memcpy(&header, data, sizeof(header));  // Windows x64 and the cache header are both little-endian
+        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+               header.vendorID == properties.vendorID && header.deviceID == properties.deviceID &&
+               std::memcmp(header.pipelineCacheUUID, properties.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+    }
+
+    const void* data = nullptr;
+    std::size_t size = 0;
+
+private:
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+};
 
 struct Format {
     VkFormat format = VK_FORMAT_UNDEFINED;
@@ -119,6 +174,38 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
+
+    std::once_flag pipeline_cache_once;
+    VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
+
+    VkPipelineCache pipeline_cache() {
+        std::call_once(pipeline_cache_once, [&] {
+            auto& vk = context->vk;
+            if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
+            const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+            const PipelineCacheFile seed(pipeline_cache_path());
+            if (seed.data && get_properties) {
+                VkPhysicalDeviceProperties properties{};
+                get_properties(info.physical, &properties);
+                if (seed.compatible(properties)) {
+                    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                                           nullptr, 0, seed.size, seed.data};
+                    if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) == VK_SUCCESS) {
+                        std::fprintf(stderr, "[rt] d3d12: seeded the Vulkan pipeline cache with %zu bytes\n", seed.size);
+                        return;
+                    }
+                    std::fprintf(stderr, "[rt] d3d12: Vulkan declined the pipeline cache seed\n");
+                } else {
+                    std::fprintf(stderr, "[rt] d3d12: pipeline_cache.bin does not match this Vulkan device\n");
+                }
+            }
+            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+                pipeline_cache_handle = VK_NULL_HANDLE;
+        });
+        return pipeline_cache_handle;
+    }
 
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
@@ -844,7 +931,8 @@ public:
         info.pColorBlendState = &blend;
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
-        if (vk.vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &graphics_.pipeline) != VK_SUCCESS)
+        if (vk.vkCreateGraphicsPipelines(dev, device_.pipeline_cache(), 1, &info, nullptr, &graphics_.pipeline) !=
+            VK_SUCCESS)
             return E_FAIL;
 
         if (code_stage) {
@@ -911,7 +999,7 @@ public:
         pipeline_info.stage.module = module_;
         pipeline_info.stage.pName = "main";
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
+        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
             VK_SUCCESS)
             return E_FAIL;
 
@@ -1032,6 +1120,8 @@ public:
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
         }
+        if (state_.pipeline_cache_handle)
+            state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);

@@ -642,9 +642,13 @@ Pipeline creation:
   buffer device address, storage image without format, maintenance8.
 - Request `requiredSubgroupSize = 64` for wave64 shaders when `VK_EXT_subgroup_size_control` offers it (AMD).
   Otherwise use the translator's 32-wide approximation and say so in the log.
-- Pipeline caches: use a `VkPipelineCache` keyed by driver/pipeline-cache UUID; the `pipelines` build stage already
-  produces one. D3D12 `CachedPSO` blobs are driver-specific and are ignored (the PSO is rebuilt from its
-  descriptors). `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan cache.
+- Graphics and compute PSO creation share one `VkPipelineCache` per device. The first PSO seeds it from
+  `pipeline_cache.bin` next to `gta6rt.exe`, which the `pipelines` build stage produces. The cache starts empty if
+  the seed is missing, invalid, or from another GPU or driver. Entries can be reused when the pipeline creation
+  state matches. The checker uses the runtime layout for descriptor-free compute shaders that don't need a
+  non-default subgroup size. Graphics entries built with stub partners depend on the actual draw pipeline state.
+  The runtime reads the cache without updating it. D3D12 `CachedPSO` blobs are ignored and `ID3D12PipelineLibrary`
+  remains open.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

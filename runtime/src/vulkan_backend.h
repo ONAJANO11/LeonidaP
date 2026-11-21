@@ -58,12 +58,13 @@ struct VulkanDeviceFunctions {
     X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
     X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                    \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices; everything else is required.
+    // Vulkan 1.3 features, graphics pipelines and pipeline caches use optional entry points.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
