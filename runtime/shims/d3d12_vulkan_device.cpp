@@ -4,6 +4,12 @@
 // itself once. See docs/d3d12_vulkan.md section 4.1/4.2 for what each answer means and what is still open.
 #include "d3d12_com.h"
 
+#include "../src/descriptor_handles.h"  // slot arithmetic and dirty ranges (P0/P1)
+#include "../src/descriptor_views.h"    // D3D12 view descriptions -> GFX10 T#/V#
+#include "../src/bindless_registry.h"   // key -> bindless index
+#include "../src/retirement.h"          // fence-value deferred release
+#include "../src/vulkan_bindless.h"     // set 0: images, samplers, descriptor table
+#include "../src/descriptor_sizes.h"    // per-type slot sizes
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 #include "d3d12_xs_device.h"
@@ -21,10 +27,11 @@
 namespace rt::d3d12 {
 namespace {
 
-// Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
-// increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
-constexpr UINT kDescriptorSize = 32;
-static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
+// Slot sizes are per heap type (descriptor_sizes.h): a sampler heap no longer shares the CBV/SRV/UAV stride.
+// The console's own increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the
+// device, and GetDescriptorHandleIncrementSize answers per type. The RTV/DSV payload is our own TargetView.
+static_assert(sizeof(leonida::TargetView) <= rt::d3d12::kDescriptorSlotBytesRtv);
+static_assert(sizeof(leonida::TargetView) <= rt::d3d12::kDescriptorSlotBytesDsv);
 
 void log_once(const char* what, int value) {
     static std::mutex mutex;
@@ -105,6 +112,8 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+class DescriptorHeap;  // defined below; DeviceState only keeps the registry
+
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
     VulkanDeviceInfo info;
@@ -143,6 +152,26 @@ struct DeviceState {
         }
         return VK_NULL_HANDLE;
     }
+
+    // Every live descriptor heap, so a CPU handle maps back to its stride and dirty range. Heaps register in their
+    // constructor and unregister in their destructor; a lookup holds the lock only for the scan.
+    std::mutex descriptor_heaps_mutex;
+    std::vector<DescriptorHeap*> descriptor_heaps;
+
+    // The console GPU VA space: one linear arena for now, so a resource can hand a valid address to a descriptor.
+    // Reserving a real range and growing it at a frame boundary is docs/d3d12_vulkan.md section 3.3's plan.
+    // Set 0 for every pipeline: images, samplers and the descriptor hash table. Created once the device exists.
+    std::unique_ptr<leonida::BindlessSet> bindless;
+    leonida::BindlessRegistry bindless_registry;
+    leonida::RetirementQueue retirement;
+
+    std::uint64_t next_console_va = 0x100000000ull;
+    std::uint64_t allocate_va(std::uint64_t bytes) {
+        const std::uint64_t aligned = (std::max<std::uint64_t>(bytes, 0x10000) + 0xFFFF) & ~std::uint64_t(0xFFFF);
+        const std::uint64_t va = next_console_va;
+        next_console_va += aligned;
+        return va;
+    }
 };
 
 class DescriptorHeap final
@@ -152,23 +181,96 @@ public:
     // {4a7d2c90-5e1b-4f63-8c0a-91d3b6e2f417}
     static constexpr GUID kTag{0x4a7d2c90, 0x5e1b, 0x4f63, {0x8c, 0x0a, 0x91, 0xd3, 0xb6, 0xe2, 0xf4, 0x17}};
 
-    explicit DescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC& desc)
-        : desc_(desc), storage_(new std::byte[std::size_t(desc.NumDescriptors) * kDescriptorSize]()) {}
+    DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc)
+        : device_(device), desc_(desc), stride_(rt::d3d12::descriptor_slot_bytes(desc.Type)),
+          storage_(new std::byte[slot_bytes(desc)]()) {
+        std::lock_guard lock(device_.descriptor_heaps_mutex);
+        device_.descriptor_heaps.push_back(this);
+    }
+
+    ~DescriptorHeap() override {
+        std::lock_guard lock(device_.descriptor_heaps_mutex);
+        auto& heaps = device_.descriptor_heaps;
+        heaps.erase(std::remove(heaps.begin(), heaps.end(), this), heaps.end());
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
     D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetCPUDescriptorHandleForHeapStart() override {
         return {reinterpret_cast<SIZE_T>(storage_.get())};
     }
-    // Shader-visible heaps get a GPU handle; descriptor tables that read it are not implemented yet.
+    // Shader-visible heaps get a GPU handle; the console-visible arena/VGPR mapping is P0's next step, so the host
+    // pointer stays a placeholder here (docs/d3d12_vulkan.md:337-341).
     D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE GetGPUDescriptorHandleForHeapStart() override {
         if (!(desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)) return {0};
         return {reinterpret_cast<UINT64>(storage_.get())};
     }
 
+    UINT stride() const { return stride_; }
+    UINT slot_count() const { return desc_.NumDescriptors; }
+    D3D12_DESCRIPTOR_HEAP_TYPE type() const { return desc_.Type; }
+    std::uint8_t* base() const { return reinterpret_cast<std::uint8_t*>(storage_.get()); }
+
+    // True when `ptr` is slot-aligned inside this heap; `slot` receives the slot number.
+    bool slot_of(const void* ptr, std::uint32_t* slot) const {
+        return rt::d3d12::slot_index(reinterpret_cast<std::uintptr_t>(ptr),
+                                     reinterpret_cast<std::uintptr_t>(storage_.get()), desc_.NumDescriptors, stride_,
+                                     slot);
+    }
+    bool contains(const void* ptr) const { return slot_of(ptr, nullptr); }
+
+    // Marks [first, first + count) as written since the last bindless scan; copies and view creation call it.
+    void mark_dirty(std::uint32_t first, std::uint32_t count) {
+        if (!count || !stride_) return;
+        const std::uint32_t last = std::min(desc_.NumDescriptors, first + count);
+        if (last <= first) return;
+        std::lock_guard lock(dirty_mutex_);
+        dirty_ = rt::d3d12::merge(dirty_, rt::d3d12::slot_range(first, last - first));
+    }
+    rt::d3d12::DirtyRange dirty() const {
+        std::lock_guard lock(dirty_mutex_);
+        return dirty_;
+    }
+    void clear_dirty() {
+        std::lock_guard lock(dirty_mutex_);
+        dirty_ = {};
+    }
+
+    // Copies `count` slots of this heap into `source` (P1: CopyDescriptors goes through here so the destination
+    // stride is the heap's, never the CBV/SRV/UAV default). Bounds are checked against the heap.
+    bool copy_slots(std::uint32_t first, const std::uint8_t* source, std::uint32_t count) {
+        std::size_t bytes = 0;
+        if (!rt::d3d12::slot_run_bytes(count, stride_, &bytes) || !bytes) return false;
+        const std::uint64_t offset = std::uint64_t(first) * stride_;
+        if (offset + bytes > std::uint64_t(desc_.NumDescriptors) * stride_) return false;
+        std::memmove(base() + offset, source, bytes);
+        mark_dirty(first, count);
+        return true;
+    }
+
 private:
+    static std::size_t slot_bytes(const D3D12_DESCRIPTOR_HEAP_DESC& desc) {
+        // CreateDescriptorHeap rejects a 0 stride before constructing, so this is never 0 in practice; the max keeps
+        // the allocation non-empty for a defensive caller.
+        return std::max<std::size_t>(1, std::size_t(desc.NumDescriptors) * rt::d3d12::descriptor_slot_bytes(desc.Type));
+    }
+
+    DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
+    UINT stride_ = 0;
     std::unique_ptr<std::byte[]> storage_;
+    mutable std::mutex dirty_mutex_;
+    rt::d3d12::DirtyRange dirty_;
 };
+
+// The heap that owns a CPU descriptor handle, or nullptr. The pointer stays valid for one call: D3D12 does not
+// destroy a heap while a copy or a view creation uses its handles.
+inline DescriptorHeap* heap_of(DeviceState& state, const void* ptr) {
+    std::lock_guard lock(state.descriptor_heaps_mutex);
+    for (DescriptorHeap* heap : state.descriptor_heaps) {
+        if (heap->contains(ptr)) return heap;
+    }
+    return nullptr;
+}
 
 class Resource final
     : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
@@ -178,7 +280,9 @@ public:
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags),
+          console_va_(device.allocate_va(std::max<std::uint64_t>(desc.Width * std::max<UINT>(desc.Height, 1),
+                                                                0x10000))) {}
 
     ~Resource() override {
         auto& vk = device_.context->vk;
@@ -191,6 +295,8 @@ public:
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
+    std::uint64_t console_va() const { return console_va_; }
+    UINT64 STDMETHODCALLTYPE GetGPUVirtualAddress() override { return console_va_; }
 
     HRESULT create_buffer() {
         auto& vk = device_.context->vk;
@@ -309,6 +415,7 @@ private:
     D3D12_RESOURCE_DESC desc_;
     D3D12_HEAP_PROPERTIES heap_;
     D3D12_HEAP_FLAGS heap_flags_;
+    std::uint64_t console_va_ = 0;
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
@@ -423,13 +530,14 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!desc || !desc->NumDescriptors) return E_INVALIDARG;
-        auto* heap = new DescriptorHeap(*desc);
+        if (!rt::d3d12::descriptor_slot_bytes(desc->Type)) return E_INVALIDARG;  // no slot size, no heap
+        auto* heap = new DescriptorHeap(state_, *desc);
         heap->attach_device(identity());
         return hand_out(heap, riid, out);
     }
 
-    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        return kDescriptorSize;
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        return rt::d3d12::descriptor_slot_bytes(type);
     }
 
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
@@ -480,38 +588,193 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
     }
 
+    // ---- CBV/SRV/UAV views (P2 slice): encode the GFX10 descriptor and write the heap slot ----
+
+    // Writes an 8-dword T#/V# into a CBV/SRV/UAV heap slot and marks it dirty for the bindless scan. The view's
+    // registration in bindless set 0 (VkImageView/buffer index) belongs to the #157 work; this writes what a shader
+    // reads from a descriptor table.
+    bool write_view(D3D12_CPU_DESCRIPTOR_HANDLE destination, const void* words, std::size_t bytes) {
+        if (!destination.ptr) return false;
+        DescriptorHeap* heap = heap_of(state_, reinterpret_cast<const void*>(destination.ptr));
+        std::uint32_t slot = 0;
+        if (!heap || heap->type() != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            !heap->slot_of(reinterpret_cast<const void*>(destination.ptr), &slot)) {
+            log_once("descriptor write outside a CBV/SRV/UAV heap", 0);
+            return false;
+        }
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), words, std::min(bytes, std::size_t(heap->stride())));
+        heap->mark_dirty(slot, 1);
+        return true;
+    }
+
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!desc) return;
+        leonida::gfx10::BufferWords words{};
+        if (!rt::d3d12::views::encode_cbv(desc->BufferLocation, desc->SizeInBytes, words))
+            log_once("constant buffer view rejected, size", int(desc->SizeInBytes));
+        else
+            write_view(destination, words.data(), sizeof(words));
+    }
+
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
+                                                    const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r || !desc) return;
+        const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+        const VkFormat view_format =
+            vulkan_format(desc->Format == DXGI_FORMAT_UNKNOWN ? rd.Format : desc->Format, false).format;
+        if (desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
+            leonida::gfx10::BufferWords words{};
+            const rt::d3d12::views::BufferResource buffer{r->console_va(), rd.Width};
+            if (rt::d3d12::views::encode_buffer_srv(*desc, buffer, view_format, words))
+                write_view(destination, words.data(), sizeof(words));
+            else
+                log_once("buffer SRV not encoded, format", int(desc->Format));
+            return;
+        }
+        leonida::gfx10::ImageWords words{};
+        rt::d3d12::views::TextureResource texture{};
+        texture.address = r->console_va();
+        texture.width = static_cast<std::uint32_t>(rd.Width);
+        texture.height = rd.Height;
+        texture.depth = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? rd.DepthOrArraySize : 1;
+        texture.mip_levels = rd.MipLevels;
+        texture.array_layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize;
+        texture.samples = std::max(rd.SampleDesc.Count, 1u);
+        if (rt::d3d12::views::encode_texture_srv(*desc, texture, view_format, words))
+            write_view(destination, words.data(), sizeof(words));
+        else
+            log_once("texture SRV not encoded, dimension", int(desc->ViewDimension));
+    }
+
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource,
+                                                     ID3D12Resource* counter_resource,
+                                                     const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (counter_resource) log_once("UAV counter resources are not bound yet", 0);
+        const Resource* r = Resource::from<Resource>(resource);
+        if (!r || !desc) return;
+        const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+        const VkFormat view_format =
+            vulkan_format(desc->Format == DXGI_FORMAT_UNKNOWN ? rd.Format : desc->Format, false).format;
+        if (desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
+            leonida::gfx10::BufferWords words{};
+            const rt::d3d12::views::BufferResource buffer{r->console_va(), rd.Width};
+            if (rt::d3d12::views::encode_buffer_uav(*desc, buffer, view_format, words))
+                write_view(destination, words.data(), sizeof(words));
+            else
+                log_once("buffer UAV not encoded, format", int(desc->Format));
+            return;
+        }
+        leonida::gfx10::ImageWords words{};
+        rt::d3d12::views::TextureResource texture{};
+        texture.address = r->console_va();
+        texture.width = static_cast<std::uint32_t>(rd.Width);
+        texture.height = rd.Height;
+        texture.depth = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? rd.DepthOrArraySize : 1;
+        texture.mip_levels = rd.MipLevels;
+        texture.array_layers = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : rd.DepthOrArraySize;
+        texture.samples = std::max(rd.SampleDesc.Count, 1u);
+        if (rt::d3d12::views::encode_texture_uav(*desc, texture, view_format, words))
+            write_view(destination, words.data(), sizeof(words));
+        else
+            log_once("texture UAV not encoded, dimension", int(desc->ViewDimension));
+    }
     // A descriptor is its slot's bytes (a TargetView in RTV and DSV heaps, otherwise what the shader loads), so a
     // copy is a byte copy. D3D12 walks the destination and source ranges together, one descriptor at a time; a
     // null size array means every range holds one descriptor. Whichever side runs out first ends the copy.
     void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
                                            const UINT* destination_sizes, UINT source_ranges,
                                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
-                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type) override {
         if (!destinations || !sources) return;
+        const UINT type_stride = rt::d3d12::descriptor_slot_bytes(type);
+        if (!type_stride) return;  // an unknown heap type has no slot size
         UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
         while (d < destination_ranges && s < source_ranges) {
-            if (d_at >= (destination_sizes ? destination_sizes[d] : 1) || !destinations[d].ptr) {
+            const UINT d_size = destination_sizes ? destination_sizes[d] : 1;
+            const UINT s_size = source_sizes ? source_sizes[s] : 1;
+            if (d_at >= d_size || !destinations[d].ptr) {
                 ++d;
                 d_at = 0;
-            } else if (s_at >= (source_sizes ? source_sizes[s] : 1) || !sources[s].ptr) {
+                continue;
+            }
+            if (s_at >= s_size || !sources[s].ptr) {
                 ++s;
                 s_at = 0;
-            } else {
-                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
-                             kDescriptorSize);
+                continue;
+            }
+            DescriptorHeap* destination_heap = heap_of(state_, reinterpret_cast<const void*>(destinations[d].ptr));
+            DescriptorHeap* source_heap = heap_of(state_, reinterpret_cast<const void*>(sources[s].ptr));
+            std::uint32_t d_slot = 0, s_slot = 0;
+            if (!destination_heap || !source_heap ||
+                !destination_heap->slot_of(reinterpret_cast<const void*>(destinations[d].ptr), &d_slot) ||
+                !source_heap->slot_of(reinterpret_cast<const void*>(sources[s].ptr), &s_slot)) {
+                ++d;
+                d_at = 0;  // a handle outside every heap: nothing to copy, advance both sides by one range
+                ++s;
+                s_at = 0;
+                continue;
+            }
+            const UINT copied = rt::d3d12::copy_slots_between(
+                destination_heap->base(), destination_heap->slot_count(), d_slot, source_heap->base(),
+                source_heap->slot_count(), s_slot, destination_heap->stride(), std::min(d_size - d_at, s_size - s_at));
+            if (!copied) {
+                ++d;
+                d_at = 0;
+                ++s;
+                s_at = 0;
+                continue;
+            }
+            destination_heap->mark_dirty(d_slot, copied);
+            d_at += copied;
+            s_at += copied;
+            if (d_at >= d_size) {
+                ++d;
+                d_at = 0;
+            }
+            if (s_at >= s_size) {
+                ++s;
+                s_at = 0;
             }
         }
     }
-
     void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
                                                  D3D12_CPU_DESCRIPTOR_HANDLE source,
-                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        if (!destination.ptr || !source.ptr) return;
-        std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
-                     std::size_t(count) * kDescriptorSize);
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        if (!destination.ptr || !source.ptr || !count) return;
+        const UINT type_stride = rt::d3d12::descriptor_slot_bytes(type);
+        if (!type_stride) return;
+        DescriptorHeap* destination_heap = heap_of(state_, reinterpret_cast<const void*>(destination.ptr));
+        std::uint32_t d_slot = 0;
+        if (destination_heap &&
+            destination_heap->slot_of(reinterpret_cast<const void*>(destination.ptr), &d_slot)) {
+            const UINT stride = destination_heap->stride();
+            DescriptorHeap* source_heap = heap_of(state_, reinterpret_cast<const void*>(source.ptr));
+            std::uint32_t s_slot = 0;
+            if (source_heap && source_heap->slot_of(reinterpret_cast<const void*>(source.ptr), &s_slot)) {
+                const UINT copied = rt::d3d12::copy_slots_between(
+                    destination_heap->base(), destination_heap->slot_count(), d_slot, source_heap->base(),
+                    source_heap->slot_count(), s_slot, stride, count);
+                destination_heap->mark_dirty(d_slot, copied);
+                return;
+            }
+            // The source is not inside a known heap: copy raw bytes with the destination heap's stride.
+            const UINT n = std::min(count, destination_heap->slot_count() - d_slot);
+            std::size_t bytes = 0;
+            if (!rt::d3d12::slot_run_bytes(n, stride, &bytes)) return;
+            std::memmove(destination_heap->base() + std::size_t(d_slot) * stride,
+                         reinterpret_cast<const void*>(source.ptr), bytes);
+            destination_heap->mark_dirty(d_slot, n);
+            return;
+        }
+        // A handle outside every heap: fall back to the type stride (the slot range is unknown, so no dirty mark).
+        std::size_t bytes = 0;
+        if (!rt::d3d12::slot_run_bytes(count, type_stride, &bytes)) return;
+        std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr), bytes);
     }
-
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                                                       const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES,
                                                       const D3D12_CLEAR_VALUE*, REFIID riid, void** out) override {
@@ -755,6 +1018,20 @@ public:
 private:
     IUnknown* identity() { return outer_ ? outer_ : static_cast<ID3D12Device*>(this); }
 
+public:
+    // Set 0 and its layout for the pipeline layouts the device hands out. Null when the set could not be made.
+    VkDescriptorSet bindless_set() const { return state_.bindless ? state_.bindless->set() : VK_NULL_HANDLE; }
+    VkDescriptorSetLayout bindless_layout() const {
+        return state_.bindless ? state_.bindless->layout() : VK_NULL_HANDLE;
+    }
+    leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
+    leonida::RetirementQueue& retirement() { return state_.retirement; }
+
+    void create_bindless(PFN_vkGetDeviceProcAddr get_device_proc) {
+        if (state_.bindless || !get_device_proc) return;
+        state_.bindless = std::make_unique<leonida::BindlessSet>(get_device_proc, state_.info.device, state_.memory);
+    }
+
     DeviceState state_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
@@ -770,6 +1047,9 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
         device->Release();
         return E_FAIL;
     }
+    const auto get_device_proc =
+        reinterpret_cast<PFN_vkGetDeviceProcAddr>(info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+    device->create_bindless(get_device_proc);
     return hand_out(device, riid, out);
 }
 

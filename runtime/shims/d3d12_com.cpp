@@ -86,6 +86,50 @@ public:
         return S_OK;
     }
 
+    // Descriptor binding (P4): record the bound heaps and root tables in the command-list IR. Draws do not exist yet,
+    // so the replay validates these and emits nothing; the state is what the first draw will consume.
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT count, ID3D12DescriptorHeap* const* heaps) override {
+        if (!count || !heaps) {
+            check(false);
+            return;
+        }
+        std::vector<std::uintptr_t> ids;
+        ids.reserve(count);
+        for (UINT i = 0; i < count; ++i) ids.push_back(reinterpret_cast<std::uintptr_t>(heaps[i]));
+        check(list_.set_descriptor_heaps(ids));
+    }
+
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* pipeline_state) override {
+        if (pipeline_state) check(list_.set_pipeline_state(reinterpret_cast<std::uintptr_t>(pipeline_state)));
+    }
+
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* root_signature) override {
+        if (root_signature) check(list_.set_graphics_root_signature(reinterpret_cast<std::uintptr_t>(root_signature)));
+    }
+
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* root_signature) override {
+        if (root_signature) check(list_.set_compute_root_signature(reinterpret_cast<std::uintptr_t>(root_signature)));
+    }
+
+    void STDMETHODCALLTYPE DrawInstanced(UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex,
+                                         UINT start_instance) override {
+        check(list_.draw_instanced(vertex_count_per_instance, instance_count, start_vertex, start_instance));
+    }
+
+    void STDMETHODCALLTYPE DrawIndexedInstanced(UINT index_count_per_instance, UINT instance_count, UINT start_index,
+                                                INT base_vertex, UINT start_instance) override {
+        check(list_.draw_indexed_instanced(index_count_per_instance, instance_count, start_index, base_vertex,
+                                           start_instance));
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT root_parameter,
+                                                          D3D12_GPU_DESCRIPTOR_HANDLE base) override {
+        check(list_.set_graphics_root_descriptor_table(root_parameter, base.ptr));
+    }
+
+    void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT root_parameter,
+                                                         D3D12_GPU_DESCRIPTOR_HANDLE base) override {
+        check(list_.set_compute_root_descriptor_table(root_parameter, base.ptr));
+    }
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];

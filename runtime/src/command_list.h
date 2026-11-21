@@ -296,9 +296,61 @@ struct ClearDepthStencil {
     std::vector<Rect> rects;
 };
 
+// Descriptor binding state (docs/d3d12_vulkan.md section 3.4). A heap is identified by its COM object pointer, a
+// table by the GPU descriptor handle D3D12 handed out; the IR stays free of Windows and Vulkan types. The replay
+// resolves the handles to heaps and descriptors; until draws exist the commands are recorded and validated only.
+inline constexpr std::uint32_t max_descriptor_heaps = 2;  // D3D12 allows one CBV/SRV/UAV and one sampler heap
+inline constexpr std::uint32_t max_root_parameters = 64;
+
+struct SetDescriptorHeaps {
+    std::vector<std::uintptr_t> heaps;
+};
+
+struct SetGraphicsRootDescriptorTable {
+    std::uint32_t root_parameter;
+    std::uint64_t base_descriptor;
+};
+
+struct SetComputeRootDescriptorTable {
+    std::uint32_t root_parameter;
+    std::uint64_t base_descriptor;
+};
+
+// Pipeline state and root signature binding, and the first draw commands (milestone M1). Objects are opaque ids
+// here; replay resolves them once the pipeline cache exists. A draw without a bound PSO or root signature is the
+// caller's bug and is rejected, not recorded.
+struct SetPipelineState {
+    std::uintptr_t pipeline_state;
+};
+
+struct SetGraphicsRootSignature {
+    std::uintptr_t root_signature;
+};
+
+struct SetComputeRootSignature {
+    std::uintptr_t root_signature;
+};
+
+struct DrawInstanced {
+    std::uint32_t vertex_count_per_instance;
+    std::uint32_t instance_count;
+    std::uint32_t start_vertex;
+    std::uint32_t start_instance;
+};
+
+struct DrawIndexedInstanced {
+    std::uint32_t index_count_per_instance;
+    std::uint32_t instance_count;
+    std::uint32_t start_index;
+    std::int32_t base_vertex;
+    std::uint32_t start_instance;
+};
+
 using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, GlobalBarrier, BufferBarrier,
                              TextureBarrier, ClearRenderTarget, ClearDepthStencil, CopyBuffer, CopyTexture,
-                             CopyResource, ResolveSubresource>;
+                             CopyResource, ResolveSubresource, SetDescriptorHeaps, SetGraphicsRootDescriptorTable,
+                             SetComputeRootDescriptorTable, SetPipelineState, SetGraphicsRootSignature,
+                             SetComputeRootSignature, DrawInstanced, DrawIndexedInstanced>;
 
 class CommandList {
 public:
@@ -382,6 +434,60 @@ public:
         return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
+    // Sets the bound descriptor heaps (one or two, no null or duplicate entries). D3D12 allows at most one
+    // CBV/SRV/UAV heap and one sampler heap at a time.
+    bool set_descriptor_heaps(std::span<const std::uintptr_t> heaps) {
+        if (closed_ || heaps.empty() || heaps.size() > max_descriptor_heaps) return false;
+        for (std::size_t i = 0; i < heaps.size(); ++i) {
+            if (!heaps[i]) return false;
+            for (std::size_t j = 0; j < i; ++j)
+                if (heaps[j] == heaps[i]) return false;  // the same heap twice is not a second heap
+        }
+        return append(SetDescriptorHeaps{{heaps.begin(), heaps.end()}});
+    }
+
+    // A root descriptor table: the root parameter index must fit D3D12's 64 and the GPU handle must be non-zero.
+    bool set_graphics_root_descriptor_table(std::uint32_t root_parameter, std::uint64_t base_descriptor) {
+        if (closed_ || root_parameter >= max_root_parameters || !base_descriptor) return false;
+        return append(SetGraphicsRootDescriptorTable{root_parameter, base_descriptor});
+    }
+
+    bool set_compute_root_descriptor_table(std::uint32_t root_parameter, std::uint64_t base_descriptor) {
+        if (closed_ || root_parameter >= max_root_parameters || !base_descriptor) return false;
+        return append(SetComputeRootDescriptorTable{root_parameter, base_descriptor});
+    }
+    // Pipeline state and root signatures (milestone M1). Zero ids are rejected: D3D12 requires a PSO before a draw,
+    // and a root signature before the root tables that this IR already records.
+    bool set_pipeline_state(std::uintptr_t pipeline_state) {
+        if (closed_ || !pipeline_state) return false;
+        return append(SetPipelineState{pipeline_state});
+    }
+
+    bool set_graphics_root_signature(std::uintptr_t root_signature) {
+        if (closed_ || !root_signature) return false;
+        return append(SetGraphicsRootSignature{root_signature});
+    }
+
+    bool set_compute_root_signature(std::uintptr_t root_signature) {
+        if (closed_ || !root_signature) return false;
+        return append(SetComputeRootSignature{root_signature});
+    }
+
+    // Draws. Only the counts that D3D12 itself requires are checked here: a zero vertex/index count or a zero
+    // instance count is invalid; the vertex/index buffers, PSO and root signature are checked at replay.
+    bool draw_instanced(std::uint32_t vertex_count_per_instance, std::uint32_t instance_count = 1,
+                        std::uint32_t start_vertex = 0, std::uint32_t start_instance = 0) {
+        if (closed_ || !vertex_count_per_instance || !instance_count) return false;
+        return append(DrawInstanced{vertex_count_per_instance, instance_count, start_vertex, start_instance});
+    }
+
+    bool draw_indexed_instanced(std::uint32_t index_count_per_instance, std::uint32_t instance_count = 1,
+                                std::uint32_t start_index = 0, std::int32_t base_vertex = 0,
+                                std::uint32_t start_instance = 0) {
+        if (closed_ || !index_count_per_instance || !instance_count) return false;
+        return append(DrawIndexedInstanced{index_count_per_instance, instance_count, start_index, base_vertex,
+                                           start_instance});
+    }
     bool close() {
         if (closed_) return false;
         closed_ = true;
