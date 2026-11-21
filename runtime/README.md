@@ -113,7 +113,9 @@ the files in place and never copy or commit game data.
 
 The game does not boot yet. The missing executable blocks the import-driven work: the real device
 entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
-shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
+shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue`/`XAsync`, one silent local user, save storage in a local folder
+(`LEONIDA_SAVE_DIR`, default `%LOCALAPPDATA%\Leonida\saves`), the package, thread flags and offline network/streaming answers;
+see `xgameruntime_test` and `xgameruntime_services_test`. `XStore` licence queries are deliberately not shimmed). The
 D3D12-to-Vulkan design and the measured console ABI are in
 [docs/d3d12_vulkan.md](../docs/d3d12_vulkan.md); the shader translator and its GPU checks are described
 in [docs/design.md](../docs/design.md), and the differential-validation design is in the shader-validation

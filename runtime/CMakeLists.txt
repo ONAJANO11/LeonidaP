@@ -59,6 +59,7 @@ if(WIN32)
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
+    shims/xgameruntime_services.cpp
   )
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -147,6 +148,19 @@ if(WIN32)
   target_compile_options(xgameruntime_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xgameruntime_test PRIVATE /OPT:NOREF)
   target_link_libraries(xgameruntime_test PRIVATE gta6rt_xtaskqueue)
+
+  # User, save storage (in a temporary LEONIDA_SAVE_DIR), package, threads and the offline answers.
+  add_executable(xgameruntime_services_test
+    test/xgameruntime_services_test.cpp
+    shims/xgameruntime_services.cpp
+    shims/xgameruntime.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xgameruntime_services_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xgameruntime_services_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xgameruntime_services_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xgameruntime_services_test PRIVATE /OPT:NOREF)
+  target_link_libraries(xgameruntime_services_test PRIVATE gta6rt_xtaskqueue)
 
 else()
   message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
@@ -257,6 +271,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
+  endif()
+  if(WIN32 AND TARGET xgameruntime_services_test)
+    add_test(NAME xgameruntime_services COMMAND xgameruntime_services_test)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
