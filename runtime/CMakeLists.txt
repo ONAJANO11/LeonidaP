@@ -135,6 +135,18 @@ if(WIN32)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # Descriptor slot sizes, handle arithmetic and dirty ranges (P0/P1 of docs/d3d12_vulkan_analysis.md).
+  # CPU only: no Vulkan, no GPU and no game data, so they build and run before the Vulkan SDK is installed.
+  add_executable(descriptor_increment_test test/descriptor_increment_test.cpp)
+  target_include_directories(descriptor_increment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(descriptor_increment_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(descriptor_increment_test PRIVATE /W4 /permissive- /utf-8)
+
+  add_executable(descriptor_handles_test test/descriptor_handles_test.cpp)
+  target_include_directories(descriptor_handles_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(descriptor_handles_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(descriptor_handles_test PRIVATE /W4 /permissive- /utf-8)
+
   # Offline GDK runtime shim (XGameRuntime, XSystem, XTaskQueue, XAsync), driven through the shim registry the way
   # a title calls it at boot. Like xmem_test it compiles its own registry.cpp.
   add_executable(xgameruntime_test
@@ -254,6 +266,8 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+    add_test(NAME descriptor_increment COMMAND descriptor_increment_test)
+    add_test(NAME descriptor_handles COMMAND descriptor_handles_test)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
@@ -362,6 +376,14 @@ if(Vulkan_FOUND)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)
     add_test(NAME gfx10_descriptors COMMAND gfx10_descriptors_test)
   endif()
+  # D3D12 view -> GFX10 descriptor encoders (P2 of docs/d3d12_vulkan_analysis.md). Needs the Vulkan headers for
+  # VkFormat, no GPU and no game data.
+  add_executable(descriptor_views_test test/descriptor_views_test.cpp)
+  target_include_directories(descriptor_views_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(descriptor_views_test PRIVATE Vulkan::Headers)
+  target_compile_definitions(descriptor_views_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(descriptor_views_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME descriptor_views COMMAND descriptor_views_test)
 else()
   message(STATUS "Vulkan SDK not found: GPU test tools, vk_pipeline_check, d3d12_state_map_test and "
                  "gfx10_descriptors_test are not built")
