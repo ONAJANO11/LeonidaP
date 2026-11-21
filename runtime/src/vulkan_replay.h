@@ -445,7 +445,8 @@ inline BlockFormat block_format(VkFormat format, VkImageAspectFlags aspect) {
     case VK_FORMAT_R16_UNORM:
     case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
     case VK_FORMAT_D16_UNORM: return {2, 1};
-    case VK_FORMAT_R8_UNORM: return {1, 1};
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_UINT: return {1, 1};
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
     case VK_FORMAT_BC4_UNORM_BLOCK:
@@ -703,6 +704,9 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // The pixel shader writes depth or stencil: D3D12 then shades every pixel, whatever the shading rate. Vulkan
+    // leaves that to fragmentShadingRateWithShaderDepthStencilWrites, which both test GPUs have, so replay forces 1x1.
+    bool fine_shading = false;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -764,6 +768,14 @@ struct ReplayFunctions {
     VkBuffer zero_buffer = VK_NULL_HANDLE;
     VkDeviceSize zero_offset = 0;
     VkDeviceSize zero_size = 0;
+    // Variable rate shading (VK_KHR_fragment_shading_rate with pipelineFragmentShadingRate). When set, every graphics
+    // pipeline must have VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR, and each draw sets its rate. When null, draws
+    // shade every pixel whatever the list set; D3D12_OPTIONS6 then reports no variable rate shading.
+    PFN_vkCmdSetFragmentShadingRateKHR set_fragment_shading_rate = nullptr;
+    // The texel size, in pixels, of shading-rate images (attachmentFragmentShadingRate; square, and the
+    // ShadingRateImageTileSize D3D12 reports). Graphics pipelines must then have
+    // VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR. 0: shading-rate images are not used.
+    std::uint32_t shading_rate_texel = 0;
     std::uint64_t heap_base = 0;  // device address of the GPU address arena (push-constant dwords 32-33)
     // Resolves available binary-occlusion queries to 64-bit 0/1 values, outside conditional rendering.
     std::function<void(VkCommandBuffer, VkQueryPool, std::uint32_t first, std::uint32_t count,
@@ -895,6 +907,7 @@ struct Prepared {
     GraphicsPipeline graphics;
     std::vector<Attachment> colors;  // by slot; id 0 = unbound
     Attachment depth;
+    Attachment rate_image;  // the shading-rate image; id 0 = none used at this draw
     std::vector<VkBuffer> vertex_buffers;
     std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
     VkBuffer index_buffer = VK_NULL_HANDLE;
@@ -1583,6 +1596,25 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!p.graphics.pipeline) return ReplayResult::unsupported;
     }
 
+    // The shading-rate image, read as an attachment through mip 0 of layer 0. D3D12 requires a single-sampled 2D
+    // R8_UINT texture; anything else fails the list. Vulkan also requires the image to cover the render area, where
+    // D3D12 reads 1x1 past its edges: a smaller image is left out of the draw, which then reads 1x1 everywhere.
+    if (draw.shading_rate_image && vk.set_fragment_shading_rate && vk.shading_rate_texel) {
+        const ResourceBinding* binding = resolve(draw.shading_rate_image);
+        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding->image || binding->format != VK_FORMAT_R8_UINT || binding->samples != 1 || binding->volume)
+            return ReplayResult::unsupported;
+        const std::uint64_t texel = vk.shading_rate_texel;
+        if (binding->width * texel >= p.area.width && binding->height * texel >= p.area.height) {
+            auto& a = p.rate_image;
+            a.binding = *binding;
+            a.id = draw.shading_rate_image;
+            a.range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            a.view = vk.image_view(a.binding, a.range);
+            if (!a.view) return ReplayResult::unsupported;
+        }
+    }
+
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
     // step rate 0 also take stride 0, so every instance reads element 0.
     for (std::uint32_t slot = 0; slot < 32; ++slot) {
@@ -1662,6 +1694,60 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages);
     }
     if (tracker) tracker->set(a.id, range, layout);
+}
+
+// Readies a shading-rate image for a draw. D3D12 requires it in SHADING_RATE_SOURCE, which is GENERAL here
+// (vulkan_access, vulkan_layout), a layout Vulkan accepts for the attachment; a tracked piece elsewhere is moved
+// there. A never-used image is zero-filled first, which reads as 1x1, as a zeroed D3D12 resource does.
+inline void to_shading_rate_source(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
+                                   Prepared::Attachment& a, LayoutTracker* tracker) {
+    auto pieces = current(tracker, a.id, a.range, VK_IMAGE_LAYOUT_GENERAL);
+    initialize(vk, command_buffer, a.binding, a.id, pieces, VK_IMAGE_LAYOUT_GENERAL, tracker);
+    for (const auto& piece : pieces) {
+        if (piece.layout == VK_IMAGE_LAYOUT_GENERAL) continue;
+        image_barrier(vk, command_buffer, a.binding, piece.range, piece.layout, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      VK_ACCESS_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR,
+                      VK_PIPELINE_STAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR);
+    }
+    if (tracker) tracker->set(a.id, a.range, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+// D3D12's ApplyCombiner with 1x1 as the second rate: max(a, 1x1) = a and a + 1x1 = a (log2 sizes add), while
+// override and min give 1x1. Sizes past what the GPU supports are clamped by Vulkan, as D3D12 clamps them.
+inline std::uint32_t combine_with_1x1(std::uint32_t combiner, std::uint32_t rate) {
+    namespace v = d3d12_shading_rate;
+    return combiner == v::combiner_override || combiner == v::combiner_min ? v::rate_1x1 : rate;
+}
+
+inline VkFragmentShadingRateCombinerOpKHR vulkan_combiner(std::uint32_t combiner) {
+    namespace v = d3d12_shading_rate;
+    switch (combiner) {
+    case v::combiner_override: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+    case v::combiner_min: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MIN_KHR;
+    case v::combiner_max: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MAX_KHR;
+    case v::combiner_sum: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_MUL_KHR;  // sizes multiply as log2s add
+    default: return VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    }
+}
+
+// A draw's rate for vkCmdSetFragmentShadingRateKHR. The per-primitive rate is always 1x1: translated shaders never
+// write SV_ShadingRate (no shader in the corpus declares it, #284), so the first combiner is applied here and the
+// Vulkan primitive combiner is KEEP. Without a shading-rate image, D3D12 reads 1x1 for it, so the second combiner
+// is applied here too; with one, it becomes the Vulkan attachment combiner.
+inline void draw_shading_rate(const Draw& draw, const Prepared& p, VkExtent2D& size,
+                              VkFragmentShadingRateCombinerOpKHR (&ops)[2]) {
+    std::uint32_t rate = combine_with_1x1(draw.shading_rate_combiners[0], draw.shading_rate);
+    ops[0] = ops[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    if (p.rate_image.id)
+        ops[1] = vulkan_combiner(draw.shading_rate_combiners[1]);
+    else
+        rate = combine_with_1x1(draw.shading_rate_combiners[1], rate);
+    if (p.graphics.fine_shading) {
+        rate = d3d12_shading_rate::rate_1x1;
+        ops[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    }
+    size = {1u << (rate >> 2), 1u << (rate & 3)};
 }
 
 } // namespace detail
@@ -3062,6 +3148,15 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             rendering.pColorAttachments = colors.data();
             if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            VkRenderingFragmentShadingRateAttachmentInfoKHR rate_attachment{
+                VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+            if (p.rate_image.id) {
+                detail::to_shading_rate_source(vk, command_buffer, prepared_draw.rate_image, tracker);
+                rate_attachment.imageView = p.rate_image.view;
+                rate_attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                rate_attachment.shadingRateAttachmentTexelSize = {vk.shading_rate_texel, vk.shading_rate_texel};
+                rendering.pNext = &rate_attachment;
+            }
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
@@ -3092,6 +3187,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (vk.set_fragment_shading_rate) {
+                VkExtent2D size{};
+                VkFragmentShadingRateCombinerOpKHR ops[2];
+                detail::draw_shading_rate(*draw, p, size, ops);
+                vk.set_fragment_shading_rate(command_buffer, &size, ops);
+            }
             for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
                 if (!p.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],

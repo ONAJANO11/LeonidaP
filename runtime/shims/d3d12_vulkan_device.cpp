@@ -181,6 +181,7 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
+    case DXGI_FORMAT_R8_UINT: return {VK_FORMAT_R8_UINT, color};  // also the shading-rate image format
     case DXGI_FORMAT_R32_FLOAT: return {VK_FORMAT_R32_SFLOAT, color};
     case DXGI_FORMAT_R32_UINT: return {VK_FORMAT_R32_UINT, color};
     case DXGI_FORMAT_R32_SINT: return {VK_FORMAT_R32_SINT, color};
@@ -312,12 +313,16 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
 // attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+// shading_rate_images: the device reads shading-rate images (attachmentFragmentShadingRate). D3D12 has no flag for
+// one: any single-sampled 2D R8_UINT texture can be bound as one, so each such texture gets the attachment usage.
+// Vulkan requires R8_UINT to support it wherever the feature is enabled.
 struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
-    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable,
+                      bool shading_rate_images = false) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -340,6 +345,9 @@ struct TextureCreateInfo {
                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         }
         if (!(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (shading_rate_images && info.format == VK_FORMAT_R8_UINT && info.imageType == VK_IMAGE_TYPE_2D &&
+            info.samples == VK_SAMPLE_COUNT_1_BIT)
+            info.usage |= VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
         if (format.r9g9b9e5_as_r32_uint) {
             // R32_UINT owns storage and attachment usages; E5B9G9R9 views restrict usage to SAMPLED_BIT.
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -353,6 +361,23 @@ struct TextureCreateInfo {
     TextureCreateInfo(const TextureCreateInfo&) = delete;
     TextureCreateInfo& operator=(const TextureCreateInfo&) = delete;
 };
+
+// Whether a SPIR-V module writes depth or stencil from the pixel shader: an OpDecorate or OpMemberDecorate of
+// BuiltIn FragDepth (SV_Depth and the conservative-depth outputs) or FragStencilRefEXT (SV_StencilRef).
+bool writes_depth_or_stencil(const std::vector<std::uint32_t>& words) {
+    constexpr std::uint32_t op_decorate = 71, op_member_decorate = 72, decoration_builtin = 11;
+    constexpr std::uint32_t frag_depth = 22, frag_stencil_ref = 5014;
+    for (std::size_t i = 5; i < words.size();) {  // after the 5-word header
+        const std::uint32_t count = words[i] >> 16, op = words[i] & 0xffff;
+        if (!count || count > words.size() - i) break;
+        const std::size_t at = op == op_decorate ? 2 : op == op_member_decorate ? 3 : 0;  // the decoration word
+        if (at && count > at + 1 && words[i + at] == decoration_builtin &&
+            (words[i + at + 1] == frag_depth || words[i + at + 1] == frag_stencil_ref))
+            return true;
+        i += count;
+    }
+    return false;
+}
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
 struct DeviceState {
@@ -398,6 +423,15 @@ struct DeviceState {
     // the device's VkQueue and waited for. Created on first use.
     std::mutex staging_mutex;
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
+
+    // What variable rate shading can do on this device (D3D12_OPTIONS6 and OPTIONS10), from the GPU's
+    // fragment-shading-rate properties; Device::query_shading_rate fills it.
+    struct ShadingRate {
+        D3D12_VARIABLE_SHADING_RATE_TIER tier = D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+        UINT tile = 0;                  // ShadingRateImageTileSize: the image's texel size; 0 below tier 2
+        bool additional_rates = false;  // 2x4, 4x2 and 4x4 single-sampled
+        bool sum_combiner = false;      // VariableRateShadingSumCombinerSupported
+    } shading_rate;
 
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
@@ -1365,7 +1399,8 @@ public:
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format),
+                                 device_.shading_rate.tile != 0);
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -2048,7 +2083,8 @@ public:
     // input signature by semantic name and index: location = the element's register, the translator's rule
     // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages, more than one sample, and two stages
     // that both read their code base are refused with a log. Viewport, scissor, topology, vertex strides, stencil
-    // reference and blend factor are dynamic, set from the list's state at each draw.
+    // reference, blend factor and (with variable rate shading) the shading rate are dynamic, set from the list's
+    // state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -2128,6 +2164,7 @@ public:
             }
             const std::vector<std::uint32_t> words = library->spirv(*stage.entry);
             if (words.empty()) return E_FAIL;
+            if (stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT) graphics_.fine_shading = writes_depth_or_stencil(words);
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = words.size() * 4;
             module_info.pCode = words.data();
@@ -2499,15 +2536,19 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
         const Recipe& r = recipe_;
+        std::vector<VkDynamicState> dynamic_states = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                                      VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+                                                      VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+                                                      VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        // A pipeline without vertex bindings (a full-screen pass that builds its vertices from SV_VertexID) leaves
+        // the stride state out, since no vkCmdBindVertexBuffers2 would ever set it (VUID-vkCmdDraw-pStrides-04913).
+        if (!r.bindings.empty()) dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
+        // The shading rate is dynamic whenever the device has variable rate shading: replay then sets it at every
+        // draw (vulkan_replay.h, ReplayFunctions::set_fragment_shading_rate).
+        if (device_.shading_rate.tier != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED)
+            dynamic_states.push_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
@@ -2534,10 +2575,12 @@ private:
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-        dynamic.pDynamicStates = dynamic_states;
+        dynamic.dynamicStateCount = std::uint32_t(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+        // Any draw may bind a shading-rate image, and a rendering that has one needs pipelines made for it.
+        if (device_.shading_rate.tile) info.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
         info.stageCount = std::uint32_t(r.stages.size());
         info.pStages = r.stages.data();
         info.pVertexInputState = &vertex_input;
@@ -3058,6 +3101,7 @@ public:
             if (!state_.context->debug_labels())
                 std::fprintf(stderr, "[rt] d3d12: VK_EXT_debug_utils entry points missing; debug markers are off\n");
         }
+        if (info.fragment_shading_rate && state_.context->loaded()) query_shading_rate(get_device);
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -3119,6 +3163,59 @@ public:
             if (state_.bindless) state_.bindless->table_upload_result(submitted);
         });
         return true;
+    }
+
+    // Variable rate shading from VK_KHR_fragment_shading_rate. Tier 1 needs the per-draw rate. Tier 2 adds the
+    // shading-rate image, whose tiles D3D12 makes square and 8 or 16 pixels wide, and the min/max/sum combiners
+    // (nonTrivialCombinerOps); it also covers SV_ShadingRate, which the translator does not map, but no shader in
+    // the corpus declares it (#284). Sum adds log2 sizes and Vulkan's mul multiplies sizes, the same thing where
+    // fragmentShadingRateStrictMultiplyCombiner holds.
+    void query_shading_rate(PFN_vkGetDeviceProcAddr get_device) {
+        const VulkanDeviceInfo& info = state_.info;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"));
+        const auto fragment_rates = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+        const auto set_rate = reinterpret_cast<PFN_vkCmdSetFragmentShadingRateKHR>(
+            get_device(info.device, "vkCmdSetFragmentShadingRateKHR"));
+        if (!properties2 || !fragment_rates || !set_rate) {
+            std::fprintf(stderr, "[rt] d3d12: VK_KHR_fragment_shading_rate entry points missing; no VRS\n");
+            return;
+        }
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR limits{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &limits};
+        properties2(info.physical, &properties);
+        std::uint32_t count = 0;
+        fragment_rates(info.physical, &count, nullptr);
+        std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(
+            count, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+        fragment_rates(info.physical, &count, rates.data());
+        const auto single_sampled = [&](std::uint32_t width, std::uint32_t height) {
+            return std::any_of(rates.begin(), rates.end(), [&](const VkPhysicalDeviceFragmentShadingRateKHR& r) {
+                return r.fragmentSize.width == width && r.fragmentSize.height == height &&
+                       (r.sampleCounts & VK_SAMPLE_COUNT_1_BIT);
+            });
+        };
+
+        auto& vrs = state_.shading_rate;
+        vrs.tier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
+        vrs.additional_rates = single_sampled(2, 4) && single_sampled(4, 2) && single_sampled(4, 4);
+        const VkExtent2D low = limits.minFragmentShadingRateAttachmentTexelSize;
+        const VkExtent2D high = limits.maxFragmentShadingRateAttachmentTexelSize;
+        if (info.attachment_fragment_shading_rate && limits.fragmentShadingRateNonTrivialCombinerOps) {
+            for (const std::uint32_t tile : {8u, 16u}) {
+                if (low.width <= tile && tile <= high.width && low.height <= tile && tile <= high.height) {
+                    vrs.tile = tile;
+                    vrs.tier = D3D12_VARIABLE_SHADING_RATE_TIER_2;
+                    break;
+                }
+            }
+        }
+        vrs.sum_combiner = vrs.tile && limits.fragmentShadingRateStrictMultiplyCombiner;
+        state_.context->set_fragment_shading_rate(set_rate, vrs.tile);
+        std::fprintf(stderr, "[rt] d3d12: variable rate shading tier %d (image tile %u, 2x4/4x2/4x4 %s)\n",
+                     int(vrs.tier), vrs.tile, vrs.additional_rates ? "yes" : "no");
     }
 
     // LEONIDA_ARENA_MB sets its size (default 256, at most 4095): it holds every default-heap buffer, shader-
@@ -4707,6 +4804,25 @@ public:
             opts->ExtendedCommandInfoSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
         }
+        case D3D12_FEATURE_D3D12_OPTIONS6: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS6)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS6*>(data);
+            const DeviceState::ShadingRate& vrs = state_.shading_rate;
+            *opts = {};
+            opts->AdditionalShadingRatesSupported = vrs.additional_rates;
+            opts->PerPrimitiveShadingRateSupportedWithViewportIndexing = FALSE;  // SV_ShadingRate is not mapped
+            opts->VariableShadingRateTier = vrs.tier;
+            opts->ShadingRateImageTileSize = vrs.tile;
+            opts->BackgroundProcessingSupported = FALSE;  // SetBackgroundProcessingMode is not implemented
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS10: {
+            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS10)) return E_INVALIDARG;
+            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS10*>(data);
+            opts->VariableRateShadingSumCombinerSupported = state_.shading_rate.sum_combiner;
+            opts->MeshShaderPerPrimitiveShadingRateSupported = FALSE;  // no mesh shaders
+            return S_OK;
+        }
         case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: {
             if (size != sizeof(D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* va = static_cast<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT*>(data);
@@ -5115,7 +5231,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format),
+                                       state_.shading_rate.tile != 0);
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
@@ -6140,6 +6257,26 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    // Variable rate shading where the GPU has it: the per-draw rate, and the shading-rate image when present.
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR enable_rate{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR rate{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &rate};
+        vkGetPhysicalDeviceFeatures2(info.physical, &features);
+        if (rate.pipelineFragmentShadingRate) {
+            enable_rate.pipelineFragmentShadingRate = VK_TRUE;
+            enable_rate.attachmentFragmentShadingRate = rate.attachmentFragmentShadingRate;
+            enable_rate.pNext = enable13.pNext;  // ahead of the other extension features, if any
+            enable13.pNext = &enable_rate;
+            device_extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+            info.fragment_shading_rate = true;
+            info.attachment_fragment_shading_rate = rate.attachmentFragmentShadingRate == VK_TRUE;
+        }
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

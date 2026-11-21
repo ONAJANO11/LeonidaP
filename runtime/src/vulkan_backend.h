@@ -882,6 +882,14 @@ public:
         return replay_.heap_base;
     }
 
+    // Variable rate shading, for a device with VK_KHR_fragment_shading_rate enabled (ReplayFunctions says what
+    // pipelines need then). texel: the shading-rate image texel size, 0 without attachmentFragmentShadingRate.
+    void set_fragment_shading_rate(PFN_vkCmdSetFragmentShadingRateKHR set_rate, std::uint32_t texel) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.set_fragment_shading_rate = set_rate;
+        replay_.shading_rate_texel = set_rate ? texel : 0;
+    }
+
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
         std::unique_lock lock(resource_mutex_);

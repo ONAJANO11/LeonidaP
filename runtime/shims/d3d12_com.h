@@ -138,6 +138,11 @@ struct VulkanDeviceInfo {
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
+    // VK_KHR_fragment_shading_rate enabled with pipelineFragmentShadingRate, and with attachmentFragmentShadingRate
+    // when attachment_fragment_shading_rate is set: RSSetShadingRate (and RSSetShadingRateImage) then reach the GPU,
+    // and D3D12_OPTIONS6 reports the tier the GPU's properties allow (docs section 4.1).
+    bool fragment_shading_rate = false;
+    bool attachment_fragment_shading_rate = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;
