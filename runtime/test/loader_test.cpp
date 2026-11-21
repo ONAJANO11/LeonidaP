@@ -53,6 +53,8 @@ std::vector<uint8_t> make_image() {
     nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
     nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
     nt->OptionalHeader.ImageBase = 0x140000000;
+    nt->OptionalHeader.SectionAlignment = 0x1000;
+    nt->OptionalHeader.FileAlignment = 0x200;
     nt->OptionalHeader.AddressOfEntryPoint = 0x1000;
     nt->OptionalHeader.SizeOfHeaders = 0x200;
     nt->OptionalHeader.SizeOfImage = 0x2000;
@@ -232,13 +234,114 @@ void test_header_bounds() {
 void test_section_bounds() {
     {
         auto img = make_image();
-        IMAGE_FIRST_SECTION(nt_of(img))->VirtualAddress = 0x1F00;  // 0x1F00 + 0x200 > SizeOfImage
+        IMAGE_FIRST_SECTION(nt_of(img))->Misc.VirtualSize = 0x1001;  // 0x1000 + 0x1001 > SizeOfImage
         expect_rejects("a section that would be written past the image", img);
     }
     {
         auto img = make_image();
-        IMAGE_FIRST_SECTION(nt_of(img))->PointerToRawData = 0x3F0;  // 0x3F0 + 0x200 > file size
-        expect_rejects("a section that reads past the end of the file", img);
+        IMAGE_FIRST_SECTION(nt_of(img))->SizeOfRawData = 0x400;  // VirtualSize still fits; the full raw extent does not.
+        expect_rejects("raw padding that runs past the end of the file", img);
+    }
+}
+
+void test_section_layout() {
+    {
+        auto img = make_image();
+        IMAGE_FIRST_SECTION(nt_of(img))->VirtualAddress += 0x100;
+        expect_rejects("a section RVA that is not section-aligned", img);
+    }
+    {
+        auto img = make_image();
+        nt_of(img)->OptionalHeader.SectionAlignment = 0x200;
+        nt_of(img)->OptionalHeader.FileAlignment = 0x100;
+        expect_rejects("sub-page sections with mismatched file alignment", img);
+    }
+    {
+        auto img = make_image();
+        auto* nt = nt_of(img);
+        nt->OptionalHeader.SectionAlignment = 0x200;
+        nt->OptionalHeader.FileAlignment = 0x200;
+        nt->OptionalHeader.SizeOfImage = 0x400;
+        nt->OptionalHeader.AddressOfEntryPoint = 0x200;
+        auto* section = IMAGE_FIRST_SECTION(nt);
+        section->VirtualAddress = 0x200;
+        section->PointerToRawData = 0x200;
+        try {
+            const auto path = write_image(img);
+            rt::Loader loader(g_dir);
+            rt::Module& module = loader.load(path);
+            if (module.size == 0x400 && std::memcmp(module.base + 0x200, text_raw(img), 0x200) == 0)
+                pass("a valid sub-page-aligned section maps at its RVA");
+            else
+                failed("a valid sub-page-aligned section maps at its RVA", "mapped bytes or image size differ");
+        } catch (const std::exception& e) {
+            failed("a valid sub-page-aligned section maps at its RVA", e.what());
+        }
+    }
+    {
+        auto img = make_image();
+        img.resize(0x600, 0);
+        auto* nt = nt_of(img);
+        nt->FileHeader.NumberOfSections = 2;
+        nt->OptionalHeader.SectionAlignment = 0x200;
+        nt->OptionalHeader.FileAlignment = 0x200;
+        nt->OptionalHeader.SizeOfImage = 0x600;
+        nt->OptionalHeader.AddressOfEntryPoint = 0x200;
+        auto* sections = IMAGE_FIRST_SECTION(nt);
+        sections[0].VirtualAddress = 0x200;
+        sections[0].PointerToRawData = 0x200;
+        sections[1] = sections[0];
+        std::memcpy(sections[1].Name, ".rdata", 6);
+        sections[1].VirtualAddress = 0x400;
+        sections[1].PointerToRawData = 0x400;
+        sections[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        try {
+            const auto path = write_image(img);
+            rt::Loader loader(g_dir);
+            rt::Module& module = loader.load(path);
+            MEMORY_BASIC_INFORMATION text_page{}, rdata_page{};
+            const bool queried = VirtualQuery(module.base + 0x200, &text_page, sizeof(text_page)) != 0 &&
+                                 VirtualQuery(module.base + 0x400, &rdata_page, sizeof(rdata_page)) != 0;
+            if (queried && text_page.BaseAddress == rdata_page.BaseAddress &&
+                text_page.Protect == PAGE_EXECUTE_READ && rdata_page.Protect == PAGE_EXECUTE_READ)
+                pass("shared sub-page permissions preserve execute access across sections");
+            else
+                failed("shared sub-page permissions preserve execute access across sections",
+                       "page permissions did not merge the section read/execute requirements");
+        } catch (const std::exception& e) {
+            failed("shared sub-page permissions preserve execute access across sections", e.what());
+        }
+    }
+    {
+        auto img = make_image();
+        auto* section = IMAGE_FIRST_SECTION(nt_of(img));
+        section->Misc.VirtualSize = 0x180;
+        try {
+            const auto path = write_image(img);
+            rt::Loader loader(g_dir);
+            rt::Module& module = loader.load(path);
+            const bool copied_virtual_bytes = std::memcmp(module.base + section->VirtualAddress, text_raw(img), 0x180) == 0;
+            const bool raw_padding_not_mapped = module.base[section->VirtualAddress + 0x180] == 0;
+            if (copied_virtual_bytes && raw_padding_not_mapped)
+                pass("raw file-alignment padding beyond VirtualSize is not mapped as section data");
+            else
+                failed("raw file-alignment padding beyond VirtualSize is not mapped as section data",
+                       "the mapped section did not preserve VirtualSize semantics");
+        } catch (const std::exception& e) {
+            failed("raw file-alignment padding beyond VirtualSize is not mapped as section data", e.what());
+        }
+    }
+    {
+        auto img = make_image();
+        img.resize(0x600, 0);
+        auto* nt = nt_of(img);
+        nt->FileHeader.NumberOfSections = 2;
+        auto* sections = IMAGE_FIRST_SECTION(nt);
+        sections[1] = sections[0];
+        std::memcpy(sections[1].Name, ".rdata", 6);
+        sections[1].PointerToRawData = 0x400;
+        sections[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+        expect_rejects("overlapping virtual section ranges", img);
     }
 }
 
@@ -468,6 +571,32 @@ std::vector<uint8_t> make_init_image() {
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     dir.VirtualAddress = 0x10B0;
     dir.Size = sizeof(IMAGE_TLS_DIRECTORY64);
+    return img;
+}
+
+std::vector<uint8_t> make_unresolved_import_init_image() {
+    auto img = make_init_image();
+    auto* nt = nt_of(img);
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {
+        0x10E0, 2 * static_cast<uint32_t>(sizeof(IMAGE_IMPORT_DESCRIPTOR))};
+
+    auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + 0x2E0);
+    descriptor[0] = {};
+    descriptor[0].Name = 0x1120;
+    descriptor[0].OriginalFirstThunk = 0x1160;
+    descriptor[0].FirstThunk = 0x1170;
+    descriptor[1] = {};
+    auto* lookup = reinterpret_cast<IMAGE_THUNK_DATA64*>(img.data() + 0x360);
+    lookup[0].u1.AddressOfData = 0x1180;
+    lookup[1] = {};
+    auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(img.data() + 0x370);
+    iat[0] = {};
+    iat[1] = {};
+    auto* by_name = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(img.data() + 0x380);
+    by_name->Hint = 0;
+    std::memcpy(by_name->Name, "leonida_missing_generated_only", sizeof("leonida_missing_generated_only"));
+    std::memcpy(img.data() + 0x320, "leonida_missing_generated_only.dll",
+                sizeof("leonida_missing_generated_only.dll"));
     return img;
 }
 
@@ -738,6 +867,35 @@ void test_unwind_registration() {
     expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
 }
 
+void test_initialise_preflights_unresolved_imports() {
+    g_tls_ran = 0;
+    g_main_ran = 0;
+    const auto p = write_image(make_unresolved_import_init_image());
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& module = loader.load(p);
+        const bool has_unimplemented = std::any_of(module.imports.begin(), module.imports.end(), [](const auto& item) {
+            return item.binding == rt::Binding::Unimplemented;
+        });
+        bool rejected = false;
+        try {
+            loader.initialise();
+        } catch (const std::exception& e) {
+            rejected = std::string(e.what()).find("unresolved import blocks initialization") != std::string::npos;
+        }
+        if (!has_unimplemented || !rejected)
+            failed("initialise rejects an unresolved generated import", "the unresolved import was not preflighted");
+        else
+            pass("initialise rejects an unresolved generated import");
+        if (g_tls_ran || g_main_ran)
+            failed("unresolved imports block all initialization code", "a TLS callback or DllMain already ran");
+        else
+            pass("unresolved imports block all initialization code");
+    } catch (const std::exception& e) {
+        failed("unresolved-import preflight fixture", e.what());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -753,6 +911,7 @@ int main() {
     test_valid_image();
     test_header_bounds();
     test_section_bounds();
+    test_section_layout();
     test_truncation();
     test_relocations();
     test_exports();
@@ -763,6 +922,7 @@ int main() {
     test_delay_descriptor_fields();
     test_forwarded_exports();
     test_unwind_registration();
+    test_initialise_preflights_unresolved_imports();
 
     std::filesystem::remove_all(g_dir, ec);
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);

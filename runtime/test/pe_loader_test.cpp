@@ -1,9 +1,9 @@
 // End-to-end checks for rt::Loader against locally built fixtures. The default run needs no game files.
 //
-// The fixtures are an ordinary DLL (tiny_dll) and an EXE that imports it (tiny_exe). The test maps both through the
-// public Loader API and checks the mapped headers, exports (by name and ordinal), import binding, recursive module
-// loading/dedupe, section protections and forced base relocation. Negative inputs must throw std::runtime_error
-// without leaving a module behind. The fixtures are passed as argv[1] and argv[2] by CTest.
+// The fixtures are an ordinary DLL (tiny_dll), an EXE that imports it (tiny_exe), and a minimal importer/dependency
+// pair for initialization ordering. The test checks mapped headers, exports, import binding, recursive loading,
+// section protections, relocations, x64 unwind registration and guarded DLL initialization. Negative inputs must
+// throw std::runtime_error. tiny_dll and tiny_exe are passed as argv[1] and argv[2] by CTest.
 //
 // An optional final section reads LEONIDA_GAME_DIR and maps the 16 DLLs a retail package ships, without executing
 // any of them or copying any file. It skips when the variable is unset; see test_optional_package.
@@ -83,7 +83,6 @@ void patch_machine(std::vector<uint8_t>& bytes, uint16_t machine) {
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(bytes.data() + dos->e_lfanew);
     nt->FileHeader.Machine = machine;
 }
-
 struct SectionView {
     std::string name;
     uint32_t rva = 0;
@@ -345,6 +344,29 @@ void test_recursive_exe(const fs::path& exe, const fs::path& dll) {
             using AddFn = int(__cdecl*)(int, int);
             check(reinterpret_cast<AddFn>(*slot)(2, 3) == 5, "calling the EXE's bound tiny_add(2, 3) returns 5");
         }
+    }
+}
+
+void test_initialise_dependency_order(const fs::path& init_root) {
+    std::printf("\n-- dependency initialization order: %s --\n", init_root.string().c_str());
+    rt::Loader loader(init_root.parent_path());
+    rt::Module& root = loader.load(init_root);
+    check(loader.modules().size() == 2, "loading tiny_init_root maps its tiny_dep dependency");
+    const auto& init_order = loader.initialisation_order();
+    rt::Module* dependency = nullptr;
+    for (rt::Module* module : init_order)
+        if (rt::lower(module->name) == "tiny_dep.dll") dependency = module;
+    check(dependency != nullptr, "the initialization order contains tiny_dep");
+    check(init_order.size() == 2 && init_order.front() == dependency && init_order.back() == &root,
+          "the initialization order places tiny_dep before tiny_init_root");
+
+    loader.initialise();
+    const auto status = root.exports.find("tiny_dependency_was_attached");
+    check(status != root.exports.end(), "tiny_init_root exports the dependency-order observation");
+    if (status != root.exports.end()) {
+        using StatusFn = int(__cdecl*)();
+        check(reinterpret_cast<StatusFn>(status->second)() == 1,
+              "the dependency's DllMain completed before the importing DLL's DllMain");
     }
 }
 
@@ -687,6 +709,7 @@ int main(int argc, char** argv) {
         test_fixture_dll(dll);
         test_recursive_exe(exe, dll);
         test_forced_relocation(dll);
+        test_initialise_dependency_order(dll.parent_path() / "tiny_init_root.dll");
         test_rejections(dll, temp.path);
         test_unwind(dll);
         test_optional_package();

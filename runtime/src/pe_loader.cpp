@@ -42,6 +42,68 @@ std::string read_string(const std::string& name, uint8_t* base, uint32_t image_s
     return {s, end};
 }
 
+void validate_section_layout(const std::string& name, size_t file_size, uint32_t nt_offset, IMAGE_NT_HEADERS64& nt) {
+    const IMAGE_OPTIONAL_HEADER64& oh = nt.OptionalHeader;
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const uint32_t page_size = system_info.dwPageSize;
+    if (!oh.SectionAlignment || !oh.FileAlignment)
+        throw std::runtime_error(name + ": zero section or file alignment");
+    if (oh.SectionAlignment < oh.FileAlignment)
+        throw std::runtime_error(name + ": section alignment is smaller than file alignment");
+    if (oh.SectionAlignment < page_size && oh.FileAlignment != oh.SectionAlignment)
+        throw std::runtime_error(name + ": sub-page section alignment requires matching file alignment");
+    if (oh.SizeOfImage % oh.SectionAlignment)
+        throw std::runtime_error(name + ": image size is not aligned to section alignment");
+    if (oh.SizeOfHeaders % oh.FileAlignment)
+        throw std::runtime_error(name + ": header size is not aligned to file alignment");
+    if (oh.ImageBase % 0x10000)
+        throw std::runtime_error(name + ": image base is not 64-KB aligned");
+
+    const uint64_t section_table_end = static_cast<uint64_t>(nt_offset) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
+                                       nt.FileHeader.SizeOfOptionalHeader +
+                                       static_cast<uint64_t>(nt.FileHeader.NumberOfSections) *
+                                           sizeof(IMAGE_SECTION_HEADER);
+    if (section_table_end > oh.SizeOfHeaders)
+        throw std::runtime_error(name + ": section table extends beyond the mapped headers");
+
+    uint64_t previous_end = 0;
+    uint32_t previous_rva = 0;
+    bool have_previous = false;
+    auto* section = IMAGE_FIRST_SECTION(&nt);
+    for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i, ++section) {
+        if (section->VirtualAddress % oh.SectionAlignment)
+            throw std::runtime_error(name + ": a section RVA is not aligned to section alignment");
+        if (section->SizeOfRawData && section->SizeOfRawData % oh.FileAlignment)
+            throw std::runtime_error(name + ": a section raw size is not aligned to file alignment");
+        if (section->SizeOfRawData && section->PointerToRawData % oh.FileAlignment)
+            throw std::runtime_error(name + ": a section file offset is not aligned to file alignment");
+        if (section->SizeOfRawData && oh.SectionAlignment < page_size &&
+            section->PointerToRawData != section->VirtualAddress)
+            throw std::runtime_error(name + ": sub-page section file offset does not match its RVA");
+        if (section->SizeOfRawData) {
+            const size_t raw_offset = section->PointerToRawData;
+            if (raw_offset > file_size || static_cast<size_t>(section->SizeOfRawData) > file_size - raw_offset)
+                throw std::runtime_error(name + ": a section's raw data runs past the end of the file");
+        }
+
+        // VirtualSize is the in-memory extent. SizeOfRawData can be larger because of file alignment;
+        // those trailing padding bytes are not part of the section's mapped range.
+        const uint64_t mapped_size = section->Misc.VirtualSize ? section->Misc.VirtualSize : section->SizeOfRawData;
+        if (!mapped_size) continue;
+        if (section->VirtualAddress < oh.SizeOfHeaders)
+            throw std::runtime_error(name + ": a section overlaps the mapped headers");
+        require_range(name, section->VirtualAddress, mapped_size, oh.SizeOfImage, "a section's mapped range");
+        if (have_previous && section->VirtualAddress < previous_rva)
+            throw std::runtime_error(name + ": sections are not ordered by virtual address");
+        if (have_previous && section->VirtualAddress < previous_end)
+            throw std::runtime_error(name + ": sections overlap in the mapped image");
+        previous_rva = section->VirtualAddress;
+        previous_end = static_cast<uint64_t>(section->VirtualAddress) + mapped_size;
+        have_previous = true;
+    }
+}
+
 // The Xbox builds of the MSVC runtime import the same CRT the desktop does, so the host's own copies are used.
 bool prefer_host_copy(const std::string& dll) {
     static const char* names[] = {"vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_1.dll",
@@ -69,7 +131,7 @@ Module& Loader::load(const std::filesystem::path& image) {
     std::string key = lower(image.filename().string());
     if (auto it = by_name_.find(key); it != by_name_.end()) return *it->second;
     Module& m = map_image(image);
-    bind_imports(m);  // loads every bundled module m imports first, so they land in init_order_ before m
+    bind_imports(m);  // dependencies land in init_order_ before this importer
     protect_sections(m);
     register_unwind(m);
     init_order_.push_back(&m);
@@ -115,9 +177,15 @@ void Loader::register_unwind(Module& m) {
 }
 
 void Loader::initialise() {
-    // Not order_: map_image pushes a module there before bind_imports maps its dependencies, so order_ lists an
-    // importer ahead of the DLLs it imports. init_order_ is filled once a module's imports are all loaded.
-    for (auto* m : init_order_) initialise(*m);
+    // Resolve the full import graph before calling TLS callbacks or DllMain in any module.
+    for (auto* module : init_order_) {
+        for (const ImportRecord& import : module->imports) {
+            if (import.binding == Binding::Unimplemented)
+                throw std::runtime_error(module->name + ": unresolved import blocks initialization: " + import.dll +
+                                         "!" + import.name);
+        }
+    }
+    for (auto* module : init_order_) initialise(*module);
 }
 
 void Loader::initialise(Module& m) {
@@ -218,6 +286,7 @@ Module& Loader::map_image(const std::filesystem::path& path) {
         throw std::runtime_error(name + ": the section table runs past the end of the file");
     if (!oh.SizeOfImage || oh.SizeOfHeaders > oh.SizeOfImage || oh.SizeOfHeaders > file.size())
         throw std::runtime_error(name + ": SizeOfHeaders and SizeOfImage don't fit the file");
+    validate_section_layout(name, file.size(), static_cast<uint32_t>(dos->e_lfanew), *nt);
 
     auto* m = new Module;
     m->name = name;
@@ -458,18 +527,54 @@ void Loader::bind_imports(Module& m) {
 
 void Loader::protect_sections(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
-    DWORD old;
-    VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const size_t page_size = system_info.dwPageSize;
+    const size_t page_count = (static_cast<size_t>(m.size) + page_size - 1) / page_size;
+    constexpr uint8_t kRead = 1, kWrite = 2, kExecute = 4;
+    std::vector<uint8_t> page_access(page_count, 0);
+
+    auto mark_pages = [&](uint64_t rva, uint64_t size, uint8_t access) {
+        if (!size) return;
+        const size_t first = static_cast<size_t>(rva / page_size);
+        const size_t last = static_cast<size_t>((rva + size - 1) / page_size);
+        for (size_t page = first; page <= last; ++page) page_access[page] |= access;
+    };
+
+    mark_pages(0, nt->OptionalHeader.SizeOfHeaders, kRead);
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        bool x = sec->Characteristics & IMAGE_SCN_MEM_EXECUTE, w = sec->Characteristics & IMAGE_SCN_MEM_WRITE;
-        DWORD prot = x ? (w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ) : (w ? PAGE_READWRITE : PAGE_READONLY);
+        uint8_t access = 0;
+        if (sec->Characteristics & IMAGE_SCN_MEM_READ) access |= kRead;
+        if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) access |= kWrite;
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) access |= kExecute;
         uint64_t size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
-        if (sec->VirtualAddress >= m.size) continue;
-        size = std::min<uint64_t>(size, m.size - sec->VirtualAddress);
-        if (size) VirtualProtect(m.base + sec->VirtualAddress, static_cast<SIZE_T>(size), prot, &old);
+        mark_pages(sec->VirtualAddress, size, access);
+    }
+
+    auto protection_for = [](uint8_t access) -> DWORD {
+        const bool readable = (access & kRead) != 0;
+        const bool writable = (access & kWrite) != 0;
+        const bool executable = (access & kExecute) != 0;
+        if (executable) return writable ? PAGE_EXECUTE_READWRITE : (readable ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
+        if (writable) return PAGE_READWRITE;
+        return readable ? PAGE_READONLY : PAGE_NOACCESS;
+    };
+
+    DWORD old = 0;
+    if (!VirtualProtect(m.base, m.size, PAGE_NOACCESS, &old))
+        throw std::runtime_error(m.name + ": failed to set default image page protection");
+    for (size_t first = 0; first < page_count;) {
+        const DWORD protection = protection_for(page_access[first]);
+        size_t end = first + 1;
+        while (end < page_count && protection_for(page_access[end]) == protection) ++end;
+        const SIZE_T bytes = (end - first) * page_size;
+        if (!VirtualProtect(m.base + first * page_size, bytes, protection, &old))
+            throw std::runtime_error(m.name + ": failed to set PE section page protection");
+        first = end;
     }
     FlushInstructionCache(GetCurrentProcess(), m.base, m.size);
 }
+
 
 }  // namespace rt

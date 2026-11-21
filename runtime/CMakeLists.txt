@@ -166,15 +166,40 @@ if(BUILD_TESTING)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(loader_test PRIVATE /OPT:NOREF)
     add_test(NAME loader COMMAND loader_test)
-    # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
-    # imports it so Loader::load exercises recursive module loading. They contain no game data.
+    # PE loader tests use locally built DLL/EXE fixtures: an export/import/relocation pair plus a minimal DLL pair
+    # for initialization order. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
+
+    add_library(tiny_dep SHARED test/fixtures/tiny_dep.cpp)
+    target_compile_definitions(tiny_dep PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_dep PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(tiny_dep PRIVATE /NODEFAULTLIB /ENTRY:DllMain)
+    set_target_properties(tiny_dep PROPERTIES
+      OUTPUT_NAME tiny_dep
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
 
     add_library(tiny_dll SHARED test/fixtures/tiny_dll.cpp)
     target_compile_definitions(tiny_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_dll PRIVATE /W4 /permissive- /utf-8 /GS-)
     set_target_properties(tiny_dll PROPERTIES
       OUTPUT_NAME tiny_dll
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    add_library(tiny_init_root SHARED test/fixtures/tiny_init_root.cpp)
+    target_link_libraries(tiny_init_root PRIVATE tiny_dep)
+    target_compile_definitions(tiny_init_root PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_init_root PRIVATE /W4 /permissive- /utf-8 /GS-)
+    target_link_options(tiny_init_root PRIVATE /NODEFAULTLIB /ENTRY:DllMain)
+    set_target_properties(tiny_init_root PROPERTIES
+      OUTPUT_NAME tiny_init_root
       PREFIX ""
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
       ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
@@ -210,7 +235,7 @@ if(BUILD_TESTING)
     target_compile_options(pe_loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(pe_loader_test PRIVATE /OPT:NOREF)
     target_link_libraries(pe_loader_test PRIVATE gta6rt_d3d12_xs_rootsig psapi)
-    add_dependencies(pe_loader_test tiny_dll tiny_exe)
+    add_dependencies(pe_loader_test tiny_dep tiny_init_root tiny_dll tiny_exe)
 
     # `gta6rt --run` rehearsal: a stand-in game EXE (CRT startup, statics, heap, files, threads) that imports
     # xgameruntime.dll from a link-time stub; under --run the shim registry answers those imports instead.
