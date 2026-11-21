@@ -233,8 +233,8 @@ class Gen:
                 self.x_gen += 1
 
     # ---- register access ----
-    def load_reg(self, kind, r):
-        if (kind, r) in self.mask_data:  # a lane mask read as data: the wave's bits, not this lane's (mask_as_data)
+    def load_reg(self, kind, r, raw=False):
+        if not raw and (kind, r) in self.mask_data:  # a lane mask read as data: the wave's bits, not this lane's (mask_as_data)
             return self.mask_data[(kind, r)]
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         p, t = self.tmp(), self.tmp()
@@ -822,7 +822,21 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
-        if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
+        if a["k"] == "special" and a["t"] == "exec_lo":
+            # A lane is active iff its bit is set: (val >> (lane & 31)) & 1. For a lane mask (this lane's 0 or ~0)
+            # that is the same as val != 0; a lane mask read as data (mask_as_data) has the wave's bits instead.
+            # In wave64 only lanes 0-31 change (exec_hi is left alone).
+            sh, bit = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpBitwiseAnd %uint {self.wave_lane()} {self.cu(31)}")
+            self.emit(f"{bit} = OpBitFieldUExtract %uint {val} {sh} {self.cu(1)}")
+            if self.wave64:
+                on = self.tmp()
+                self.emit(f"{on} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+                self.exec_half_write(0, on)
+            else:
+                self.set_exec(bit)
+            return
+        if a["k"] == "special" and a["t"] == "exec":
             self.set_exec(val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
@@ -2811,6 +2825,13 @@ class Gen:
             out[key] = hi if k == lane_masks.MASK_HI else lo
         return out
 
+    def mask_data64(self, a):
+        """A 64-bit SALU op (s_and_b64 …, s_cselect_b64) whose lane-mask sources are read as data here
+        (lane_masks.data_reads, mask_as_data): the wave's bits are in mask_data, so it takes the data path on both
+        words. Not when a source is EXEC/VCC itself (the mask path keeps those per lane)."""
+        return bool(self.mask_data) and all(
+            x["k"] in ("sgpr", "imm") or (x["k"] == "special" and x.get("t") == "null") for x in a[1:3])
+
     def lane_bits(self, b):
         """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
         lane = self.wave_lane()
@@ -2824,9 +2845,10 @@ class Gen:
         return lo_in, hi_in
 
     def mask_src(self, a):
-        """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane."""
+        """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. Always this lane's bit, even
+        when the same register is also read as data in the instruction (v_cndmask_b32 v1, s20, 0, s[20:21])."""
         if a["k"] == "sgpr":
-            return self.load_reg("sgpr", a["r"])
+            return self.load_reg("sgpr", a["r"], raw=True)
         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
             v = self.tmp()
             self.emit(f"{v} = OpLoad %uint %vcc")
@@ -5238,7 +5260,7 @@ class Gen:
                  "orn2": "OpBitwiseOr"}[op.split("_")[1]]
             if op.endswith("_mask") or \
                     (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
-                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
+                    ((self.is_mask_op(a[1]) or self.is_mask_op(a[2])) and not self.mask_data64(a)):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 r = self.tmp()
                 if op.endswith("n2_b64"):
@@ -5269,7 +5291,7 @@ class Gen:
                 self.scc_nonzero(orr)
         elif op == "s_cselect_b64":
             if (a[0]["k"] == "special" and a[0].get("t", "").startswith(("exec", "vcc"))) or \
-                    self.is_mask_op(a[1]) or self.is_mask_op(a[2]):
+                    ((self.is_mask_op(a[1]) or self.is_mask_op(a[2])) and not self.mask_data64(a)):
                 x, y = self.mask_src(a[1]), self.mask_src(a[2])
                 c, b, r = self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{c} = OpLoad %uint %scc")
