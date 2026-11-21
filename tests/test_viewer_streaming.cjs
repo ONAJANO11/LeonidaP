@@ -197,3 +197,75 @@ test('generated test terrain loads without network requests', () => {
     assert(f.state.live.get('chunk_0').obj);
     assert.equal(f.state.live.get('chunk_0').loading, false);
 });
+
+test('the demonstration camera orbits while looking at the same point', async () => {
+    const { tourPose } = await import('../viewer/tour.mjs');
+    const first = tourPose(0);
+    assert.deepEqual(tourPose(48), first);
+    for (let second = 0; second < 48; second++) {
+        const { x, y, z, yaw, pitch } = tourPose(second);
+        const distance = Math.hypot(x, z);
+        assert(Math.abs(distance - 620) < 1e-10);
+        assert(Math.abs(y + Math.tan(pitch) * distance - 25) < 1e-10);
+        assert(Math.abs(x - Math.sin(yaw) * distance) < 1e-10);
+        assert(Math.abs(z - Math.cos(yaw) * distance) < 1e-10);
+    }
+    assert.notEqual(tourPose(12).z, first.z);
+});
+
+test('the tour button and Escape return control to manual flight', () => {
+    const listeners = new Map();
+    const tour = { setAttribute(name, value) { this[name] = value; } };
+    const start = {
+        classList: { toggle(name, hidden) { this[name] = hidden; } },
+        focus() { this.focused = true; },
+    };
+    const context = vm.createContext({
+        addEventListener: (name, fn) => listeners.set(name, fn),
+        document: {
+            getElementById: id => ({ start, tour })[id],
+            addEventListener() {},
+        },
+        renderer: { domElement: { addEventListener() {} } },
+    });
+    const freecam = html.indexOf('// ---------- freecam ----------');
+    assert(freecam >= 0 && freecam < begin, 'viewer camera controls must exist');
+    vm.runInContext(html.slice(freecam, begin), context);
+
+    tour.onclick();
+    assert.equal(tour['aria-pressed'], 'true');
+    assert.equal(start.classList.hidden, true);
+    listeners.get('keydown')({ code: 'Escape' });
+    assert.equal(tour['aria-pressed'], 'false');
+    assert.equal(start.classList.hidden, false);
+    assert.equal(start.focused, true);
+    tour.onclick();
+    tour.onclick();
+    assert.equal(tour['aria-pressed'], 'false');
+});
+
+test('pointer-lock failures move focus to the canvas and show the drag hint once', async () => {
+    const listeners = new Map();
+    const start = { classList: { toggle(name, hidden) { this[name] = hidden; } } };
+    const help = { hints: 0, insertAdjacentHTML() { this.hints++; } };
+    const canvas = {
+        addEventListener() {},
+        focus() { this.focused = true; },
+        requestPointerLock() { return Promise.reject(new Error('pointer lock denied')); },
+    };
+    const context = vm.createContext({
+        addEventListener() {},
+        document: {
+            getElementById: id => ({ start, tour: {}, help })[id],
+            addEventListener: (name, fn) => listeners.set(name, fn),
+        },
+        renderer: { domElement: canvas },
+    });
+    vm.runInContext(html.slice(html.indexOf('// ---------- freecam ----------'), begin), context);
+
+    await start.onclick();
+    assert.equal(start.classList.hidden, true);
+    assert.equal(canvas.focused, true);
+    listeners.get('pointerlockerror')();
+    assert.equal(help.hints, 1);
+});

@@ -14,12 +14,18 @@
   #banner.hidden { display: none; }
   #help { position: fixed; bottom: 12px; left: 12px; background: var(--panel); padding: 10px 12px; border-radius: 8px; color: var(--dim); }
   #help kbd { color: var(--fg); background: #1c2129; padding: 0 5px; border-radius: 3px; }
-  #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.45); cursor: pointer; font-size: 15px; }
+  #start { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; padding: 0; display: grid; place-items: center; background: rgba(0,0,0,.15); color: var(--fg); cursor: pointer; font: inherit; font-size: 15px; }
+  #start span { background: var(--panel); padding: 8px 12px; border-radius: 6px; }
+  #start:focus-visible span { outline: 2px solid var(--accent); }
   #start.hidden { display: none; }
+  #tour { position: fixed; bottom: 12px; right: 12px; z-index: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--dim); border-radius: 6px; padding: 8px 12px; cursor: pointer; font: inherit; }
+  #tour[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
   @media (max-width: 760px) {
     #hud { right: 12px; min-width: 0; }
     #banner { top: auto; bottom: 104px; left: 12px; max-width: none; }
     #help { right: 12px; }
+    #tour { bottom: auto; top: 12px; }
+    body:has(#tour:not([hidden])) #hud { padding-right: 130px; }
   }
 </style>
 </head>
@@ -30,7 +36,8 @@
   <kbd>W A S D</kbd> move · <kbd>Q</kbd>/<kbd>E</kbd> down/up · <kbd>Shift</kbd> fast · <kbd>Ctrl</kbd> slow · wheel: speed<br>
   <kbd>F</kbd> wireframe · <kbd>T</kbd> textures/clay · <kbd>G</kbd> chunk bounds · <kbd>R</kbd> back to spawn · <kbd>Esc</kbd> release mouse
 </div>
-<div id="start">Click to fly</div>
+<button id="start" type="button"><span>Free flight</span></button>
+<button id="tour" type="button" aria-pressed="false" hidden>Auto tour</button>
 
 <script type="importmap">
 { "imports": {
@@ -41,6 +48,7 @@
 <script type="module">
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { tourPose } from "./tour.mjs";
 
 // ---------- world description ----------
 // world/world.json: { "spawn": [x,y,z], "chunks": [ { "id", "url", "bounds": [minx,miny,minz,maxx,maxy,maxz] } ] }
@@ -108,6 +116,7 @@ function buildTestChunk([cx, cz, size]) {
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
 renderer.setSize(innerWidth, innerHeight);
+renderer.domElement.tabIndex = -1;
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9cc3e6);
@@ -121,16 +130,45 @@ addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; cam
 const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
 // Pointer lock when the browser allows it; embedded views (iframes, preview panes) fall back to drag-to-look.
 const start = document.getElementById("start");
+const tour = document.getElementById("tour");
 let dragLook = false, dragging = false;
+let touring = false, tourSeconds = 0;
+function updateStartPrompt() {
+  start.classList.toggle("hidden", locked || dragLook || touring);
+}
+function focusFreeFlight() {
+  (dragLook ? renderer.domElement : start).focus();
+}
+function setTour(active) {
+  touring = active;
+  tour.setAttribute("aria-pressed", String(active));
+  if (active && locked) document.exitPointerLock();
+  updateStartPrompt();
+}
+tour.onclick = () => setTour(!touring);
+function enableDragLook() {
+  if (dragLook) return;
+  dragLook = true;
+  updateStartPrompt();
+  document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look");
+  focusFreeFlight();
+}
 start.onclick = async () => {
   try { await renderer.domElement.requestPointerLock(); }
-  catch { dragLook = true; start.classList.add("hidden"); document.getElementById("help").insertAdjacentHTML("beforeend", "<br>mouse lock unavailable here: drag to look"); }
+  catch { enableDragLook(); }
 };
-document.addEventListener("pointerlockchange", () => { locked = document.pointerLockElement === renderer.domElement; start.classList.toggle("hidden", locked || dragLook); });
+document.addEventListener("pointerlockerror", enableDragLook);
+document.addEventListener("pointerlockchange", () => {
+  const wasLocked = locked;
+  locked = document.pointerLockElement === renderer.domElement;
+  updateStartPrompt();
+  if (locked) renderer.domElement.focus();
+  else if (wasLocked && !touring) focusFreeFlight();
+});
 renderer.domElement.addEventListener("mousedown", () => { dragging = true; });
 addEventListener("mouseup", () => { dragging = false; });
 addEventListener("mousemove", e => {
-  if (!locked && !(dragLook && dragging)) return;
+  if (touring || (!locked && !(dragLook && dragging))) return;
   yaw -= e.movementX * 0.0022; pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.0022, -1.55, 1.55);
 });
 addEventListener("wheel", e => { speed = THREE.MathUtils.clamp(speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1, 3000); }, { passive: true });
@@ -139,7 +177,14 @@ addEventListener("keydown", e => {
   if (e.code === "KeyF" && !e.repeat) wire = !wire, applyWire();
   if (e.code === "KeyT" && !e.repeat) clay = !clay, applyClay();
   if (e.code === "KeyG" && !e.repeat) showBounds = !showBounds, boundsGroup.visible = showBounds;
-  if (e.code === "KeyR") camera.position.fromArray(world.spawn);
+  if (e.code === "Escape" && touring) {
+    setTour(false);
+    focusFreeFlight();
+  }
+  if (e.code === "KeyR") {
+    if (touring) setTour(false);
+    camera.position.fromArray(world.spawn);
+  }
 });
 addEventListener("keyup", e => keys.delete(e.code));
 addEventListener("blur", () => keys.clear());
@@ -252,8 +297,10 @@ function stream(now = performance.now()) {
 // ---------- main loop ----------
 const world = await loadWorld();
 camera.position.fromArray(world.spawn);
+tour.hidden = !world.test;
+if (world.test && new URLSearchParams(location.search).has("tour")) setTour(true);
 const banner = document.getElementById("banner");
-if (world.test) banner.innerHTML = "<b>TEST TERRAIN</b>: generated in the browser. No <code>world/world.json</code> found.<br>" +
+if (world.test) banner.innerHTML = "<b>TEST TERRAIN</b> generated in the browser.<br>" +
   "Build chunks with <code>python -I tools/world_build.py &lt;work&gt;\\assets --out &lt;work&gt;\\world</code> and serve with " +
   "<code>python -I viewer/serve.py --world &lt;work&gt;\\world</code>.";
 else banner.classList.add("hidden");
@@ -266,13 +313,20 @@ let fpsT = 0, fpsN = 0, fps = 0;
 const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
+  if (touring) {
+    const pose = tourPose(tourSeconds);
+    camera.position.set(pose.x, pose.y, pose.z);
+    yaw = pose.yaw;
+    pitch = pose.pitch;
+    tourSeconds += dt;
+  }
   camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
   camera.getWorldDirection(fwd); right.crossVectors(fwd, up).normalize();
   const v = new THREE.Vector3(), s = speed * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? 5 : 1) * (keys.has("ControlLeft") ? 0.2 : 1);
   if (keys.has("KeyW")) v.add(fwd); if (keys.has("KeyS")) v.sub(fwd);
   if (keys.has("KeyD")) v.add(right); if (keys.has("KeyA")) v.sub(right);
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;
-  if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), s * dt);
+  if (!touring && v.lengthSq()) camera.position.addScaledVector(v.normalize(), s * dt);
   stream();
   renderer.render(scene, camera);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
