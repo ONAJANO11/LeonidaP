@@ -758,7 +758,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wm_as_data", "cs_wm_as_data2", "cs_wm_as_data32", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -801,6 +801,9 @@ def run_suite(a, work: str) -> int:
                 "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],       # cs_wqm_w64.asm / cs_wqm_w32.asm headers
                 "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
                 "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
+                "cs_wm_as_data": [0xfafafafa, 0xfafafafa, 0x7d7d7d7d, 0xfa, 0xfafafafa, 0xafafafaf, 0xfafafafb, 0xfafafafd],  # #210: a lane mask read as data
+                "cs_wm_as_data32": [0xfafafafa, 0xfafafaf, 0xfafbf900, 0xfafafafa],  # wave32
+                "cs_wm_as_data2": [0xffff0000, 0x10000, 0xff, 0xff, 24, 2, 0xffff0001, 0xffff0000],
                 # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
                 "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
                 "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
@@ -830,7 +833,7 @@ def run_suite(a, work: str) -> int:
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16, the wave32 cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64)
+            # cs_w32_lds_u8_d16, the wave32 cs_wqm_w32 / cs_bpermute32 / cs_wm_as_data32 and the DPP tests is a whole-wave (wave64)
             # mask test: ask for a 64-wide subgroup and skip, as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
             # translated with --wave64-emulate and run on any subgroup size.
@@ -842,7 +845,7 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
                                   "cs_exec_const", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_wm_as_data32") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
@@ -853,7 +856,8 @@ def run_suite(a, work: str) -> int:
                 ok, detail = None, str(skip)
             else:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
-                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16"))
+                                           hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16", "cs_wm_as_data",
+                                                           "cs_wm_as_data2", "cs_wm_as_data32"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])

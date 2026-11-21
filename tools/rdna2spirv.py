@@ -157,6 +157,8 @@ class Gen:
         self.lane_masks = {}           # id(instruction) -> registers holding a lane mask there (lane_masks.py)
         self.cur_masks = {}
         self.mask_writes = set()       # id(instruction) of the ones that write a lane mask to a VGPR
+        self.mask_data_reads = {}      # id(instruction) -> lane-mask registers it reads as data (lane_masks.py)
+        self.mask_data = {}            # those registers' whole-wave bits for the current instruction
         self.write_all_lanes = False
         self.dpp_guard = None       # per-lane bool: a DPP instruction's row/bank/valid write mask
         self.parked = {}               # (vgpr, lane) a mask is parked in -> the spare SGPR slot that keeps it per lane
@@ -232,6 +234,8 @@ class Gen:
 
     # ---- register access ----
     def load_reg(self, kind, r):
+        if (kind, r) in self.mask_data:  # a lane mask read as data: the wave's bits, not this lane's (mask_as_data)
+            return self.mask_data[(kind, r)]
         arr = "%vgpr" if kind == "vgpr" else "%sgpr"
         p, t = self.tmp(), self.tmp()
         self.emit(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {self.cu(r)}")
@@ -239,6 +243,7 @@ class Gen:
         return t
 
     def store_reg(self, kind, r, val):
+        self.mask_data.pop((kind, r), None)
         if kind == "sgpr":
             self.sgpr_imm.pop(r, None)
             self.x_tok[("sgpr", r)] = val
@@ -257,6 +262,8 @@ class Gen:
             v = self.load_reg(k, a["r"])
         elif k == "special" and a["t"] == "null":
             v = self.cu(0)                # RDNA 'null' source reads as zero (e.g. soffset)
+        elif k == "special" and ("special", a["t"]) in self.mask_data:
+            v = self.mask_data[("special", a["t"])]
         elif k == "special" and a["t"] in ("exec_lo", "exec", "exec_hi"):
             v = self.exec_value()
         elif k == "special" and a["t"] == "m0":
@@ -2545,7 +2552,8 @@ class Gen:
     def park_masks(self, blocks):
         """Run the lane-mask analysis and give every VGPR lane a mask is fetched back from a slot of its own,
         after the real registers in the %sgpr array (the array grows by as many)."""
-        self.lane_masks, self.mask_writes = lane_masks.analyse(*blocks)
+        self.mask_data_reads = {}
+        self.lane_masks, self.mask_writes = lane_masks.analyse(*blocks, reads=self.mask_data_reads)
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
@@ -2615,12 +2623,16 @@ class Gen:
                 key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")))
             if key in self.x_mcache:
                 return self.x_mcache[key]
-        mine = self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a))
+        res = self.wave_bits(self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a)))
+        if key is not None:
+            self.x_mcache[key] = res
+        return res
+
+    def wave_bits(self, mine):
+        """Every lane's bool `mine` as the wave's mask bits: (lanes 0-31, lanes 32-63), the same in every lane."""
+        self.uses_subgroup = self.uses_wave_bits = True
         if self.emulate:
-            res = self.x_round(bits=self.lane_bits(mine))[1]
-            if key is not None:
-                self.x_mcache[key] = res
-            return res
+            return self.x_round(bits=self.lane_bits(mine))[1]
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
         self.emit(f"{low} = OpULessThan %bool {lane} {self.cu(32)}")
@@ -2774,6 +2786,30 @@ class Gen:
             nz = self.tmp()
             self.emit(f"{nz} = OpBitwiseOr %uint {res[0]} {res[1]}")
         self.scc_nonzero(nz)
+
+    def mask_as_data(self, reads):
+        """The whole-wave bits of each lane-mask register an instruction reads as plain data (lane_masks.data_reads):
+        {key: uint}, the word for lanes 0-31 (MASK_LO, or a wave32 MASK) or lanes 32-63 (MASK_HI). A register
+        holds only this lane's bit, so v_mov_b32 v1, s20 then a store, s_lshr_b32 of a mask, or an s_mov_b64 copy
+        read back with v_mov_b32 all saw 0 or 0xffffffff, where hardware sees the mask (#210). All of them are
+        gathered before the instruction emits anything (the emulated wave64 path splits the block there).
+        A wave64 VGPR mixing both halves (MASK) is left as it was: which half a lane would see is not known."""
+        out = {}
+        for key, k in reads.items():
+            if k == lane_masks.MASK and self.wave64:
+                continue
+            kind, r = key
+            if kind == "special":
+                if r.startswith("exec"):
+                    mine = self.exec_value()
+                else:
+                    mine = self.tmp()
+                    self.emit(f"{mine} = OpLoad %uint %vcc")
+            else:
+                mine = self.load_reg(kind, r)
+            lo, hi = self.wave_bits(self.tmp_bool_nz(mine))
+            out[key] = hi if k == lane_masks.MASK_HI else lo
+        return out
 
     def lane_bits(self, b):
         """This lane's bool as its bit of a 64-lane mask: (lanes 0-31 word, lanes 32-63 word), one of them 0."""
@@ -2974,6 +3010,9 @@ class Gen:
         self.write_all_lanes = id(ins) in self.mask_writes
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
+        self.mask_data = {}
+        if id(ins) in self.mask_data_reads:
+            self.mask_data = self.mask_as_data(self.mask_data_reads[id(ins)])
         if ins["op"].endswith("_dpp"):
             return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
