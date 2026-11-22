@@ -1175,8 +1175,6 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
-    if name == "ps_interp_f16_high" and BARY_FALLBACK:
-        return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
     px, out = pixels(tools, spirv, name, fmt, PIXEL_VERTEX.get(name, "vs_ids"))
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
