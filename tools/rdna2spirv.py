@@ -3429,6 +3429,15 @@ class Gen:
             return g
         return v
 
+    def clamp_f16(self, v, mods):
+        """clamp_mods for a 16-bit float result: clamp to [0, 1], but no output modifier. On RDNA2 an omod
+        (mul:2 / mul:4 / div:2) on an f16 result acts only with MODE.IEEE = 0 and f16 denormals flushed
+        (denorm_mode_16_64 = 0); with f16 denormals kept, which is what the translator assumes, the hardware leaves
+        the result as it is (gfx1036 raw kernels: v_add/mul/fma/fmac_f16, v_cvt_f16_f32, v_exp/rcp_f16;
+        docs/shader_validation.md, SHADER-135). The game's shaders carry no omod on any of their
+        201,864 f16-result instructions (SHADER-297), so this changes no translated game shader."""
+        return self.clamp_mods(v, [m for m in mods if m not in ("mul:2", "mul:4", "div:2")])
+
     def flush_f32(self, f):
         """v_mad_f32, v_mac_f32 and v_mad_legacy_f32 have no f32 denormal support: a subnormal operand or result
         reads as signed zero, whatever the MODE register says. LLVM's SITargetLowering::isFMADLegal forms
@@ -4056,7 +4065,7 @@ class Gen:
             f = self.modify_f(f, a[1])
             t = self.turn_angle(f)
             self.emit(f"{r} = OpExtInst %float %glsl {'Sin' if 'sin' in op else 'Cos'} {t}")
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)
             self.write_lo16(a[0], self.f16_bits(r))    # sin ignores MODE rounding on hardware (RX 6800, SHADER-35); cos is unmeasured, assumed like it
         elif op in ("v_pk_add_u16", "v_pk_add_i16", "v_pk_sub_u16", "v_pk_sub_i16", "v_pk_mul_lo_u16",
                     "v_pk_mad_u16", "v_pk_mad_i16", "v_pk_max_u16", "v_pk_max_i16", "v_pk_min_u16", "v_pk_min_i16"):
@@ -5000,7 +5009,7 @@ class Gen:
             sel, dhi = self.opsel_bits(mods, 3)
             vals = [self.f16_in(a[1], sel[0]), self.f16_in(a[2], sel[1]), self.f16_in(a[0], sel[2])]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
@@ -5211,7 +5220,7 @@ class Gen:
             sel, dhi = self.opsel_bits(mods, 3)     # op_sel:[src0,src1,src2,dst]
             vals = [self.f16_in(s, sel[i]) for i, s in enumerate(a[1:4])]
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op in ("v_pk_add_f16", "v_pk_mul_f16", "v_pk_max_f16", "v_pk_min_f16", "v_pk_fma_f16"):
             # Packed f16x2 (VOP3P). Result lo: source i takes its half from op_sel[i] (0 = lo, 1 = hi), negated by
@@ -5381,7 +5390,7 @@ class Gen:
                 m, r = self.tmp(), self.tmp()
                 self.emit(f"{m} = OpExtInst %float %glsl {f} {vals[0]} {vals[1]}")
                 self.emit(f"{r} = OpExtInst %float %glsl {f} {m} {vals[2]}")
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, dhi)    # opsel-capable VOP3: keeps the other half (Mesa ACO can_use_opsel)
         elif op in ("v_qsad_pk_u16_u8", "v_mqsad_pk_u16_u8"):
             # Four byte-SADs packed as u16 (RDNA ISA pseudocode): for k = 0..3, D.u16[k] = (S2.u16[k] + SAD of the
@@ -5559,12 +5568,10 @@ class Gen:
                 self.emit(f"{r} = OpFDiv %float %f1 {f}")
             if fn == "Fract":
                 r = self.fract_below_one(r)
-            r = self.clamp_mods(r, mods)
-            # 0x3c00 -> 0x3bff only when 0x3c00 is Fract's own rounding: after mul:2 fract(0.5) is a true 1.0.
-            omod = any(m in ("mul:2", "mul:4", "div:2") for m in mods)
+            r = self.clamp_f16(r, mods)     # no omod on an f16 result, so a 1.0 here is always Fract's own rounding
             # rcp/rsq/sqrt (and sin below) ignore MODE rounding on hardware (RX 6800, SHADER-35); exp, log (and cos
             # below) are unmeasured, assumed like them: nearest even always.
-            self.f16_out(a[0], r, dhi, fract=fn == "Fract" and not omod,
+            self.f16_out(a[0], r, dhi, fract=fn == "Fract",
                          mode=op not in ("v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_exp_f16", "v_log_f16"))  # GFX10: f16 ops keep the other half
         elif op == "v_not_b32":
             x = self.src_u(a[1])
@@ -5598,7 +5605,7 @@ class Gen:
                     r = self.sum_toward_zero(vals[0], ny, r)
             else:
                 self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if 'max' in op else 'NMin'} {vals[0]} {vals[1]}")
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
         elif op.startswith(("v_cmp_", "v_cmpx_")) and op.endswith(("_u64", "_i64")) and op.split("_")[2] in ("eq", "ne", "lg"):
             # 64-bit equality compare: both halves of the register pairs. GFX10 v_cmpx has no destination operand:
@@ -6382,7 +6389,7 @@ class Gen:
             if op == "v_interp_p2_f16":
                 # VOP3 clamp applies to the f16 result (ACO: dst(F16); llvm-mc takes clamp but no omod on this op).
                 # Until 2026-11-22 it was dropped.
-                self.dst(a[0], self.f16_res(self.clamp_mods(f, mods)))
+                self.dst(a[0], self.f16_res(self.clamp_f16(f, mods)))
             else:   # p1ll/p1lv produce the f32 intermediate consumed by p2_f16
                 self.dst(a[0], self.tou(f))
         elif op.startswith("s_cmp_"):
@@ -6424,7 +6431,7 @@ class Gen:
         elif op in ("v_fma_mixlo_f16", "v_fma_mixhi_f16"):
             vals = self.fma_mix_srcs(a, mods)
             r = self.fma_mix_odd(*vals)
-            r = self.clamp_mods(r, mods)
+            r = self.clamp_f16(r, mods)     # VOP3P: clamp only
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
             # Convert src0 to u8 (round to nearest even, clamp) and insert it at byte src1 of src2.

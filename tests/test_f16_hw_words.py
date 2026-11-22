@@ -38,6 +38,8 @@ HARDWARE = {
     # neg/abs on the selected half: a sign flip / clear before packing (SHADER-260; the rule was measured on
     # gfx1036 and these words follow it, they are not a direct readback of this shader)
     "ps_f16_pack_mods": (0x4400B400, 0xC4003400, 0x4400C200, 0xB400B400),
+    # measured on a gfx1036 (RDNA2 iGPU) raw kernel in the same MODE, wave32 and wave64 (SHADER-297)
+    "ps_f16_omod": (0xAAAA3F00, 0xAAAA3A00, 0xAAAA3F00, 0xAAAA3C00),
 }
 OLD = 0xAAAA5555
 
@@ -148,10 +150,17 @@ def ref_pack_mods():
             hi0 ^ 0x8000 | lo1 << 16, lo0 ^ 0x8000 | (hi1 ^ 0x8000) << 16)
 
 
+def ref_omod():
+    """No omod on an f16 result with f16 denormals kept (docs/design.md): mul:2 / mul:4 / div:2 change nothing."""
+    old = 0xAAAA0000
+    return (to_lo(old, 0.75 + 1.0), to_lo(old, 0.75 * 1.0), to_lo(old, 0.75 * 1.0 + 1.0), to_lo(old, 2.0 ** 0))
+
+
 REFERENCE = {"ps_f16_med3_opsel": ref_med3_opsel, "ps_f16_med3_mods": ref_med3_mods, "ps_f16_vop2": ref_vop2,
              "ps_f16_vop2b": ref_vop2b, "ps_f16_vop1": ref_vop1, "ps_f16_vop1b": ref_vop1b,
              "ps_f16_const": ref_const, "ps_f16_const2": ref_const2, "ps_f16_pack": ref_pack,
-             "ps_f16_pack_mods": ref_pack_mods}
+             "ps_f16_pack_mods": ref_pack_mods,
+             "ps_f16_omod": ref_omod}
 NAMES = sorted(HARDWARE)
 
 
