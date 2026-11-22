@@ -45,14 +45,14 @@ work on booting can start as soon as one is available to a developer.
 |---|---|
 | Finding and checking your copy (Xbox Series 1.0.2.1) | ✅ Works |
 | Shaders: carve, unpack native RDNA2 code, disassemble | ✅ All 26,503 |
-| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD), and cross-half wave ops are approximate on 32-wide (NVIDIA) |
-| Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) pass on 13 GPUs reported in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell; AMD RDNA2 and RDNA3 (Windows driver and RADV); Apple M1 (MoltenVK, no geometry or mesh stages). Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`; `cs_w64x_partial` still fails on native wave64 until #204. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
+| Shaders: RDNA2 → SPIR-V translation | ✅ **All 26,503**: 2,236 VS, 12,101 PS, 2,689 CS, 9,282 mesh, 195 geometry. All pass `spirv-val`, with a per-shader metadata index for pipeline creation. ⚠️ 21,545 are wave64: exact on 64-wide subgroups (AMD). On 32-wide subgroups (NVIDIA, Intel), compute and mesh shaders are exact with wave64 emulation (`--wave64-emulate`, on by default there); cross-half wave ops in vertex, pixel and geometry shaders are still approximate |
+| Shader translator checked on a real GPU | ⚠️ The hand-written GPU tests (vertex fetch, texture sampling, exports, ALU ops, partial-register ops, barycentrics, wave-uniform branches, compute LDS/barriers/buffer stores, wave64 masks) have been run on more than 30 GPU and driver combinations, with results in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): NVIDIA Turing, Ampere, Ada and Blackwell (Windows and Linux); AMD GCN3, RDNA1, RDNA2, RDNA3 and RDNA4 (Windows driver and RADV); Intel Gen9 (ANV); Apple M1 (MoltenVK, no geometry or mesh stages); and Mesa llvmpipe. Wave64 tests need 64-wide subgroups (AMD) or `LEONIDA_W64_EMULATE=1`. These are small test shaders: the game's own shaders are checked by `spirv-val` and by driver pipeline creation (`vk_pipeline_check`), not by their output |
 | Models (OBJ with real names, UVs, material references) | ✅ Exported. Not all layouts are decoded yet |
-| Texture dictionaries and world texture pools (DDS) | ✅ Exported. Some pool entries (BCPack) are skipped |
+| Texture dictionaries and world texture pools (DDS) | ✅ Exported. Pool entries stored as BCPack are still skipped by the export; a clean-room decoder (`tools/bcpack.py`) rebuilds BC1, BC3, BC4 and BC5, and is not wired into `rpf9dump` yet ([notes](docs/textures.md)) |
 | Audio banks (AWC: Opus, XMA2) | ✅ Exported whole. Opus repackaged **losslessly** as Ogg Opus; PCM (codec 0/2) as WAV; XMA2 decoded with ffmpeg. `--wav` adds 16-bit PCM WAV ([notes](docs/audio.md)) |
 | Music/radio config | ? Measured. **1,589** audio-config records with exact durations and AWC stream ids; station grouping and content-id lists; no per-track start offsets ([notes](docs/audio_config.md)) |
-| PE loader and import shims | ⚠️ Skeleton. Untested against the real executable |
-| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, views and committed resources; barriers, clears, uploads and copies (BC included) run on Vulkan, frames are presented to a window (milestone M0 passes in a synthetic test), and compute and graphics pipelines dispatch and draw with root arguments through a GPU address arena (milestone M1 passes with stand-in shaders), checked on one GPU. No bindless descriptors yet (so translated game shaders that declare bindings are refused), and the game's own present call is not hooked up ([plan](docs/d3d12_vulkan.md)) |
+| PE loader and import shims | ⚠️ Runs a stand-in executable end to end (`gta6rt --run`: CRT startup, statics, heap, files, threads, GDK imports through the shims, exit code back). Untested against the real executable |
+| Xbox D3D12 → Vulkan | ⚠️ In progress. A Vulkan-backed device behind the Xbox-ABI proxy creates queues, command lists, fences, descriptor heaps, committed and reserved resources, render-target and depth views, and texture views and samplers (which go into the bindless set). Barriers, clears, uploads, copies (BC included) and colour resolves run on Vulkan, frames are presented to a window (milestone M0 passes in a synthetic test), and compute and graphics pipelines dispatch and draw with root arguments through a GPU address arena (milestone M1 passes with stand-in shaders), checked on one GPU. Pipelines do not bind the bindless set yet (so translated game shaders that declare bindings are refused), there are no buffer views, and the game's own present call is not hooked up ([plan](docs/d3d12_vulkan.md)) |
 | Booting, story mode, anything playable | ❌ No |
 
 ## How to build
@@ -80,7 +80,7 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 
 - **Your own copy** of the Xbox Series package, version 1.0.2.1.
 - **Windows 10/11 x64**, with about **350 GB** free for work files. They can go on another drive with `--work`.
-- [Python 3.11+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
+- [Python 3.12+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
@@ -88,7 +88,8 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
   (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`. Or install `llvm-21` in WSL and set
   `LLVM_MC` to the whole command, `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"` (see
   [docs/design.md](docs/design.md#disassembling-shaders)). On Linux, `llvm-mc` on PATH is enough.
-- Visual Studio 2022 with **Desktop development with C++**, for the runtime stage.
+- Visual Studio 2022 with **Desktop development with C++** and the **Windows SDK 10.0.26100 or newer**, for the
+  runtime stage (the runtime uses version 1.2 root signatures, which older SDKs don't declare).
 - [ffmpeg](https://ffmpeg.org/download.html) on PATH (optional: decodes the XMA2 streams, and required for `--wav`).
 
 **From a terminal**, with the same behaviour and more control:
@@ -105,8 +106,10 @@ python -I make_game.py --wave64-emulate off            # auto (default), on or o
 `--wave64-emulate` decides whether wave64 compute and mesh shaders are translated to be exact on any subgroup size
 (see "Wave64 emulation" in [docs/design.md](docs/design.md)). NVIDIA and Intel GPUs have 32-wide subgroups and need
 it. The default, `auto`, asks `vulkaninfo` (part of the Vulkan SDK) and turns it on unless every GPU reports 64-wide
-subgroups, or when it can't tell. The mode is saved next to the translated shaders, and changing it translates them
-again.
+subgroups, or when it can't tell; it also turns it on when the GPU the runtime would use can't be made to run
+compute and mesh shaders 64-wide. The mode is saved next to the translated shaders, and changing it translates them
+again. With `auto`, shaders already translated with emulation are kept even when this run would not emulate (they are
+exact on every GPU); `--wave64-emulate off` translates them natively.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
@@ -152,7 +155,9 @@ read and the licence limits on it.
 
 The biggest open pieces:
 
-- **Compute, mesh and geometry shaders**: their per-stage system-value register layout.
+- **Shader translator on hardware**: compute, mesh and geometry now translate (see the translator contract in
+  [docs/design.md](docs/design.md)); still open are the vertex-shader input layout (`v0` = `VertexIndex` is
+  unverified if the console runs VS as NGG) and wave64 cross-half code in VS/PS/GS on 32-wide subgroups.
 - **Xbox D3D12 → Vulkan**: the `d3d12_xs` command list and descriptor heap model.
 - **Model layouts** the decoder rejects today.
 

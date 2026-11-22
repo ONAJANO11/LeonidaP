@@ -1,8 +1,10 @@
 // Xbox Series D3D12 imports forwarded to the Windows D3D12 exports.
 // The SDK types describe the Windows side. The measured guest ABI differs in the root-signature flag word: Xbox
 // sets bits in the high byte (observed 0x03000000) and the PC serializer rejects them, so descriptors are copied
-// with that byte cleared before forwarding. D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h)
-// over the PC device; only the measured slots are overridden, the rest follow the PC vtable.
+// with that byte cleared before forwarding. On a host that serializes only up to 1.1 (Windows 10's built-in
+// d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags.
+// D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h) over the PC device; only the measured slots
+// are overridden, the rest follow the PC vtable.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -34,6 +36,22 @@ using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
 using LegacySerializeFn = decltype(&::D3D12SerializeRootSignature);
 using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 
+// Asked once: does the host serializer take version 1.2 at all? An empty 1.2 description is valid everywhere 1.2 is
+// supported; Windows 10's built-in d3d12.dll rejects it with E_INVALIDARG.
+bool host_serializes_1_2(SerializeFn fn) {
+    static const bool supported = [fn] {
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty{};
+        empty.Version = D3D_ROOT_SIGNATURE_VERSION_1_2;
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* error = nullptr;
+        const HRESULT hr = fn(&empty, &blob, &error);
+        if (blob) blob->Release();
+        if (error) error->Release();
+        return SUCCEEDED(hr);
+    }();
+    return supported;
+}
+
 HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
                                         ID3DBlob** blob, ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
@@ -47,6 +65,25 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
                      "forwarding unchanged (Xbox flags not cleared)\n",
                      static_cast<int>(desc->Version));
         return fn(desc, blob, error);
+    }
+    if (cleared.Version == D3D_ROOT_SIGNATURE_VERSION_1_2 && !host_serializes_1_2(fn)) {
+        // Windows 10's d3d12.dll stops at 1.1 (d3d12_xs_rootsig.h). Rewrite as 1.1 when nothing is lost.
+        std::vector<D3D12_STATIC_SAMPLER_DESC> samplers;
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC v11{};
+        if (!rt::d3d12_xs::downgrade_root_signature_1_2_to_1_1(cleared, samplers, v11)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: D3D12SerializeVersionedRootSignature: version 1.2 with static sampler flags, "
+                         "and the host d3d12.dll serializes only up to 1.1; refused\n");
+            if (blob) *blob = nullptr;
+            if (error) *error = nullptr;
+            return E_INVALIDARG;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: the host d3d12.dll serializes root signatures only up to 1.1; version 1.2 "
+                         "descriptions without static sampler flags are serialized as 1.1\n");
+        return fn(&v11, blob, error);
     }
     return fn(&cleared, blob, error);
 }
@@ -67,7 +104,16 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
     static auto fn = reinterpret_cast<DeserializerFn>(host("D3D12CreateRootSignatureDeserializer"));
-    return fn ? fn(data, size, iid, out) : E_NOTIMPL;
+    if (!fn) return E_NOTIMPL;
+
+    // The host deserializer rejects a blob whose RTS0 flags carry the Xbox high
+    // byte, so forward a copy with that byte cleared when present (the same fix
+    // the serializer applies to descriptors).
+    std::vector<uint8_t> cleared;
+    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        return fn(cleared.data(), cleared.size(), iid, out);
+    }
+    return fn(data, size, iid, out);
 }
 
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only

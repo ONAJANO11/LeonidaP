@@ -1,12 +1,16 @@
 // Tests for the native PE loader. Every image here is built byte by byte, so nothing from the game is needed and
-// nothing is read from the repo: the only files written go to a temporary directory.
+// nothing is read from the repo: the only files written go to a leonida_loader_test folder in the temporary
+// directory, or in LEONIDA_TEST_DIR when that is set (for machines whose security software blocks the images there).
 //
 // What it pins down: a valid image maps exactly as its headers say, and a truncated or corrupt one is rejected with
 // a message instead of being followed out of bounds. The truncation case covers every length of a valid image.
 #include <windows.h>
+#include <intrin.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "../shims/shims.h"
 #include "../src/pe_loader.h"
 
 namespace {
@@ -136,6 +141,12 @@ void* host_symbol(const char* dll, const char* name) {
     HMODULE h = GetModuleHandleA(dll);
     return h ? reinterpret_cast<void*>(GetProcAddress(h, name)) : nullptr;
 }
+
+// A shim table for the forwarder test, so the test does not depend on the real xmem shim. Registering it at startup
+// exercises the same registry a packaged module reaches.
+int g_test_shim_target = 0;
+void* test_shim_function() { return &g_test_shim_target; }
+SHIM_TABLE(test_forwarder_shim, {"testshim.dll", "F", reinterpret_cast<void*>(&test_shim_function)});
 
 // 0 when the image loaded, 1 when it was rejected. A crash here is a test failure, which is the point.
 int load(const std::filesystem::path& p, std::string& error) {
@@ -492,12 +503,21 @@ void test_initialise() {
             failed("initialise calls DllMain for a DLL", "the entry point never wrote its sentinel");
         else
             pass("initialise calls DllMain for a DLL");
-        uint32_t slot = *reinterpret_cast<const uint32_t*>(m.base + 0x10A0);
-        void* block = slot == TLS_OUT_OF_INDEXES ? nullptr : TlsGetValue(slot);
-        if (!block || std::memcmp(block, "TLS!", 4) != 0)
-            failed("the TLS template is copied into the allocated slot", "the slot doesn't hold the template");
+        // __declspec(thread) reads TEB->ThreadLocalStoragePointer[_tls_index] at gs:[58h], which is a different index
+        // space from the TlsAlloc slots. The loader writes the OS-assigned module index (reserved through
+        // gta6rt_tls_host.dll) into AddressOfIndex and puts the template copy in that TEB slot, so this reads exactly
+        // what mapped __declspec(thread) code would.
+        const uint32_t index = *reinterpret_cast<const uint32_t*>(m.base + 0x10A0);
+        auto** module_slots = reinterpret_cast<void**>(__readgsqword(0x58));
+        void* block = index == TLS_OUT_OF_INDEXES || index >= 64 || !module_slots ? nullptr : module_slots[index];
+        if (index != m.tls_index)
+            failed("the module TLS index is written to AddressOfIndex", "the image and the Module disagree");
         else
-            pass("the TLS template is copied into the allocated slot");
+            pass("the module TLS index is written to AddressOfIndex");
+        if (!block || std::memcmp(block, "TLS!", 4) != 0)
+            failed("the TLS template is copied into the module TLS slot", "the TEB slot doesn't hold the template");
+        else
+            pass("the TLS template is copied into the module TLS slot");
     } catch (const std::exception& e) {
         failed("initialise runs a TLS callback and DllMain", e.what());
     }
@@ -583,6 +603,22 @@ void test_forwarded_exports() {
             failed(what, e.what());
         }
     }
+    {
+        const char* what = "a forwarder to a shimmed module binds to the shim";
+        write_image_as(make_forwarder_image("testshim.F", 0x180000000), "prov_shim.dll");
+        auto importer = write_image_as(make_import_image("prov_shim.dll", "fwd"), "importer_shim.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "the import did not bind as a shim");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
+                return failed(what, "the address table does not hold the shim function");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
 }
 
 void test_delay_descriptor_fields() {
@@ -601,7 +637,7 @@ void test_delay_descriptor_fields() {
         expect_rejects("a delay-import descriptor without the RVA attribute", img);
     }
     {
-        const char* what = "a delay import with no name table binds through its address table";
+        // Without a name table the IAT still holds delay thunks, not import names, so there is no symbol to bind.
         auto img = make_image();
         std::fill(img.begin() + 0x200, img.begin() + 0x400, uint8_t{0});
         auto* d = reinterpret_cast<IMAGE_DELAYLOAD_DESCRIPTOR*>(img.data() + 0x200);
@@ -610,31 +646,150 @@ void test_delay_descriptor_fields() {
         d->ImportNameTableRVA = 0;
         d->ImportAddressTableRVA = 0x1180;
         std::memcpy(img.data() + 0x260, "kernel32.dll\0", 13);
-        *reinterpret_cast<uint64_t*>(img.data() + 0x380) = 0x1120;  // RVA 0x1180: the single hint/name entry
-        *reinterpret_cast<uint16_t*>(img.data() + 0x320) = 0;
-        std::memcpy(img.data() + 0x322, "GetCurrentProcessId\0", 20);
         auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_DELAYLOAD_DESCRIPTOR);
+        expect_rejects("a delay-import descriptor without a name table", img);
+    }
+}
+
+// make_image() plus an exception directory at RVA 0x1100 whose entries all share one minimal UNWIND_INFO at 0x1180
+// (version 1, no flags, no prologue, no codes). Every RVA here lies inside the single .text section, so file offset
+// = RVA - 0x1000 + 0x200.
+constexpr uint32_t kPdataRva = 0x1100;
+constexpr uint32_t kUnwindRva = 0x1180;
+
+std::vector<uint8_t> make_unwind_image(const std::vector<RUNTIME_FUNCTION>& entries) {
+    auto img = make_image();
+    std::memset(img.data() + 0x200 + (kPdataRva - 0x1000), 0, 0x100);
+    const uint8_t unwind_info[4] = {1, 0, 0, 0};
+    std::memcpy(img.data() + 0x200 + (kUnwindRva - 0x1000), unwind_info, sizeof(unwind_info));
+    std::memcpy(img.data() + 0x200 + (kPdataRva - 0x1000), entries.data(), entries.size() * sizeof(RUNTIME_FUNCTION));
+    auto& dir = nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    dir.VirtualAddress = kPdataRva;
+    dir.Size = static_cast<DWORD>(entries.size() * sizeof(RUNTIME_FUNCTION));
+    nt_of(img)->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    return img;
+}
+
+void test_unwind_registration() {
+    const std::vector<RUNTIME_FUNCTION> entries = {{0x1000, 0x1010, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}};
+    uintptr_t pc = 0;
+    {
+        auto img = make_unwind_image(entries);
+        auto p = write_image(img);
         try {
             rt::Loader loader(g_dir);
-            rt::Module& m = loader.load(write_image_as(img, "delay.exe"));
-            void* expected = host_symbol("kernel32.dll", "GetCurrentProcessId");
-            if (m.imports.size() != 1) return failed(what, "expected one bound import");
-            if (m.imports[0].binding != rt::Binding::Host) return failed(what, "the delay import did not bind to the host");
-            if (*reinterpret_cast<void**>(m.base + 0x1180) != expected)
-                return failed(what, "the address table does not hold the host function");
-            pass(what);
+            rt::Module& m = loader.load(p);
+            pc = reinterpret_cast<uintptr_t>(m.base) + 0x1014;  // inside the second function
+            DWORD64 image_base = 0;
+            auto* found = RtlLookupFunctionEntry(pc, &image_base, nullptr);
+            if (m.function_count != 2)
+                failed("the exception directory is registered", "function_count is " + std::to_string(m.function_count));
+            else if (!found)
+                failed("the exception directory is registered", "RtlLookupFunctionEntry found nothing");
+            else if (image_base != reinterpret_cast<DWORD64>(m.base) ||
+                     reinterpret_cast<uint8_t*>(found) != m.base + kPdataRva + sizeof(RUNTIME_FUNCTION))
+                failed("the exception directory is registered", "the lookup returned the wrong entry or image base");
+            else
+                pass("the exception directory is registered");
         } catch (const std::exception& e) {
-            failed(what, e.what());
+            failed("the exception directory is registered", e.what());
+        }
+        DWORD64 image_base = 0;
+        if (pc && RtlLookupFunctionEntry(pc, &image_base, nullptr))
+            failed("the unwind table is removed with the loader", "the lookup still finds the freed image");
+        else
+            pass("the unwind table is removed with the loader");
+    }
+    {
+        // The system loader drops a trailing partial entry rather than rejecting the image; so does this one.
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size += 5;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (m.function_count != 2)
+                failed("a trailing partial unwind entry is ignored", "function_count is " + std::to_string(m.function_count));
+            else
+                pass("a trailing partial unwind entry is ignored");
+        } catch (const std::exception& e) {
+            failed("a trailing partial unwind entry is ignored", e.what());
         }
     }
+    // A zero-length entry appears in a shipped Windows image (symcryptk.dll), so it has to be accepted.
+    expect_loads("a zero-length unwind entry is accepted",
+                 make_unwind_image({{0x1000, 0x1000, kUnwindRva}, {0x1000, 0x1020, kUnwindRva}}));
+    {
+        auto img = make_unwind_image(entries);
+        nt_of(img)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress = 0x1FF0;
+        expect_rejects("an exception directory past the image", img);
+    }
+    expect_rejects("an unwind entry ending past the image",
+                   make_unwind_image({{0x1000, 0x2001, kUnwindRva}}));
+    expect_rejects("an unwind entry that ends before it starts",
+                   make_unwind_image({{0x1010, 0x1000, kUnwindRva}}));
+    expect_rejects("unwind entries out of order",
+                   make_unwind_image({{0x1010, 0x1020, kUnwindRva}, {0x1000, 0x1010, kUnwindRva}}));
+    expect_rejects("overlapping unwind entries",
+                   make_unwind_image({{0x1000, 0x1018, kUnwindRva}, {0x1010, 0x1020, kUnwindRva}}));
+    expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
+}
+
+// The folder the images go to: leonida_loader_test\<process id> in LEONIDA_TEST_DIR when that is set, otherwise in
+// the temporary directory. A folder per run, because security software can hold the previous run's images for a
+// while after they are written (so they can be neither deleted nor overwritten); the fixed parent name is what an
+// exclusion names.
+std::filesystem::path work_dir() {
+    wchar_t* env = nullptr;
+    size_t size = 0;
+    std::filesystem::path base;
+    if (_wdupenv_s(&env, &size, L"LEONIDA_TEST_DIR") == 0 && env && *env) base = env;
+    std::free(env);
+    if (base.empty()) base = std::filesystem::temp_directory_path();
+    return base / "leonida_loader_test" / std::to_string(GetCurrentProcessId());
+}
+
+// Security software can scan each file that looks like an executable as it is written, and hold it while it does:
+// measured with Trend Micro Maximum Security, opening such a file afterwards fails with "access denied" for a while
+// (50 to 800 ms each), plain files are unaffected, and an excluded folder takes about 2 ms. Cases then fail at
+// random and the truncation case, which writes over a thousand images, stalls for minutes. So the test first writes
+// and reads back a few images, and stops with the reason if any is refused or they take too long. Empty when the
+// folder behaves.
+std::string written_images_blocked() {
+    constexpr int probes = 8;
+    constexpr auto slow = std::chrono::milliseconds(25);  // per image, on average
+    const std::vector<uint8_t> image = make_image();
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < probes; ++i) {
+        const auto path = write_image_as(image, "readback_check_" + std::to_string(i) + ".bin");
+        const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return "opening one failed with Windows error " + std::to_string(GetLastError());
+        std::vector<uint8_t> back(image.size() + 1);
+        DWORD read = 0;
+        const BOOL ok = ReadFile(file, back.data(), DWORD(back.size()), &read, nullptr);
+        const DWORD error = GetLastError();
+        CloseHandle(file);
+        if (!ok) return "reading one failed with Windows error " + std::to_string(error);
+        if (read != image.size() || !std::equal(image.begin(), image.end(), back.begin()))
+            return "one read back as " + std::to_string(read) + " bytes that differ from the " +
+                   std::to_string(image.size()) + " written";
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const auto each = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed) / probes;
+    if (each > slow)
+        return "writing and reading one back took " + std::to_string(each.count()) + " ms on average (over " +
+               std::to_string(slow.count()) + " ms means each is being scanned)";
+    return {};
 }
 
 }  // namespace
 
 int main() {
-    g_dir = std::filesystem::temp_directory_path() / "leonida_loader_test";
+    g_dir = work_dir();
     std::error_code ec;
     std::filesystem::remove_all(g_dir, ec);
     std::filesystem::create_directories(g_dir, ec);
@@ -643,20 +798,37 @@ int main() {
         return 1;
     }
 
-    test_valid_image();
-    test_header_bounds();
-    test_section_bounds();
-    test_truncation();
-    test_relocations();
-    test_exports();
-    test_imports();
-    test_delay_imports();
-    test_initialise();
-    test_initialise_rejects();
-    test_delay_descriptor_fields();
-    test_forwarded_exports();
+    try {
+        if (const std::string why = written_images_blocked(); !why.empty()) {
+            std::printf("FAIL  PE images written to %s are not readable straight away: %s.\n"
+                        "      Security software that scans newly written executable files does this. Exclude %s\n"
+                        "      from scanning, or set LEONIDA_TEST_DIR to a folder it does not scan.\n",
+                        g_dir.string().c_str(), why.c_str(), g_dir.parent_path().string().c_str());
+            std::filesystem::remove_all(g_dir, ec);
+            return 1;
+        }
+        test_valid_image();
+        test_header_bounds();
+        test_section_bounds();
+        test_truncation();
+        test_relocations();
+        test_exports();
+        test_imports();
+        test_delay_imports();
+        test_initialise();
+        test_initialise_rejects();
+        test_delay_descriptor_fields();
+        test_forwarded_exports();
+        test_unwind_registration();
+    } catch (const std::exception& e) {
+        // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
+        failed("writing the test images", e.what());
+    }
 
     std::filesystem::remove_all(g_dir, ec);
+    if (ec)  // not a failure of the loader; the next run uses a folder of its own anyway
+        std::printf("note  could not remove %s: %s\n", g_dir.string().c_str(), ec.message().c_str());
+    std::filesystem::remove(g_dir.parent_path(), ec);  // only if no other run's folder is left
     std::printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

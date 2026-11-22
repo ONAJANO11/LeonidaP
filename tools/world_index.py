@@ -50,6 +50,7 @@ FIELD = {
     "childLodDist": 0xCA974BCD,
     "priorityLevel": 0x2691F019,
     "name": 0xE6E17F14,
+    "name64": 0x8BFB6095,
     "parent": 0xA99C4651,
     "streamingExtentsMin": 0xDD22821F,
     "streamingExtentsMax": 0xA22EA335,
@@ -241,6 +242,8 @@ def parse_resource(b, collect=None):
             continue
         row["map_name"] = _u32(b, off + mm.get(FIELD["name"], (8,))[0])
         row["parent"] = _u32(b, off + mm.get(FIELD["parent"], (0x68,))[0])
+        if FIELD["name64"] in mm:
+            row["map_name64"] = _u64(b, off + mm[FIELD["name64"]][0])
         for key, field in (("extent_min", "streamingExtentsMin"), ("extent_max", "streamingExtentsMax"),
                            ("entities_min", "entitiesExtentsMin"), ("entities_max", "entitiesExtentsMax")):
             v = _value(b, off, mm.get(FIELD[field]))
@@ -305,8 +308,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
         size = len(m)
         data_start = _u32(m[:8], 4)
+        if start is not None and not data_start <= start < size:
+            raise ValueError(f"--start 0x{start:x} is outside the data area 0x{data_start:x}..0x{size:x} of {path}")
         pos = start if start is not None else data_start
-        end = min(size, pos + limit) if limit else size
+        end = min(size, pos + limit) if limit is not None else size     # --limit 0 is not "no limit"
         while pos < end:
             found = ZHDR.search(m, pos, end)
             if not found:
@@ -336,7 +341,10 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP):
                     mt = ZHDR.match(m, nxt, size)
                     if not mt:
                         break
-                    more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    try:
+                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                    except zlib.error:
+                        break
                     if not meof or not more:
                         break
                     data += more
@@ -364,8 +372,6 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
         for root, _, files in os.walk(path):
             for name in sorted(files):
                 p = os.path.join(root, name)
-                if os.path.getsize(p) > max_inflate:
-                    continue
                 with open(p, "rb") as f:
                     head = f.read(4)
                 if head == b"9FPR":
@@ -373,6 +379,8 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
                     rows.extend(more)
                     stats["files"] += 1
                     stats["scanned_bytes"] += sub["scanned_bytes"]
+                    continue
+                if os.path.getsize(p) > max_inflate:
                     continue
                 with open(p, "rb") as f:
                     b = f.read(max_inflate + 1)
@@ -396,18 +404,35 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP):
             {"path": os.path.abspath(path), "files": 1, "scanned_bytes": len(b)})
 
 
+def _count(minimum):
+    """An argparse type for a whole number of at least `minimum`."""
+    def parse(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+        if value < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum}")
+        return value
+    return parse
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved file, or a directory of carved files")
     ap.add_argument("--out", default=os.path.join("reports", "world_index.json"),
                     help="JSON output (default: reports/world_index.json)")
     ap.add_argument("--csv", help="optional CSV output")
-    ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
-    ap.add_argument("--limit", type=int, help="window size in bytes (default: to end of archive)")
+    ap.add_argument("--start", type=_count(0), help="first byte of an RPF9 data-area window")
+    ap.add_argument("--limit", type=_count(1), help="window size in bytes (default: to end of archive)")
     ap.add_argument("--max-inflate", type=int, default=CAP,
                     help="stop keeping bytes above this per resource, default 64 MiB")
     a = ap.parse_args(argv)
-    rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate)
+    try:
+        rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate)
+    except ValueError as e:                 # a --start outside an archive's data area; nothing is written
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     summary = dict(stats)
     summary["resources"] = len(rows)
     summary["maps"] = sum(1 for r in rows if r["kind"] == "map")
@@ -420,7 +445,8 @@ def main(argv=None):
         json.dump(doc, f, indent=1, sort_keys=True)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
-                "root_objects", "entities", "entity_size", "archetypes", "map_name", "parent", "map_flags",
+                "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",
+                "map_flags",
                 "content_flags", "extent_min", "extent_max", "entities_min", "entities_max", "position_min",
                 "position_max", "lod", "lod_dist_min", "lod_dist_max"]
         os.makedirs(os.path.dirname(os.path.abspath(a.csv)), exist_ok=True)

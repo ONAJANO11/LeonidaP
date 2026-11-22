@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "audio_config.py")
@@ -89,8 +90,57 @@ class TestScan(unittest.TestCase):
             self.assertEqual(len(A.collect(tmp)), 0)
             self.assertEqual(len(A.collect(tmp, join=True)), 1)
 
+    def test_non_joined_scan_processes_each_blob_before_reading_the_next(self):
+        def parts(_src):
+            yield "first.bin", make_record(0x1000, 100_000)
+            self.assertEqual(scan.call_count, 1)
+            yield "second.bin", make_record(0x1001, 200_000)
+
+        with patch.object(A, "files_in", parts), patch.object(A, "scan", wraps=A.scan) as scan:
+            rows = A.collect("unused")
+        self.assertEqual([(row["file"], row["id"]) for row in rows],
+                         [("first.bin", 0x1000), ("second.bin", 0x1001)])
+
+    def test_join_marker_at_stream_boundary_uses_the_file_containing_it(self):
+        record = make_record(0x3000, 150_000)
+        name = "\U0001f3b5.bin"
+        with tempfile.TemporaryDirectory() as tmp:
+            for filename, data in (("a.bin", record[:4]), ("b.bin", b""), (name, record[4:])):
+                with open(os.path.join(tmp, filename), "wb") as f:
+                    f.write(data)
+            rows = A.collect(tmp, join=True)
+        self.assertEqual([(row["offset"], row["file"]) for row in rows], [(4, name)])
+
 
 class TestCli(unittest.TestCase):
+    def test_missing_or_unreadable_inputs_are_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blob = os.path.join(tmp, "00000001.bin")
+            with open(blob, "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            missing = os.path.join(tmp, "missing")
+            cases = (([missing], missing, "does not exist"),
+                     ([tmp, "--names", os.path.join(tmp, "no_pool.txt")], "no_pool.txt", "name pool"),
+                     ([tmp, "--names", tmp], tmp, "name pool"))          # a folder as the pool
+            for args, path, message in cases:
+                with self.subTest(message=message, args=[os.path.basename(x) for x in args]):
+                    p = subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 1)
+                    self.assertIn(path, p.stderr)
+                    self.assertIn(message, p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertEqual(p.stdout, "")
+
+    def test_unreadable_stream_is_one_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "00000001.bin"), "wb") as f:
+                f.write(b"\x00" * 4 + make_record(0x2000, 123_456))
+            denied = PermissionError(13, "Permission denied", os.path.join(tmp, "00000001.bin"))
+            with patch.object(sys, "argv", ["audio_config.py", tmp]), \
+                    patch.object(A, "collect", side_effect=denied), self.assertRaises(SystemExit) as ctx:
+                A.main()
+            self.assertIn("00000001.bin: cannot read: Permission denied", str(ctx.exception.code))
+
     def test_json_and_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             name = "Test Song"

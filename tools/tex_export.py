@@ -84,9 +84,10 @@ def score_image(w, h, fmt, payload, bpe):
         im = Image.open(io.BytesIO(dds_bytes(w, h, DECODE_AS.get(fmt, fmt), payload))).convert("RGB")
         a = np.asarray(im.reduce(4) if min(w, h) >= 64 else im, np.float32)
     else:
-        a = np.frombuffer(payload, np.uint8).reshape(-1, bpe)[:, :4].astype(np.float32)
-        a = a.reshape(-1, max(1, (w + 3) // 4 if bpe >= 8 and FMT[fmt][1] == 4 else w), 4)
-    d = np.abs(np.diff(a, axis=0)).mean() + np.abs(np.diff(a, axis=1)).mean()
+        block = FMT[fmt][1]
+        we, he = (w + block - 1) // block, (h + block - 1) // block
+        a = np.frombuffer(payload, np.uint8).reshape(he, we, bpe)[:, :, :4].astype(np.float32)
+    d = sum(np.abs(np.diff(a, axis=axis)).mean() for axis in (0, 1) if a.shape[axis] > 1)
     return float(d / (a.std() + 1e-6))
 
 
@@ -135,16 +136,26 @@ def export_one(t, carve, out, blob_cache):
     return "ok:" + place
 
 
+def positive_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("out")
-    ap.add_argument("--limit", type=int)
+    ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     a = ap.parse_args()
     texs = json.load(open(a.index, encoding="utf-8"))
     texs.sort(key=lambda t: (t["archive"], t["gpu"]))
-    if a.limit:
+    if a.limit is not None:         # 0 used to read as "no limit", and a negative N dropped the last N
         texs = texs[: a.limit]
     os.makedirs(a.out, exist_ok=True)
     res, cache = Counter(), {}

@@ -2,8 +2,10 @@
 
     python -I tests/test_world_index.py
 """
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import os
 import struct
@@ -80,6 +82,7 @@ def make_resource(map_file=True):
     if map_file:
         mm = [
             member(WI.FIELD["name"], 0x08, 0x4A),
+            member(WI.FIELD["name64"], 0x10, 0x4F),
             member(WI.FIELD["parent"], 0x68, 0x4A),
             member(WI.FIELD["streamingExtentsMin"], 0x70, 0x32),
             member(WI.FIELD["streamingExtentsMax"], 0x7C, 0x32),
@@ -93,6 +96,7 @@ def make_resource(map_file=True):
         struct.pack_into("<IIQ", b, 0x210, WI.MAPDATA, 0x120, ptr(0x500))
         root = 0x500
         struct.pack_into("<I", b, root + 0x08, 0x11223344)
+        struct.pack_into("<Q", b, root + 0x10, 0x1122334455667788)
         struct.pack_into("<I", b, root + 0x68, 0xAABBCCDD)
         struct.pack_into("<3f", b, root + 0x70, -10.0, -20.0, -30.0)
         struct.pack_into("<3f", b, root + 0x7C, 10.0, 20.0, 30.0)
@@ -130,6 +134,7 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(row["entity_size"], 0x90)
         self.assertEqual(row["archetypes"], 1)
         self.assertEqual(row["map_name"], 0x11223344)
+        self.assertEqual(row["map_name64"], 0x1122334455667788)
         self.assertEqual(row["parent"], 0xAABBCCDD)
         self.assertEqual(row["extent_min"], [-10.0, -20.0, -30.0])
         self.assertEqual(row["extent_max"], [10.0, 20.0, 30.0])
@@ -168,6 +173,50 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
 
+    def test_scan_window_options(self):
+        blob = make_resource()
+        path = os.path.join(self.dir, "sample.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob]))
+        size = os.path.getsize(path)
+        out = os.path.join(self.dir, "out.json")
+        # A one-byte window at the data start: the scan ends one byte later.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(WI.main([path, "--out", out, "--start", "64", "--limit", "1"]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["scan_end"], 0x41)
+        os.remove(out)
+        # --limit 0 used to read as "no limit" (the whole archive); negative values were used as given.
+        for args in (["--limit", "0"], ["--limit", "-16"], ["--start", "-1"]):
+            with self.subTest(args=args), self.assertRaises(SystemExit) as ctx, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                WI.main([path, "--out", out, *args])
+            self.assertEqual(ctx.exception.code, 2)
+        # A start inside the RPF9 header or past the end is refused, and no report is written.
+        for start in ("16", str(size)):
+            with self.subTest(start=start):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(WI.main([path, "--out", out, "--start", start]), 2)
+                self.assertIn("outside the data area", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_rpf_scan_survives_a_damaged_candidate_continuation(self):
+        blob = make_resource()
+        partial = blob[:0x150]
+        unrelated = bytes(72)
+        archive = bytearray(make_rpf_streams([partial, unrelated, blob]))
+        continuation = (0x40 + len(zlib.compress(partial)) + 15) & ~15
+        end = continuation + len(zlib.compress(unrelated))
+        archive[end - 1] ^= 1  # Corrupt only the second stream's checksum.
+        path = os.path.join(self.dir, "damaged_continuation.rpf")
+        with open(path, "wb") as f:
+            f.write(archive)
+        rows, stats = WI.scan_rpf(path)
+        self.assertEqual(stats["streams"], 2)
+        self.assertEqual(rows[-1]["offset"], (end + 15) & ~15)
+        self.assertEqual(rows[-1]["size"], len(blob))
+
     def test_directory_scan_and_outputs(self):
         with open(os.path.join(self.dir, "map.bin"), "wb") as f:
             f.write(make_resource())
@@ -192,6 +241,18 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["signature"], "0DRPz")
         self.assertEqual(rows[0]["version"], "122")
+
+    def test_directory_inflate_cap_does_not_exclude_large_archives(self):
+        resource = make_resource()
+        cap = len(resource)
+        with open(os.path.join(self.dir, "large.rpf"), "wb") as f:
+            f.write(make_rpf_streams([resource]) + bytes(cap))
+        with open(os.path.join(self.dir, "oversized.bin"), "wb") as f:
+            f.write(resource + b"\0")
+        rows, stats = WI.scan_path(self.dir, max_inflate=cap)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "map")
+        self.assertEqual(stats["files"], 1)
 
 
 if __name__ == "__main__":

@@ -18,11 +18,13 @@ its output (make_game.py does both, the second only with --wav).
 """
 import argparse
 import concurrent.futures
+from functools import cache
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 EXTS = (".ogg", ".opus")
@@ -113,54 +115,67 @@ def collect(src: str):
     return files, not_opus
 
 
-def output_names(items):
+def output_names(items, out=None):
     """Give every input its own output stem, and count how many had to keep their extension.
 
     x.ogg and x.opus (or x.OPUS, which is the same name on Windows) both became x.wav: two jobs then decoded into
     the same x.wav.part.wav at once and one result was lost, and with --jobs 1 the second silently replaced the
     first. Inputs that share a stem now keep their extension (x.ogg.wav, x.opus.wav); a name that still clashes
-    gets ~2, ~3. Names that are unique stay as they were, so existing WAVs are still found and skipped."""
+    gets ~2, ~3. With out supplied, resolve directory links on the destination before checking names. Keep the
+    original relative paths in the result so existing WAVs are still found and skipped."""
+    @cache
+    def output_directory(relative):
+        return os.path.normcase(os.path.realpath(os.path.join(out, relative)))
+
+    def destination(stem):
+        if out is None:
+            return os.path.normcase(stem)
+        directory, name = os.path.split(stem)
+        return output_directory(directory), os.path.normcase(name)
+
     count = {}
     for _, rel in items:
-        key = os.path.normcase(rel)
+        key = destination(rel)
         count[key] = count.get(key, 0) + 1
+    if len(count) == len(items):
+        return list(items), 0
     named, used, renamed = [], set(), 0
     for path, rel in items:
         name = rel
-        if count[os.path.normcase(rel)] > 1:
+        if count[destination(rel)] > 1:
             name = rel + os.path.splitext(path)[1]
             renamed += 1
         base, n = name, 2
-        while os.path.normcase(name) in used:
+        key = destination(name)
+        while key in used:
             name, n = f"{base}~{n}", n + 1
-        used.add(os.path.normcase(name))
+            key = destination(name)
+        used.add(key)
         named.append((path, name))
     return named, renamed
 
 
 def decode(ffmpeg: str, src: str, dst: str):
-    """Decode one file to a temporary WAV next to dst, then rename it, so an interrupted run leaves no short WAV."""
-    tmp = dst + ".part.wav"
+    """Decode under the destination directory and rename the finished WAV into place."""
     try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
-        samples = ogg_output_samples(src)
-        if samples:
-            cmd += ["-af", f"atrim=end_sample={samples}"]
-        cmd += ["-c:a", "pcm_s16le", tmp]
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-        if r.returncode != 0:
-            if os.path.isfile(tmp):
-                os.remove(tmp)
-            return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
-        os.replace(tmp, dst)
+        out_dir = os.path.dirname(dst)
+        os.makedirs(out_dir, exist_ok=True)
+        td_kwargs = {"dir": out_dir}
+        if sys.version_info >= (3, 10):
+            td_kwargs["ignore_cleanup_errors"] = True
+        with tempfile.TemporaryDirectory(**td_kwargs) as tmp_dir:
+            tmp = os.path.join(tmp_dir, "decoded.wav")
+            cmd = [ffmpeg, "-v", "error", "-y", "-i", src]
+            samples = ogg_output_samples(src)
+            if samples:
+                cmd += ["-af", f"atrim=end_sample={samples}"]
+            cmd += ["-c:a", "pcm_s16le", tmp]
+            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            if r.returncode != 0:
+                return False, (r.stderr.strip() or f"ffmpeg exited with {r.returncode}")
+            os.replace(tmp, dst)
         return True, ""
     except OSError as e:
-        if os.path.isfile(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
         return False, str(e)
 
 
@@ -202,7 +217,7 @@ def main() -> int:
     if not ffmpeg:
         return 2
 
-    items, renamed = output_names(items)
+    items, renamed = output_names(items, out)
     if renamed:
         print(f"{renamed} file(s) share a name with another input (e.g. x.ogg and x.opus) and keep their extension "
               f"in the WAV name (x.ogg.wav)")

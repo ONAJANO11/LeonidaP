@@ -15,6 +15,8 @@
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
 //   --stage S     which stages to check: all (default), cs, or graphics (aliases: --compute-only, --graphics-only)
 #include "vulkan_loader.h"
+#include "pipeline_cache_file.h"
+#include "pipeline_cache_snapshot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -230,7 +232,12 @@ struct JsonParser {
             if (error) return m;
             if (!consume(':')) { fail("expected ':' in shader metadata"); return m; }
             if (k == "stage") m.stage = parse_string();
-            else if (k == "subgroup_size") m.subgroup_size = parse_u32();
+            else if (k == "subgroup_size") {
+                // null: translated with --wave64-emulate, exact on any subgroup size, so request none (0)
+                ws();
+                if (s.compare(i, 4, "null") == 0) { i += 4; m.subgroup_size = 0; }
+                else m.subgroup_size = parse_u32();
+            }
             else if (k == "writes_depth") m.writes_depth = parse_bool();
             else if (k == "needs_maintenance8") m.needs_maintenance8 = parse_bool();
             else if (k == "features") m.features = parse_str_array();
@@ -558,22 +565,30 @@ int main(int argc, char** argv) {
         if (!seed.empty()) std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), cache_path.c_str());
     }
     pci.initialDataSize = seed.size(); pci.pInitialData = seed.empty() ? nullptr : seed.data();
-    VkPipelineCache cache;
+    VkPipelineCache cache = VK_NULL_HANDLE;
     if (vkCreatePipelineCache(dev, &pci, nullptr, &cache)) {  // data from another driver: start empty
         pci.initialDataSize = 0; pci.pInitialData = nullptr;
-        vkCreatePipelineCache(dev, &pci, nullptr, &cache);
+        if (VkResult r = vkCreatePipelineCache(dev, &pci, nullptr, &cache)) {
+            std::fprintf(stderr, "vkCreatePipelineCache failed: %d\n", r);
+            return 1;
+        }
     }
+    std::vector<char>().swap(seed);  // the driver has copied the seed; it can be several GiB
     auto save_cache = [&](bool final_save) {
-        if (cache_path.empty()) return;
-        size_t sz = 0;
-        vkGetPipelineCacheData(dev, cache, &sz, nullptr);
-        std::vector<char> data(sz);
-        vkGetPipelineCacheData(dev, cache, &sz, data.data());
-        const std::string tmp = cache_path + ".partial";
-        std::ofstream(tmp, std::ios::binary).write(data.data(), std::streamsize(sz));
-        std::remove(cache_path.c_str());
-        std::rename(tmp.c_str(), cache_path.c_str());
-        if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", sz, cache_path.c_str());
+        if (cache_path.empty()) return true;
+        try {
+            const auto data = pipeline_cache_snapshot([&](size_t* size, void* dest) {
+                return vkGetPipelineCacheData(dev, cache, size, dest);
+            });
+            if (auto error = write_pipeline_cache_file(cache_path, data.data(), data.size()))
+                throw std::system_error(error);
+            if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", data.size(), cache_path.c_str());
+            return true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "%s pipeline cache save to %s failed: %s\n",
+                         final_save ? "final" : "periodic", cache_path.c_str(), e.what());
+            return false;
+        }
     };
 
     std::fprintf(stderr, "checking %zu shaders [%zu, %zu) (stage=%s) on %u threads\n",
@@ -938,6 +953,5 @@ int main(int argc, char** argv) {
         std::printf("; checked %zu of %zu\n", work.size() - big_total, work.size());
     }
     std::printf("wall time: %.1fs on %u threads\n", elapsed(), jobs);
-    save_cache(true);
-    return 0;
+    return save_cache(true) ? 0 : 1;
 }

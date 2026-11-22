@@ -323,6 +323,8 @@ def _gap(gap):
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
     rows = []
+    if os.path.getsize(path) == 0:
+        raise ValueError("empty file")
     with open(path, "rb") as fh:
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         size = len(m)
@@ -445,23 +447,53 @@ def write_output(path, rows, summary):
                         for i, c in enumerate(COLUMNS)])
 
 
+def offset(text):
+    """--start: 0 or more, decimal or 0x hex."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be 0 or more") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return value
+
+
+def byte_count(text):
+    """--limit: at least 1; 0 used to mean no limit and a negative value silently scanned less."""
+    try:
+        value = int(text, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be at least 1") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin files")
     ap.add_argument("out", help="output path ending in .csv or .json")
-    ap.add_argument("--start", type=lambda s: int(s, 0), help="first byte to scan (default: the RPF data start)")
-    ap.add_argument("--limit", type=lambda s: int(s, 0), help="number of bytes to scan")
+    ap.add_argument("--start", type=offset, help="first byte to scan (default: the RPF data start)")
+    ap.add_argument("--limit", type=byte_count, help="number of bytes to scan")
     ap.add_argument("--rigs", metavar="PATH", help="write parsed RBF0 rig-set/rig and SKEL_ JSON here")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
-    if os.path.isdir(a.source):
-        rows, summary = scan_dir(a.source)
-    else:
-        def progress(n, pos, end):
-            if not a.quiet:
-                print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
-        rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
-    write_output(a.out, rows, summary)
+    try:
+        if os.path.isdir(a.source):
+            rows, summary = scan_dir(a.source)
+        else:
+            def progress(n, pos, end):
+                if not a.quiet:
+                    print(f"[{pos / max(1, end):6.1%}] {n} streams", flush=True)
+            rows, summary = scan_rpf(a.source, a.start, a.limit, progress)
+    except ValueError as e:
+        sys.exit(f"{a.source}: {e}")
+    except OSError as e:        # missing, a folder that can't be listed, a file that can't be read
+        sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
     if a.rigs:
         if os.path.isdir(a.source):
             blob = collect_rbf0_dir(a.source)
@@ -472,8 +504,14 @@ def main():
         if blob is None:
             print("no RBF0 stream found; --rigs needs the archive or carved folder that contains it", file=sys.stderr)
             return 2
+        try:
+            rbf0 = parse_rbf0(blob)
+        except ValueError as e:
+            # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
+            print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
+            return 2
         with open(a.rigs, "w", encoding="utf-8") as f:
-            json.dump({"rbf0": parse_rbf0(blob), "skeletons": skeletons}, f, indent=1)
+            json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])
     print(json.dumps({k: summary[k] for k in
                       ("files", "compressed_bytes", "inflated_bytes", "zero_padding", "unread_bytes",

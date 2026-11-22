@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -58,12 +59,14 @@ struct VulkanDeviceFunctions {
     X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
     X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                      X(vkCreateSampler) X(vkDestroySampler)                                                                     \
+    X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices; everything else is required.
+    // The Vulkan 1.3 entry points may be null on older devices, and the extension ones (conditional rendering)
+    // when the extension is not enabled; everything else is required.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -85,7 +88,9 @@ struct VulkanDeviceFunctions {
 // Per device: what the queues share. Resources are registered by their stable ID (the COM resource pointer).
 class VulkanContext {
 public:
-    VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts)
+    // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
+    VulkanContext(PFN_vkGetDeviceProcAddr get, VkDevice device, bool separate_depth_stencil_layouts,
+                  bool conditional_rendering = false)
         : device_(device), tracker_(separate_depth_stencil_layouts) {
         loaded_ = vk.load(get, device);
         replay_.pipeline_barrier = vk.vkCmdPipelineBarrier;
@@ -130,6 +135,10 @@ public:
             }
             return false;
         };
+        if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
+            replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
+            replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
+        }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
             return view(r, range);
         };
@@ -205,6 +214,15 @@ public:
         return tracker_.layout(id, subresource);
     }
 
+    // `prepare` is called with the context locked, at the start of the command buffer of every
+    // ExecuteCommandLists, before the lists are written: the device brings the bindless set 0 of the translated
+    // shaders up to date there (vulkan_bindless.h) and records what the set needs first. When it fails, nothing
+    // of that call is executed.
+    void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+        std::lock_guard lock(mutex_);
+        bindless_prepare_ = std::move(prepare);
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -229,6 +247,11 @@ private:
         info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         info.format = r.format;
         info.subresourceRange = range;
+        // Reinterpreted RTVs need only color-attachment usage. Inheriting STORAGE usage from the resource
+        // would incorrectly require it from an sRGB view, even though this view is never used as storage.
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (r.rgba8_typeless) info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         views_[key] = view;
@@ -243,8 +266,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     LayoutTracker tracker_;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView>
-        views_;
+    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
+    std::function<bool(VkCommandBuffer)> bindless_prepare_;
     ReplayFunctions replay_;
 };
 
@@ -343,6 +366,12 @@ public:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
+        if (context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+            // The command buffer holds at most what the set recorded for itself; submit it so the buffer is reused.
+            context_.vk.vkEndCommandBuffer(command_buffer);
+            submit(command_buffer, VK_NULL_HANDLE, 0);
+            return ReplayResult::unsupported;
+        }
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.

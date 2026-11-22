@@ -57,6 +57,20 @@ class AudioWavTest(unittest.TestCase):
         self.assertIn("0 WAV written", p.stdout)
         self.assertIn("1 already present", p.stdout)
 
+    def test_decode_preserves_an_existing_wav_at_the_old_temporary_name(self):
+        old_tmp = self.dst + ".part.wav"
+        os.makedirs(self.out)
+        with open(old_tmp, "wb") as f:
+            f.write(b"previous output")
+        # This input would resume from old_tmp while the other input is decoded.
+        shutil.copyfile(self.src, os.path.join(os.path.dirname(self.src), "one.wav.part.opus"))
+        p = self.run_tool(os.path.dirname(self.src), "--out", self.out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("1 WAV written, 1 already present", p.stdout)
+        with open(old_tmp, "rb") as f:
+            self.assertEqual(f.read(), b"previous output")
+        self.assertEqual(sorted(os.listdir(self.out)), ["one.wav", "one.wav.part.wav"])
+
     def test_missing_ffmpeg_is_an_explanation_not_a_traceback(self):
         p = self.run_tool(self.src, "--out", self.out, "--ffmpeg", os.path.join(self.dir, "no-ffmpeg"))
         self.assertNotEqual(p.returncode, 0)
@@ -101,6 +115,26 @@ class SameStemTest(unittest.TestCase):
             self.assertEqual((named, renamed), ([("x.ogg", "x.ogg"), ("X.OPUS", "X.OPUS")], 2))
         else:
             self.assertEqual((named, renamed), (items, 0))
+
+    def test_output_names_follow_linked_directories_and_counter_collisions(self):
+        with tempfile.TemporaryDirectory() as out:
+            first = os.path.join(out, "first")
+            os.mkdir(first)
+            try:
+                os.symlink(first, os.path.join(out, "second"), target_is_directory=True)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"directory symlinks unavailable: {e}")
+
+            # The worker will create child/ later. Both logical paths lead to one physical WAV.
+            a = os.path.join("first", "child", "track")
+            b = os.path.join("second", "child", "track")
+            c = os.path.join("independent", "child", "track")
+            items = [(a + ".ogg", a), (b + ".ogg", b), (c + ".opus", c)]
+            expected = [(a + ".ogg", a + ".ogg"), (b + ".ogg", b + ".ogg~2"), (c + ".opus", c)]
+            self.assertEqual(audio_wav.output_names(items, out), (expected, 2))
+            self.assertFalse(os.path.exists(os.path.join(first, "child")))
+            os.mkdir(os.path.join(first, "child"))
+            self.assertEqual(audio_wav.output_names(items, out), (expected, 2))
 
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:

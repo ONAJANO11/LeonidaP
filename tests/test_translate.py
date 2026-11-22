@@ -72,9 +72,52 @@ def test_translation_is_deterministic(make_shader):
 
 def test_unsupported_instruction_is_reported_not_guessed(make_shader):
     """Anything outside the supported set must raise Unsupported rather than emit a wrong program."""
-    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_sad_u8 v0, v1, v1, v1"))
+    shader = make_shader(program("v_mov_b32 v1, 1.0\nv_mqsad_u32_u8 v[8:11], v[2:3], v1, v[4:7]"))
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+@pytest.mark.parametrize("d16", [False, True], ids=["f32", "d16"])
+def test_depth_compare_sample_result_width(make_shader, d16):
+    """image_sample_c_lz returns one value: f32 bits, or with d16 an f16 in the low half like every other d16 sample
+    result. Written as f32 bits under d16, every compare result would read back as 0 (1.0 = 0x3f800000)."""
+    shader = make_shader("v_mov_b32 v0, 0.5\nv_mov_b32 v1, 0.5\nv_mov_b32 v2, 0.25\n"
+                         "image_sample_c_lz v4, v[0:2], s[0:7], s[8:11] dmask:0x1 dim:SQ_RSRC_IMG_2D"
+                         + (" d16" if d16 else "") + "\nexp mrt0 v4, v4, v4, v4 done vm\ns_endpgm\n", "ps_dref")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    dref = re.search(r"^\s*(%\w+) = OpImageSampleDrefExplicitLod %float ", spvasm, re.M)
+    assert dref, "the depth compare sample is missing"
+    d = re.escape(dref.group(1))
+    as_f16 = re.search(rf"^\s*(%\w+) = OpCompositeConstruct %v2float {d} %f0\n\s*%\w+ = OpExtInst %uint %glsl "
+                       r"PackHalf2x16 \1$", spvasm, re.M)
+    as_f32 = re.search(rf"^\s*%\w+ = OpBitcast %uint {d}$", spvasm, re.M)
+    assert (bool(as_f16), bool(as_f32)) == (d16, not d16)
+
+
+def test_a16_sample_gradients_use_full_vgprs(make_shader):
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
+    with open(path, encoding="utf-8") as fixture:
+        shader = make_shader(fixture.read(), "ps_texture_grad_a16")
+    spvasm = shader.translate()
+    sample = re.search(r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad (%\w+) (%\w+)$", spvasm, re.M)
+    assert sample, "the explicit-gradient sample is missing"
+    definitions = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+
+    # Trace dPdx and dPdy back to the fixture's full 32-bit derivative words, in operand order.
+    for vector, registers in zip(sample.groups(), ((8, 9), (10, 11))):
+        assert definitions[vector].startswith("OpCompositeConstruct %v2float ")
+        components = definitions[vector].split()[2:]
+        assert len(components) == 2
+        for component, register in zip(components, registers):
+            cast, float_type, word = definitions[component].split()
+            assert (cast, float_type) == ("OpBitcast", "%float")
+            load, word_type, pointer = definitions[word].split()
+            assert (load, word_type) == ("OpLoad", "%uint")
+            *access, index = definitions[pointer].split()
+            assert access == ["OpAccessChain", "%_ptr_Function_uint", "%vgpr"]
+            assert definitions[index] == f"OpConstant %uint {register}"
+    shader.validate(spvasm)
 
 
 def test_unknown_stage_is_rejected(make_shader):
@@ -86,6 +129,21 @@ def test_unknown_stage_is_rejected(make_shader):
 def test_compute_translates_and_validates(make_shader):
     shader = make_shader("v_mov_b32 v1, 1\ns_endpgm\n", name="cs_test")
     shader.validate(shader.translate())
+
+
+def test_cs_store_packed_atomic_pointers(make_shader):
+    """Packed stores need element zero of the physical dword array for Metal atomics."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_store.asm"), encoding="utf-8") as f:
+        spvasm = make_shader(f.read(), "cs_store").translate()
+    defs = dict(re.findall(r"^\s*(%\w+) = (Op[^\n]+)", spvasm, re.M))
+    atomics = re.findall(r"= (OpAtomicAnd|OpAtomicOr) %uint (%\w+) ", spvasm)
+    assert {op for op, ptr in atomics} == {"OpAtomicAnd", "OpAtomicOr"}
+    for _, ptr in atomics:
+        access = defs[ptr].split()
+        assert access[:2] == ["OpAccessChain", "%_ptr_PSB_uint"]
+        _, _, base, index = access
+        assert defs[base].startswith("OpConvertUToPtr %_ptr_PSB_arr ")
+        assert defs[index] == "OpConstant %uint 0"
 
 
 def test_compute_thread_group_size_sgpr_is_rejected(make_shader):
@@ -124,6 +182,54 @@ def test_mesh_without_psv0_is_rejected(make_shader):
         shader = make_shader(f.read(), "ms_tri")                   # empty DXBC
     with pytest.raises(rdna2spirv.Unsupported):
         shader.translate()
+
+
+def test_wave32_readlane_writelane_mask_31(make_shader):
+    """SHADER-52: wave32 lane select is & 31; wave64 keeps & 63."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w32_lane_wrap.asm"), encoding="utf-8") as f:
+        w32 = make_shader(f.read(), name="cs_w32_lane_wrap", cs_header=(0x8088, (32, 1, 1)))
+    w32_spv = w32.translate()
+    w32.validate(w32_spv)
+    assert "OpBitwiseAnd %uint" in w32_spv and "%c1f" in w32_spv  # 31
+    # Every readlane/writelane mask in this wave32 program is 31, never 63.
+    assert not re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w32_spv)
+    assert rdna2spirv.translate.last_gen.wave64 is False
+
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "cs_w64x_readlane.asm"), encoding="utf-8") as f:
+        w64 = make_shader(f.read(), name="cs_w64x_readlane")
+    w64_spv = w64.translate()
+    assert rdna2spirv.translate.last_gen.wave64 is True
+    assert re.search(r"OpBitwiseAnd %uint %\w+ %c3f\b", w64_spv)  # 63
+
+
+@pytest.mark.parametrize("threads", [96, 128], ids=["96-threads", "128-threads"])
+def test_mesh_v5_seed_and_threads_constant(make_shader, threads):
+    """Mesh prologue computes v5 = %wlin * NumThreads + %lidx and registers NumThreads before assembly (7b82460)."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_tri.asm"), encoding="utf-8") as f:
+        asm = f.read()
+    dxbc = make_dxbc([mesh_psv0_chunk(threads=(threads, 1, 1), max_vertices=64, max_primitives=64)])
+    shader = make_shader(asm, name=f"ms_v5_seed_{threads}", dxbc=dxbc)
+    spvasm = shader.translate()
+    cid = f"%c{threads:x}"
+    assert f"{cid} = OpConstant %uint {threads}" in spvasm
+    assert f"%wbase = OpIMul %uint %wlin {cid}" in spvasm
+    assert "%v5v = OpIAdd %uint %wbase %lidx" in spvasm
+    assert "%v5p = OpAccessChain %_ptr_Function_uint %vgpr %c5" in spvasm
+    assert "OpStore %v5p %v5v" in spvasm
+    shader.validate(spvasm, KNOWN_VAL_ISSUES.get("ms_tri"))
+def test_mesh_cull_primitive_is_block_bool(make_shader):
+    """CullPrimitiveEXT must be a Block bool member (VUID-07036); array-of-bool trips SPIRV-Tools ≤2025.1."""
+    with open(os.path.join(ROOT, "runtime", "test", "shaders", "ms_v5_workgroup.asm"), encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_v5_workgroup", dxbc=SAMPLE_DXBC["ms_v5_workgroup"])
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "OpDecorate %ms_cull_blk Block" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 BuiltIn CullPrimitiveEXT" in spvasm
+    assert "OpMemberDecorate %ms_cull_blk 0 PerPrimitiveEXT" in spvasm
+    assert "%ms_cull_blk = OpTypeStruct %bool" in spvasm
+    assert re.search(r"%ms_arr_cull = OpTypeArray %ms_cull_blk %c\w+", spvasm)
+    assert "OpDecorate %ms_cull BuiltIn CullPrimitiveEXT" not in spvasm
+    assert re.search(r"OpAccessChain %_ptr_Out_bool_ms %ms_cull %\w+ %c0", spvasm)
 
 
 # ---- pos1..pos3: ClipDistance / CullDistance / misc exports (VS & MS) ----
@@ -412,6 +518,70 @@ def test_wave64_bpermute_reads_zero_from_lanes_that_are_not_running(make_shader)
     ), "wave64 ds_bpermute did not keep the shuffle only where the source lane is running"
 
 
+WQM_MASK = "s_mov_b64 exec, -1\nv_cmp_gt_u32_e32 vcc_lo, 16, v0\ns_wqm_b64 s[6:7], vcc\ns_bcnt1_i32_b64 s8, s[6:7]\ns_endpgm\n"
+WQM_DATA = "s_mov_b32 s20, 0x00800010\ns_mov_b32 s21, 1\ns_wqm_b64 s[22:23], s[20:21]\ns_add_u32 s24, s22, s23\ns_endpgm\n"
+
+
+def test_wqm_on_a_lane_mask_gathers_the_quad_and_votes_scc(make_shader, monkeypatch):
+    """s_wqm on a lane mask ORs the lane's bit with its quad's (two OpGroupNonUniformQuadSwap, horizontal then
+    vertical) and SCC is the wave-wide any. Emulated, the four lanes of the quad come through %x_buf instead."""
+    shader = make_shader(WQM_MASK, name="cs_wqm_mask_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpCapability GroupNonUniformQuad" in asm
+    assert asm.count("OpGroupNonUniformQuadSwap %uint %c3") == 2
+    assert re.search(r"OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c0\n(?:.*\n)*?.*OpGroupNonUniformQuadSwap %uint %c3 %t\d+ %c1\n", asm)
+    assert "OpGroupNonUniformAny" in asm                   # SCC: any bit of the result in the wave
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    emulated = shader.translate()
+    shader.validate(emulated)
+    assert "OpGroupNonUniform" not in emulated and "GroupNonUniformQuad" not in emulated
+    assert "%x_buf" in emulated
+
+
+def test_wqm_on_data_is_a_bit_operation(make_shader):
+    """A register that is not a lane mask is data: per 32-bit word (x | x>>1 | x>>2 | x>>3) & 0x11111111, times 15."""
+    shader = make_shader(WQM_DATA, name="cs_wqm_data_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "OpGroupNonUniform" not in asm
+    for k in (1, 2, 3):                                  # three shifts per word, two words (s_wqm_b64)
+        assert len(re.findall(rf"OpShiftRightLogical %uint %t\d+ %c{k}\n", asm)) == 2
+    assert len(re.findall(r"OpBitwiseAnd %uint %t\d+ %c11111111\n", asm)) == 2
+    assert len(re.findall(r"OpIMul %uint %t\d+ %cf\n", asm)) == 2
+    assert re.search(r"OpBitwiseOr %uint %t\d+ %t\d+\n(?:.*\n)*?.*OpStore %scc", asm)   # SCC = low | high != 0
+
+
+def test_wqm_without_quad_operations_outside_fragment_and_compute(make_shader):
+    """Quad operations are only guaranteed in fragment and compute shaders: a vertex shader shuffles from the four
+    lanes of the quad instead."""
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp pos0 v6, v6, v6, v6 done\ns_endpgm\n", name="vs_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "QuadSwap" not in asm and "GroupNonUniformQuad" not in asm
+    assert asm.count("OpGroupNonUniformShuffle") == 4
+
+
+def test_wave64_wqm_b32_changes_and_votes_only_its_half(make_shader):
+    """s_wqm_b32 exec_hi in wave64 writes the lanes 32-63 of EXEC only (exec_half_write) and SCC votes over them."""
+    shader = make_shader("s_mov_b32 exec_hi, 0x102\ns_wqm_b32 exec_hi, exec_hi\ns_cselect_b32 s9, 1, 0\ns_endpgm\n",
+                         name="cs_wqm_half_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert rdna2spirv.translate.last_gen.wave64
+    assert re.search(r"(%t\d+) = OpUGreaterThanEqual %bool %t\d+ %c20\n(?:.*\n)*?.*OpLogicalAnd %bool \1 %t\d+\n"
+                     r"(?:.*\n)*?.*OpGroupNonUniformAny", asm)
+
+
+def test_wqm_in_a_pixel_shader_uses_the_fragment_quad(make_shader):
+    shader = make_shader("v_cmp_gt_u32_e32 vcc_lo, 1, v0\ns_wqm_b32 s8, vcc_lo\nv_cndmask_b32_e64 v6, 0, 1, s8\n"
+                         "exp mrt0 v6, v6, v6, v6 done vm\ns_endpgm\n", name="ps_wqm_ci")
+    asm = shader.translate()
+    shader.validate(asm)
+    assert asm.count("OpGroupNonUniformQuadSwap") == 2 and "OpCapability GroupNonUniformQuad" in asm
+
+
 EMULATE_SAMPLES = [p for p in SAMPLES if os.path.basename(p).startswith(("cs_", "ms_"))]
 
 
@@ -433,3 +603,205 @@ def test_wave64_emulate_uses_no_subgroup_ops(path, make_shader, monkeypatch):
     shader.validate(emulated, KNOWN_VAL_ISSUES.get(stem))
     assert "OpGroupNonUniform" not in emulated and "%sg_lane" not in emulated
     assert "%x_buf" in emulated and emulated.count("OpControlBarrier") >= 2
+# ---- Irreducible CFG node splitting (compute shaders) ----
+
+IRREDUCIBLE_PATTERNS = {
+    # 2-entry SCC with s_branch + s_cbranch_scc0 (all 1-dword insns; offsets are relative dwords from next_pc)
+    "scc0_branch": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_lt_u32 s1, 4
+s_cbranch_scc0 4
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc0 1
+s_branch -7
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_scc1
+    "scc1": """\
+s_mov_b32 s1, 0
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 1
+s_cmp_ge_u32 s1, 4
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 8
+s_cbranch_scc1 -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # 2-entry SCC with s_cbranch_vccnz
+    "vccnz": """\
+s_mov_b32 s1, 0
+v_cmp_gt_u32_e32 vcc_lo, 4, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 1
+v_cmp_gt_u32_e32 vcc_lo, 8, v0
+s_cbranch_vccnz 3
+s_add_u32 s1, s1, 2
+v_cmp_lt_u32_e32 vcc_lo, 2, v0
+s_cbranch_vccnz -6
+v_mov_b32 v1, s1
+s_endpgm
+""",
+    # Nested irreducible cycle {A, B} inside an outer reducible loop headed by H (pc=2)
+    "nested_in_reducible": """\
+s_mov_b32 s1, 0
+s_mov_b32 s2, 0
+s_add_u32 s2, s2, 1
+s_cmp_eq_u32 s0, 0
+s_cbranch_scc0 3
+s_add_u32 s1, s1, 1
+s_cmp_eq_u32 s1, 3
+s_cbranch_scc1 3
+s_add_u32 s1, s1, 2
+s_cmp_lt_u32 s1, 6
+s_cbranch_scc1 -6
+s_cmp_lt_u32 s2, 4
+s_cbranch_scc1 -11
+v_mov_b32 v1, s1
+s_endpgm
+""",
+}
+
+
+@pytest.mark.parametrize("pattern", sorted(IRREDUCIBLE_PATTERNS))
+def test_irreducible_cfg_node_splitting(pattern, make_shader, monkeypatch):
+    """Irreducible CFGs (2-entry SCCs and nested irreducible cycles) structure via node splitting and pass spirv-val."""
+    asm = IRREDUCIBLE_PATTERNS[pattern]
+    shader = make_shader(asm, name=f"cs_irred_{pattern}")
+
+    # Without node splitting, the shader genuinely falls back to the dispatch loop.
+    monkeypatch.setattr(rdna2spirv.cfg_structure, "split_irreducible", lambda succ, **kw: None)
+    spv_fallback = shader.translate()
+    meta_fallback = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_fallback)
+    assert meta_fallback["control_flow"] == "dispatch loop"
+    assert "OpSwitch" in spv_fallback
+
+    # With node splitting enabled, the shader becomes structured and passes spirv-val.
+    monkeypatch.undo()
+    spv_struct = shader.translate()
+    shader.validate(spv_struct)
+    meta_struct = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spv_struct)
+    assert meta_struct["control_flow"] == "structured"
+    assert "OpLoopMerge" in spv_struct
+    assert "OpSwitch" not in spv_struct
+
+
+MASK_REUSE_HEAD = "; mattr: +wavefrontsize64,-wavefrontsize32\nv_mbcnt_lo_u32_b32 v1, -1, 0\nv_mbcnt_hi_u32_b32 v1, -1, v1\n"
+
+
+def emulated_exchanges(make_shader, monkeypatch, body, name="cs_reuse"):
+    """Translate `body` (wave64 compute) with --wave64-emulate; return (SPIR-V, number of mask-word ORs). Every
+    whole-mask exchange ORs two words (lanes 0-31 and 32-63), so the count is two per exchange."""
+    shader = make_shader(MASK_REUSE_HEAD + body + "s_endpgm\n", name)
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    asm = shader.translate()
+    shader.validate(asm)
+    return asm, asm.count("OpAtomicOr")
+
+
+def test_wave64_emulate_reuses_a_mask_exchange(make_shader, monkeypatch):
+    """The same register value (or EXEC) read as a whole mask twice in a block is exchanged once; a rewrite of the
+    register or of EXEC gets a new exchange."""
+    cmp = "v_cmp_eq_u32_e64 s[4:5], 5, v1\n"
+    _, same = emulated_exchanges(make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, rewritten = emulated_exchanges(
+        make_shader, monkeypatch, cmp + "s_bcnt1_i32_b64 s6, s[4:5]\nv_cmp_gt_u32_e64 s[4:5], 40, v1\ns_bcnt1_i32_b64 s7, s[4:5]\n")
+    _, same_exec = emulated_exchanges(make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\ns_bcnt1_i32_b64 s7, exec\n")
+    _, new_exec = emulated_exchanges(
+        make_shader, monkeypatch, "s_bcnt1_i32_b64 s6, exec\nv_cmpx_gt_u32_e32 10, v1\ns_bcnt1_i32_b64 s7, exec\n")
+    _, pair = emulated_exchanges(  # s4 and s5 hold the same value: one exchange serves v_mbcnt_lo(s4) and _hi(s5)
+        make_shader, monkeypatch, cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    _, half = emulated_exchanges(  # s5 rewritten, s4 kept: two exchanges
+        make_shader, monkeypatch,
+        cmp + "v_mbcnt_lo_u32_b32 v3, s4, 0\nv_cmp_gt_u32_e64 s[6:7], 40, v1\ns_and_b32 s5, s5, s7\n"
+        "v_mbcnt_hi_u32_b32 v3, s5, v3\n")
+    assert (same, rewritten, same_exec, new_exec, pair, half) == (2, 4, 2, 4, 2, 4)
+
+
+def test_mesh_s3_wave_id_emits_local_index_shift_and_bfe(make_shader):
+    """Mesh shader prologue initializes s3[27:24] from LocalInvocationIndex >> 6 and s_bfe_u32 extracts it."""
+    path = os.path.join(ROOT, "runtime", "test", "shaders", "ms_wave_info_s3.asm")
+    with open(path, encoding="utf-8") as f:
+        shader = make_shader(f.read(), "ms_wave_info_s3", dxbc=SAMPLE_DXBC["ms_wave_info_s3"])
+    asm = shader.translate()
+    shader.validate(asm)
+    assert "%wave = OpShiftRightLogical %uint %lidx %c6" in asm
+    assert "%mwi = OpShiftLeftLogical %uint %wave %c18" in asm
+    assert "OpStore %s3p %mwi" in asm
+    assert "OpBitFieldUExtract %uint" in asm
+
+
+PK_F16_REPRO_513 = """\
+; mattr: +wavefrontsize64,-wavefrontsize32
+v_mov_b32_e32 v27, 0xbdd53e00
+v_mov_b32_e32 v32, 0x3d3d32a5
+v_and_b32_e32 v7, 7, v0
+v_lshlrev_b32_e32 v7, 7, v7
+v_or_b32_e32 v20, 0x3c00, v7
+v_pk_add_f16 v31, v32, v20 op_sel:[0,0] op_sel_hi:[0,0]
+v_pk_mul_f16 v34, v27, v31 op_sel:[0,0] op_sel_hi:[0,0]
+v_lshlrev_b32_e32 v1, 2, v0
+buffer_store_dword v34, v1, s[0:3], 0 offen
+v_add_nc_u32_e32 v2, 256, v1
+buffer_store_dword v31, v2, s[0:3], 0 offen
+s_endpgm
+"""
+
+
+@pytest.mark.parametrize("emulate", [False, True], ids=["wave64", "wave64-emulate"])
+def test_pk_f16_int_pack_repro_513(emulate, make_shader, monkeypatch):
+    """SHADER-70 (#513): v_pk_*_f16 packs with integer IEEE-754 RTE instead of PackHalf2x16 so drivers cannot fold
+    UnpackHalf2x16(PackHalf2x16(x)) back to unrounded f32, and produces exact RTE bits on the #513 repro."""
+    import sys
+
+    semantic_dir = os.path.join(ROOT, "tests", "semantic")
+    if semantic_dir not in sys.path:
+        sys.path.insert(0, semantic_dir)
+    import spirv_mini_interp
+
+    shader = make_shader(PK_F16_REPRO_513, name="cs_pk_f16_repro_513")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", emulate)
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv
+
+    sg_size = 32 if emulate else 64
+    mem = spirv_mini_interp.run_workgroup(
+        spv, 64, sg_size,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % sg_size},
+        push_constants=[0, 0, 0xFFFFFFFF, 0] + [0] * 28,
+        memory={},
+    )
+    assert [mem[256 + 4 * i] for i in range(3)] == [0x3CD53CD5, 0x3D553D55, 0x3DD53DD5]
+    assert [mem[4 * i] for i in range(3)] == [0x3F403F40, 0x40004000, 0x40604060]
+
+
+@pytest.mark.parametrize("op_asm", [
+    "v_pk_add_f16 v3, v1, v2",
+    "v_pk_mul_f16 v3, v1, v2",
+    "v_pk_max_f16 v3, v1, v2",
+    "v_pk_min_f16 v3, v1, v2",
+    "v_pk_fma_f16 v3, v1, v2, v4",
+    "v_add_f16_e64 v3, v1, v2",
+])
+def test_pk_and_scalar_f16_ops_emit_no_packhalf2x16(op_asm, make_shader):
+    """All v_pk_*_f16 instructions and scalar f16_out ops validate and avoid GLSL PackHalf2x16."""
+    body = (
+        "v_mov_b32 v1, 0x3c003800\n"
+        "v_mov_b32 v2, 0x40003c00\n"
+        "v_mov_b32 v3, 0x00000000\n"
+        "v_mov_b32 v4, 0x38003400\n"
+        f"{op_asm}\n"
+        "v_mov_b32 v0, v3"
+    )
+    shader = make_shader(program(body))
+    spv = shader.translate()
+    shader.validate(spv)
+    assert "PackHalf2x16" not in spv

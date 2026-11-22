@@ -165,6 +165,26 @@ class CliTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_missing_path_is_one_line(self):
+        missing = os.path.join(self.dir, "missing")
+        p = subprocess.run([sys.executable, "-I", TOOL, missing], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn(missing, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(p.stdout, "")
+
+    def test_limit_counts_from_the_start(self):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json", "--limit", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm"])
+        # A negative limit sliced from the end (paths[:-1] dropped b.fssm) instead of being refused.
+        p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--limit", "-1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must be 0 or more", p.stderr)
+        self.assertEqual(p.stdout, "")
+
     def test_text_tally(self):
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -178,6 +198,20 @@ class CliTest(unittest.TestCase):
         doc = json.loads(p.stdout)
         self.assertEqual(doc["tally"]["ps_with_table"], 1)
         self.assertEqual(doc["tally"]["entries"], 2)
+
+    def test_local_stage_index_works_with_an_unrelated_parent_index(self):
+        with open(os.path.join(self.dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"unrelated": []}, f)
+        with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump([{"file": "a.dxbc", "stage": "ps"}], f)
+        self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps"})
+
+    def test_parent_stage_index_is_used_when_local_index_is_empty_or_unrelated(self):
+        for data in ({"unrelated": []}, [], {}):
+            with self.subTest(data=data):
+                with open(os.path.join(self.fssm_dir, "index.json"), "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                self.assertEqual(fssm_header.stage_index(self.fssm_dir), {"a": "ps", "b": "ps"})
 
 
 class BindingCliTest(unittest.TestCase):
