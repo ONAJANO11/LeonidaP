@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import struct
 from pathlib import Path
 import sys
@@ -658,7 +659,8 @@ class TextureSampleD16Checks(unittest.TestCase):
         return b"".join(struct.pack("<4f", *p) for p in pixels)
 
     def run_d16(self, data, code=0, out=""):
-        def harness(_tool, _vs, _fs, raw, *_words, env=None, cwd=None):
+        def harness(_tool, _vs, _fs, raw, *words, env=None, cwd=None):
+            self.words = words
             if data is not None:
                 Path(raw).write_bytes(data)
             return code, out
@@ -678,6 +680,15 @@ class TextureSampleD16Checks(unittest.TestCase):
 
     def test_unsupported_device_skips(self):
         self.assertIsInstance(self.run_d16(None, 77, "unsupported: no Vulkan physical device\n"), check.Skip)
+
+    def test_binds_the_sampler_the_shader_names(self):
+        # vk_texture_test registers the words after ptr_sgpr as sampler 1: they must be the S# the shader builds in
+        # s[16:19], or the draw samples fallback sampler 0
+        asm = (Path(check.__file__).parent / "ps_texture_sample_d16.asm").read_text()
+        built = dict(re.findall(r"s_mov_b32 s(1[6-9]), (\w+)", asm))
+        self.assertEqual(check.D16_SAMPLER, tuple(f"{int(built[str(r)], 0):x}" for r in range(16, 20)))
+        self.run_d16(self.frame())
+        self.assertEqual(self.words, ("0",) + check.D16_SAMPLER)
 
 
 class TexelOffsetChecks(unittest.TestCase):

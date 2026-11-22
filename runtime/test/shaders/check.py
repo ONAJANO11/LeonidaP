@@ -868,6 +868,11 @@ def texture_mode_test(tools, spirv, name):
     return "" if code == 0 and "PASSED" in out else failure(code, out, 3)
 
 
+# The S# ps_texture_sample_d16 builds in s[16:19]. vk_texture_test registers the words it is given as sampler 1, so
+# zeros would leave the shader on fallback sampler 0, which only filters the same by chance.
+D16_SAMPLER = ("92", "c00000", "14500000", "0")
+
+
 def check_d16_texture(raw_path) -> tuple[bool, str]:
     """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
     data = Path(raw_path).read_bytes()
@@ -895,7 +900,7 @@ def texture_sample_d16_test(tools, spirv):
             return f"missing {os.path.basename(path)}"
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw, "0", "0", "0", "0", "0")
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw, "0", *D16_SAMPLER)
         if code == UNSUPPORTED:
             m = re.search(r"unsupported: .*", out)
             return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
