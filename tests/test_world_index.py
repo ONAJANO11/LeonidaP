@@ -12,6 +12,7 @@ import struct
 import tempfile
 import unittest
 import zlib
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -106,7 +107,7 @@ def make_resource(map_file=True):
     return bytes(b)
 
 
-def make_rpf_streams(parts, start=0x40):
+def make_rpf_streams(parts, start=0x40, level=-1):
     """A minimal RPF9-looking file: header word + compressed parts, 16-byte aligned."""
     out = bytearray(start)
     out[:4] = b"9FPR"
@@ -114,7 +115,7 @@ def make_rpf_streams(parts, start=0x40):
     for part in parts:
         pos = (len(out) + 15) & ~15
         out.extend(b"\0" * (pos - len(out)))
-        out.extend(zlib.compress(part))
+        out.extend(zlib.compress(part, level))
     return bytes(out)
 
 
@@ -173,6 +174,47 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["streams"], 2)
         self.assertEqual(rows[0]["kind"], "map")
         self.assertEqual(rows[0]["entities"], 1)
+
+    def test_rpf_scan_joins_three_streams_at_physical_offsets(self):
+        # Stored streams of 347, 722 and 756 bytes start at 64, 416 and 1152: the third start is aligned from the
+        # second stream's end (1138), not from 64 + 347 + 722. A map with its own name follows at 1920.
+        blob = make_resource()
+        second = bytearray(blob)
+        struct.pack_into("<I", second, 0x508, 0xABCD3333)
+        second = bytes(second)
+        path = os.path.join(self.dir, "three.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([blob[:0x150], blob[0x150:0x417], blob[0x417:], second], level=0))
+        joined = dict(WI.parse_resource(blob), offset=64, size=len(blob))
+        rows, stats = WI.scan_rpf(path)
+        self.assertEqual(rows, [joined, dict(WI.parse_resource(second), offset=1920, size=len(second))])
+        self.assertEqual((stats["streams"], stats["scanned_bytes"]), (4, 3628))
+        # A window containing the three parts and ending before the next map.
+        rows, stats = WI.scan_rpf(path, limit=1908 - 64)
+        self.assertEqual(rows, [joined])
+        self.assertEqual((stats["streams"], stats["scanned_bytes"]), (3, 1825))
+
+    def test_rpf_scan_does_not_join_a_following_resource(self):
+        # Use small reads to exercise the retention budget with a small, complete first map.
+        # Its instance blocks lie beyond the retained prefix.
+        blob = make_resource()
+        second = bytearray(blob)
+        struct.pack_into("<I", second, 0x508, 0xABCD3333)
+        second = bytes(second)
+        large = bytearray(blob) + bytes(0x1000 - len(blob)) + blob[0x400:]
+        for at, location in ((0x208, 0x1000), (0x218, 0x1100)):
+            struct.pack_into("<Q", large, at, ptr(location))
+        large = bytes(large)
+        self.assertEqual(WI.parse_resource(large), WI.parse_resource(blob))
+        path = os.path.join(self.dir, "capped.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf_streams([large, second], level=0))
+        used = len(zlib.compress(large, 0))
+        offset = (0x40 + used + 15) & ~15
+        with mock.patch.object(WI, "CHUNK", 0x100):
+            rows, stats = WI.scan_rpf(path, max_inflate=0x800)
+        self.assertEqual(rows, [dict(WI.parse_resource(second), offset=offset, size=len(second))])
+        self.assertEqual((stats["streams"], stats["scanned_bytes"]), (2, used + len(zlib.compress(second, 0))))
 
     def test_scan_window_options(self):
         blob = make_resource()

@@ -348,26 +348,29 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                 pos = s + 1
                 continue
             consumed = 1
+            stream_end = s + used
             if is_meta:
                 # Large resources put the system page in one stream and a small continuation in the next.
                 # Append contiguous zlib streams until the resource's own schema resolves.
                 for _ in range(2):
                     if parse_resource(data) is not None and not _needs_continuation(data):
                         break
-                    nxt = (s + used + 15) & ~15
+                    nxt = (stream_end + 15) & ~15
                     if nxt >= size:
                         break
                     mt = ZHDR.match(m, nxt, size)
                     if not mt:
                         break
                     try:
-                        more, mused, meof, _ = _inflate_stream(m, nxt, size, max_inflate, keep=True)
+                        more, mused, meof, starts_resource = _inflate_stream(m, nxt, size, max_inflate, keep=True)
                     except zlib.error:
                         break
-                    if not meof or not more:
+                    # A stream with its own 0x7a header starts the next resource; the outer scan indexes it.
+                    if not meof or not more or starts_resource:
                         break
                     data += more
                     used += mused
+                    stream_end = nxt + mused
                     consumed += 1
                 row = parse_resource(data, collect)
                 if row is not None:
@@ -376,7 +379,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=CAP, collect=None):
                     rows.append(row)
             streams += consumed
             scanned += used
-            pos = s + used
+            pos = stream_end
             if pos <= s:
                 pos = s + 1
         return rows, {"path": os.path.abspath(path), "bytes": size,
