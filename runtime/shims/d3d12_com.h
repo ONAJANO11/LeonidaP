@@ -90,6 +90,17 @@ struct VulkanDeviceInfo {
     // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
     // approximated.
     bool sampler_anisotropy = false;
+    // multiDrawIndirect is enabled: ExecuteIndirect hands all its commands to one vkCmdDraw*Indirect. Without it the
+    // layer issues one call per command (a drawCount above 1 is invalid without the feature).
+    bool multi_draw_indirect = false;
+    // drawIndirectCount (Vulkan 1.2) is enabled: ExecuteIndirect with a count buffer. Without it such a call is
+    // unsupported.
+    bool draw_indirect_count = false;
+    // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
+    // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
+    bool draw_indirect_first_instance = false;
+    // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
+    std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
@@ -198,6 +209,17 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
+// The device's VkPipelineCache: how many Vulkan pipelines were created through it (graphics, compute and the draw-time
+// variants of a graphics PSO), how many of those the cache answered (VkPipelineCreationFeedback's application-cache
+// hit bit), and the size of its data. `available` is false without Vulkan 1.3 feedback or without the cache; then the
+// counts stay 0. For tests.
+struct PipelineCacheStats {
+    bool available = false;
+    std::uint32_t created = 0;
+    std::uint32_t hits = 0;
+    std::size_t bytes = 0;
+};
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

@@ -594,6 +594,15 @@ public:
         if (!command_signature_info(signature, kind, stride) || !argument_buffer)
             return check(false);
         leonida::ExecuteIndirect cmd{};
+        // A draw takes the list's graphics state, as DrawInstanced does; with nothing to rasterize it is dropped. A
+        // list with no pipeline, root signature or topology yet records the bare call (it closes, as on the PC
+        // runtime; it is not a call replay can run).
+        if (kind != leonida::IndirectKind::dispatch && max_command_count && graphics_pipeline_ && graphics_.layout &&
+            topology_) {
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            cmd.state = std::make_shared<const leonida::Draw>(
+                make_draw(kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0));
+        }
         cmd.kind = kind;
         cmd.stride = stride;
         cmd.max_count = max_command_count;
@@ -924,11 +933,16 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
-                           {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
-                           blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
-        check(list_.draw(draw));
+        check(list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance)));
+    }
+
+    // The list's graphics state as a draw (see record_draw for what has to be set).
+    leonida::Draw make_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex,
+                            UINT first_instance) const {
+        return {graphics_pipeline_, graphics_.data, render_targets_, depth_,
+                {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
+                blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
+                base_vertex, first_instance};
     }
 };
 

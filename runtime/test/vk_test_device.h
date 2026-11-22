@@ -103,6 +103,10 @@ public:
     // create(true) only: VK_KHR (else EXT) swapchain_maintenance1 and its feature enabled, with the surface half on the
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
+    bool multi_draw_indirect = false;  // multiDrawIndirect enabled, where the device has it
+    bool draw_indirect_count = false;  // drawIndirectCount (Vulkan 1.2) enabled, where the device has it
+    std::uint32_t max_draw_indirect_count = 0;  // VkPhysicalDeviceLimits::maxDrawIndirectCount
+    bool draw_indirect_first_instance = false;  // drawIndirectFirstInstance enabled: indirect records may start at an instance
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
@@ -362,6 +366,8 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        enable12.drawIndirectCount = features12.drawIndirectCount;  // ExecuteIndirect with a count buffer
+        draw_indirect_count = features12.drawIndirectCount == VK_TRUE;
         buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
         enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
@@ -395,6 +401,11 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.multiDrawIndirect = features.features.multiDrawIndirect;  // ExecuteIndirect: several commands per call
+        multi_draw_indirect = features.features.multiDrawIndirect == VK_TRUE;
+        enable.drawIndirectFirstInstance = features.features.drawIndirectFirstInstance;
+        draw_indirect_first_instance = features.features.drawIndirectFirstInstance == VK_TRUE;
+        max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
