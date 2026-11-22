@@ -4120,7 +4120,13 @@ class Gen:
         elif op == "v_cvt_f16_f32":
             # Low 16 bits get the f16; on GFX10 the high half is kept (partial write: Mesa ACO instr_is_16bit lists
             # v_cvt_f16_f32 as 16-bit for gfx_level >= GFX10).
+            # VOP3 clamp applies to the f16 (ACO: dst(F16)); the omod doesn't. On RDNA2 an omod acts on an f16 result
+            # only with f16 denormals flushed, and the translator keeps them (SHADER-297: the game has no omod on any
+            # f16 result). clamp to [0, 1] before the rounding gives the same bits as after it. Until 2026-11-22 the
+            # clamp was dropped too.
             x = self.src_f(a[1])
+            if "clamp" in mods:
+                x = self.clamp_mods(x, ["clamp"])
             self.write_lo16(a[0], self.f16_res(x))
         elif op == "s_mulk_i32":
             v = a[1]["v"] & 0xFFFF
