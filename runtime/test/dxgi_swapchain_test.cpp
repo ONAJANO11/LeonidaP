@@ -658,6 +658,15 @@ int main() {
             return fail("DXGI_PRESENT_TEST should not increment GetLastPresentCount");
         if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+        BOOL fullscreen = TRUE;
+        if (FAILED(sc->GetFullscreenState(&fullscreen, nullptr)) || fullscreen)
+            return fail("GetFullscreenState should start windowed");
+        if (FAILED(sc->SetFullscreenState(TRUE, nullptr)) || FAILED(sc->GetFullscreenState(&fullscreen, nullptr)) ||
+            !fullscreen)
+            return fail("GetFullscreenState should report SetFullscreenState(TRUE)");
+        if (FAILED(sc->SetFullscreenState(FALSE, nullptr)) || FAILED(sc->GetFullscreenState(&fullscreen, nullptr)) ||
+            fullscreen)
+            return fail("GetFullscreenState should report SetFullscreenState(FALSE)");
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
 

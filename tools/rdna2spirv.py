@@ -5121,6 +5121,89 @@ class Gen:
             r = self.fma_f16_odd(*vals)     # one rounding, to f16 (SHADER-55); omod/clamp keep round-to-odd valid
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, dhi)  # GFX10: f16 ops keep the other half
+        elif op in ("v_add_nc_i16", "v_sub_nc_i16") and "clamp" not in mods:
+            self._insn({**ins, "op": ("v_add_u16_e64" if op == "v_add_nc_i16" else "v_sub_u16_e64")})
+        elif op in ("v_add_nc_i16", "v_sub_nc_i16"):
+            sel, dhi = self.opsel_bits(mods, 2)
+            if dhi:
+                raise Unsupported(op + " op_sel destination")
+            xs = []
+            for k, src in enumerate(a[1:3]):
+                u, v = self.src_u(src), self.tmp()
+                self.emit(f"{v} = OpBitFieldSExtract %int {self.as_int(u)} {self.cu(16 * sel[k])} {self.cu(16)}")
+                xs.append(v)
+            w, c, cu, lo = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{w} = {'OpIAdd' if op == 'v_add_nc_i16' else 'OpISub'} %int {xs[0]} {xs[1]}")
+            self.emit(f"{c} = OpExtInst %int %glsl SClamp {w} {self.as_int(self.cu(0xFFFF8000))} "
+                      f"{self.as_int(self.cu(0x7FFF))}")
+            self.emit(f"{cu} = OpBitcast %uint {c}")
+            self.emit(f"{lo} = OpBitwiseAnd %uint {cu} {self.cu(0xFFFF)}")
+            self.write_lo16(a[0], lo)
+        elif op == "v_sat_pk_u8_i16":
+            x = self.src_u(a[1])
+            bytes_ = []
+            for off in (0, 16):
+                v, c, u = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{v} = OpBitFieldSExtract %int {self.as_int(x)} {self.cu(off)} {self.cu(16)}")
+                self.emit(f"{c} = OpExtInst %int %glsl SClamp {v} {self.as_int(self.cu(0))} {self.as_int(self.cu(255))}")
+                self.emit(f"{u} = OpBitcast %uint {c}")
+                bytes_.append(u)
+            sh, r = self.tmp(), self.tmp()
+            self.emit(f"{sh} = OpShiftLeftLogical %uint {bytes_[1]} {self.cu(8)}")
+            self.emit(f"{r} = OpBitwiseOr %uint {bytes_[0]} {sh}")
+            self.dst(a[0], r)
+        elif op in ("v_cvt_norm_i16_f16", "v_cvt_norm_u16_f16", "v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16"):
+            if any(m == "clamp" or m.startswith(("mul:", "div:")) for m in mods):
+                raise Unsupported(op + " output modifier")
+            packed = "pknorm" in op
+            snorm = "_i16_" in op
+            sel, dhi = self.opsel_bits(mods, 2 if packed else 1)
+            halves = []
+            for k, src in enumerate(a[1:3] if packed else a[1:2]):
+                f = self.f16_in(src, sel[k])
+                nan, z, c, m, rr, i, h = (self.tmp() for _ in range(7))
+                self.emit(f"{nan} = OpIsNan %bool {f}")
+                self.emit(f"{z} = OpSelect %float {nan} %f0 {f}")
+                self.emit(f"{c} = OpExtInst %float %glsl FClamp {z} {self.fconst(-1.0) if snorm else '%f0'} %f1")
+                self.emit(f"{m} = OpFMul %float {c} {self.fconst(32767.0 if snorm else 65535.0)}")
+                self.emit(f"{rr} = OpExtInst %float %glsl RoundEven {m}")
+                if snorm:
+                    si_ = self.tmp()
+                    self.emit(f"{si_} = OpConvertFToS %int {rr}")
+                    self.emit(f"{i} = OpBitcast %uint {si_}")
+                else:
+                    self.emit(f"{i} = OpConvertFToU %uint {rr}")
+                self.emit(f"{h} = OpBitwiseAnd %uint {i} {self.cu(0xFFFF)}")
+                halves.append(h)
+            if packed:
+                sh, r = self.tmp(), self.tmp()
+                self.emit(f"{sh} = OpShiftLeftLogical %uint {halves[1]} {self.cu(16)}")
+                self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {sh}")
+                self.dst(a[0], r)
+            elif not dhi:
+                self.write_lo16(a[0], halves[0])
+            else:
+                if a[0]["k"] != "vgpr":
+                    raise Unsupported("op_sel destination")
+                old, keep, sh16, v = (self.tmp() for _ in range(4))
+                self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                self.emit(f"{keep} = OpBitwiseAnd %uint {old} {self.cu(0xFFFF)}")
+                self.emit(f"{sh16} = OpShiftLeftLogical %uint {halves[0]} {self.cu(16)}")
+                self.emit(f"{v} = OpBitwiseOr %uint {keep} {sh16}")
+                self.dst(a[0], v)
+        elif op in ("v_fma_legacy_f32", "v_fmac_legacy_f32"):
+            srcs = (a[1], a[2], a[0]) if op == "v_fmac_legacy_f32" else a[1:4]
+            x, y, z = (self.src_f(t) for t in srcs)
+            fused, zx, zy, either, plain, r = (self.tmp() for _ in range(6))
+            self.emit_fma(fused, x, y, z)
+            self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
+            self.emit(f"{zy} = OpFOrdEqual %bool {y} %f0")
+            self.emit(f"{either} = OpLogicalOr %bool {zx} {zy}")
+            self.emit(f"{plain} = OpFAdd %float %f0 {z}")
+            self.emit(f"{r} = OpSelect %float {either} {plain} {fused}")
+            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+        elif op in ("v_fmaak_f16", "v_fmamk_f16"):
+            self._insn({**ins, "op": "v_fma_f16"})
         elif op in ("v_add_nc_u16", "v_sub_nc_u16"):
             # VOP3-only GFX10 names of the 16-bit add/sub (no carry): opsel-capable, so the high half is kept.
             self._insn({**ins, "op": ("v_add_u16_e64" if op == "v_add_nc_u16" else "v_sub_u16_e64")})

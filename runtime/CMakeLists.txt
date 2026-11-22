@@ -1459,7 +1459,9 @@ if(TARGET Vulkan::Headers)
     else()
       find_program(LEONIDA_LLVM_MC llvm-mc HINTS "C:/msys64/ucrt64/bin")
     endif()
-    if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    if(LEONIDA_LLVM_MC AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL)
+      get_filename_component(LEONIDA_SG_SPIRV_TOOLS ${LEONIDA_SPIRV_AS} DIRECTORY)
+      file(TO_NATIVE_PATH "${LEONIDA_SG_SPIRV_TOOLS}" LEONIDA_SG_SPIRV_TOOLS)
       set(LEONIDA_SG_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/subgroup_shaders)
       set(LEONIDA_SG_INDEXES "")
       foreach(case "w64_native;cs_w64x_readlane;0" "w64_emulated;cs_w64x_readlane;1" "w32_native;cs_wqm_w32;0"
@@ -1471,6 +1473,7 @@ if(TARGET Vulkan::Headers)
         add_custom_command(
           OUTPUT ${index}
           COMMAND ${CMAKE_COMMAND} -E env LLVM_MC=${LEONIDA_LLVM_MC} LEONIDA_W64_EMULATE=${emulate}
+                  "LEONIDA_SPIRV_TOOLS=${LEONIDA_SG_SPIRV_TOOLS}"
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
           DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
@@ -1501,7 +1504,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_subgroup COMMAND d3d12_subgroup_test)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
+      message(STATUS "llvm-mc (set LLVM_MC), glslangValidator or the SDK's spirv-as/spirv-val not found: d3d12_subgroup_test is not built")
     endif()
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).

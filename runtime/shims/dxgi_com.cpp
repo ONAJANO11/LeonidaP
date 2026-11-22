@@ -206,9 +206,12 @@ public:
         return buffers_[buffer]->QueryInterface(riid, surface);
     }
 
-    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL, IDXGIOutput*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetFullscreenState(BOOL fullscreen, IDXGIOutput*) override {
+        fullscreen_ = fullscreen ? TRUE : FALSE;
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetFullscreenState(BOOL* fs, IDXGIOutput** out) override {
-        if (fs) *fs = FALSE;
+        if (fs) *fs = fullscreen_;
         if (out) *out = nullptr;
         return S_OK;
     }
@@ -424,6 +427,7 @@ private:
     leonida::VulkanContext& context_;
     leonida::VulkanSwapchain swapchain_;
     HWND hwnd_ = nullptr;
+    BOOL fullscreen_ = FALSE;
     UINT flags_ = 0;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
