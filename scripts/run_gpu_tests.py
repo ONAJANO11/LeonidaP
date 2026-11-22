@@ -646,7 +646,7 @@ def run_suite(a, work: str) -> int:
                                                     os.environ.get("LEONIDA_W64_EMULATE") == "1"))
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_scc_mask32", "cs_movrelsd_2", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
 
-                      "cs_w64_mask_detect",
+                      "cs_w64_mask_detect", "cs_w64_exec_half",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
@@ -668,6 +668,7 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
                 "cs_w64_mask_detect": [48],
+                "cs_w64_exec_half": [1, 0, 1, 1, 0, 3, 9, 9],     # one half of EXEC / VCC (FUZZ-8)
                 "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],       # cs_wqm_w64.asm / cs_wqm_w32.asm headers
                 "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
                 "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],

@@ -18,6 +18,12 @@ Shapes (each nests, up to --depth):
   irr       two-entry cycle on uniform SCC branches                                   (irreducible graph)
   sccmask   s_and/andn2/or/xor of VCC and EXEC, or s_not of VCC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
+  ifs       v_cmp_*_e64 into an SGPR mask -> s_and_saveexec from it [-> v_cndmask_b32_e64 on it]
+  cexec     a constant EXEC (s_mov_b32 exec_lo/exec_hi, literal) around a body
+  halfexec  s_and_b32 on one half of EXEC (wave64: exec_lo or exec_hi; the other half's lanes are untouched)
+  halfscc   SCC of s_and/andn2/or/xor_b32 on one half of VCC and EXEC -> s_cbranch_scc0/1
+  scmpmask  s_cmp_eq/lg of a mask against 0 (u32 on an SGPR mask in wave32, u64 on VCC in wave64)
+  cselmask  s_cselect_b32/b64 between a compare mask and EXEC -> s_and_saveexec
 (vloop also closes some loops with s_cbranch_scc1 on the SCC of its s_andn2 exec.)
 Bodies mix integer VALU and SALU ops with "probes": v11 = v11 * 33 + K at each site, so v11 records which sites
 each lane ran, in which order and how often. v8/v9 carry data, v10 the uniform SGPRs. Immediates stay in the
@@ -37,6 +43,7 @@ import argparse
 import gc
 import os
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -79,6 +86,10 @@ class Gen:
         r = self.r
         k = r.choice((0, 1, 2, 3, 4, 5, 7, 8, 12, 16, 31, 32, 63, 64, -1, -16))
         return (r.choice(CCS), r.choice(("u32", "u32", "i32")), k, r.choice((0, 0, 1, 2, 3, 8, 9)))
+
+    def half(self):
+        """Which 32-bit half of a mask a _b32 op works on: always the low (whole) one in wave32."""
+        return self.r.choice(("lo", "hi")) if self.wave == 64 else "lo"
 
     def probe(self):
         self.site += 1
@@ -125,7 +136,21 @@ class Gen:
     def compound(self, depth):
         r = self.r
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "vloop", "irr",
-                         "sccmask", "csel"))
+                         "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask"))
+        if kind == "ifs":
+            return ("ifs", self.cmp(), r.random() < 0.7, r.random() < 0.5, [self.probe()] + self.block(depth))
+        if kind == "cexec":
+            return ("cexec", r.getrandbits(32), r.getrandbits(32), [self.probe()] + self.block(depth))
+        if kind == "halfexec":
+            return ("halfexec", self.cmp(), self.half(), [self.probe()] + self.block(depth))
+        if kind == "halfscc":
+            return ("halfscc", self.cmp(), r.choice(("and", "andn2", "or", "xor")), self.half(),
+                    r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
+        if kind == "scmpmask":
+            return ("scmpmask", self.cmp(), r.choice(("eq", "lg")), r.choice(("s_cbranch_scc0", "s_cbranch_scc1")),
+                    [self.probe()] + self.block(depth))
+        if kind == "cselmask":
+            return ("cselmask", (r.choice(SREGS), r.randrange(0, 65)), self.cmp(), [self.probe()] + self.block(depth))
         if kind == "sccmask":
             return ("sccmask", self.cmp(), r.choice(("and", "andn2", "or", "xor", "not")),
                     r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
@@ -322,6 +347,83 @@ class Emitter:
             self.ins(f"s_add_u32 s{ctr}, s{ctr}, 1")
             self.ins(f"s_cmp_lt_u32 s{ctr}, {trips}")
             self.br("s_cbranch_scc1", head)
+        elif kind == "ifs":
+            # The compare writes an SGPR mask (VOP3), which feeds the saveexec; some bodies also v_cndmask on it.
+            _, c, skip, use_cnd, body = n
+            cc, ty, k, v = c
+            m, save, end = self.sreg(60), self.sreg(20), self.label()
+            self.ins(f"v_cmp_{cc}_{ty}_e64 {m}, {k}, v{v}")
+            self.ins(f"s_and_saveexec_{w} {save}, {m}")
+            if skip:
+                self.br("s_cbranch_execz", end)
+            if use_cnd:
+                self.ins(f"v_cndmask_b32_e64 v9, 3, v8, {m}")
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_or_{w} {ex}, {ex}, {save}")
+        elif kind == "cexec":
+            # A constant EXEC: each lane takes its own bit of the literal (also lanes that were off).
+            _, klo, khi, body = n
+            save = self.sreg(20)
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.ins(f"s_mov_b32 exec_lo, 0x{klo:x}")
+            if self.wave == 64:
+                self.ins(f"s_mov_b32 exec_hi, 0x{khi:x}")
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"s_mov_{w} {ex}, {save}")
+        elif kind == "halfexec":
+            # A 32-bit op on one half of EXEC: the lanes of the other half keep their state.
+            _, c, half, body = n
+            save = self.sreg(20)
+            self.vcmp(c)
+            self.ins(f"s_mov_{w} {save}, {ex}")
+            self.ins(f"s_and_b32 exec_{half}, exec_{half}, vcc_{half}")
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.ins(f"s_mov_{w} {ex}, {save}")
+        elif kind == "halfscc":
+            # SCC of a 32-bit op on one half: whether that half's result is non-zero (in wave32, the whole mask).
+            _, c, logic, half, mnemonic, body = n
+            end = self.label()
+            self.vcmp(c)
+            self.ins(f"s_{logic}_b32 s50, vcc_{half}, exec_{half}")
+            self.br(mnemonic, end)
+            self.nodes(body)
+            self.place(end)
+        elif kind == "scmpmask":
+            # s_cmp of a mask against 0: s_cmp_eq/lg_u32 on an SGPR mask (wave32) or _u64 on VCC (wave64).
+            _, c, cc, mnemonic, body = n
+            end = self.label()
+            if self.wave == 64:
+                self.vcmp(c)
+                self.ins(f"s_cmp_{cc}_u64 vcc, 0")
+            else:
+                cc_, ty, k, v = c
+                self.ins(f"v_cmp_{cc_}_{ty}_e64 s60, {k}, v{v}")
+                self.ins(f"s_cmp_{cc}_u32 s60, 0")
+            self.br(mnemonic, end)
+            self.nodes(body)
+            self.place(end)
+        elif kind == "cselmask":
+            # A uniform s_cmp picks one of two masks (compare result or EXEC) for the saveexec.
+            _, (sr, k), c, body = n
+            cc, ty, kk, v = c
+            m, t, save, end = self.sreg(60), self.sreg(70), self.sreg(20), self.label()
+            self.ins(f"v_cmp_{cc}_{ty}_e64 {m}, {kk}, v{v}")
+            self.ins(f"s_cmp_lt_u32 s{sr}, {k}")
+            self.ins(f"s_cselect_{w} {t}, {m}, {ex}")
+            self.ins(f"s_and_saveexec_{w} {save}, {t}")
+            self.br("s_cbranch_execz", end)
+            self.depth += 1
+            self.nodes(body)
+            self.depth -= 1
+            self.place(end)
+            self.ins(f"s_or_{w} {ex}, {ex}, {save}")
         elif kind == "sccmask":
             # SCC of a mask op is (whole result != 0): one value for the wave, like a vote.
             _, c, logic, mnemonic, body = n
@@ -401,10 +503,20 @@ class Emitter:
 
 
 def _size(text):
-    op = text.split()[0]
-    if op == "exp" or op.endswith("_e64") or op in VOP3:
-        return 8
-    return 4
+    """Bytes of the encoding: 4, or 8 for VOP3 and exp, plus 4 for a literal (an integer outside -16..64)."""
+    op, _, rest = text.partition(" ")
+    base = 8 if op == "exp" or op.endswith("_e64") or op in VOP3 else 4
+    return base + (4 if any(not -16 <= v <= 64 for v in _ints(rest)) else 0)
+
+
+def _ints(operands):
+    out = []
+    for t in (x.strip() for x in operands.split(",")):
+        try:
+            out.append(int(t, 0))
+        except ValueError:
+            pass
+    return out
 
 
 def listing_text(lines, name):
@@ -437,7 +549,7 @@ def run_case(name, body, wave, structured=True):
         try:
             ref = cf_ref.run(path, wave=wave)
         except cpu_ref.CpuRefError as e:
-            return ("skip", f"cf_ref: {e}")
+            return ("skip", "cf_ref: " + re.sub(r" at pc 0x[0-9a-f]+", "", str(e)))
         old = rdna2spirv.STRUCTURED
         rdna2spirv.STRUCTURED = structured
         try:

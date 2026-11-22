@@ -79,7 +79,6 @@ class WaveMachine(cpu_ref.Machine):
         self.wave = wave
         self.wmask = (1 << wave) - 1
         self.exports = {}
-        self.mask_sgprs = set()     # SGPRs a v_cmp wrote (s_not on them is a mask op)
         self.by_pc = {}
         for i, ins in enumerate(self.insns):
             if not ins.get("enc"):
@@ -200,6 +199,12 @@ class WaveMachine(cpu_ref.Machine):
             return None
         if base.startswith(("v_cmp_", "v_cmpx_")):
             return self._vcmp(ins, base)
+        if base in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
+            self._check_width("x_b64", op)
+            self._expect(ins, 2)
+            x, y = self._read_mask(a[0]), self._read_mask(a[1])
+            self.scc = 1 if (x == y) == (base == "s_cmp_eq_u64") else 0
+            return None
         if base.startswith("s_cmp_"):
             self._expect(ins, 2)
             _, cc, ty = base.split("_")[1:]
@@ -226,8 +231,9 @@ class WaveMachine(cpu_ref.Machine):
         parts = base.split("_")
         if len(parts) == 3 and parts[0] == "s" and parts[1] in _SOP2_LOGIC and parts[2] in ("b32", "b64"):
             self._expect(ins, 3)
-            mask_op = self._touches_mask(a)
-            if parts[2] == "b64" or mask_op:
+            # A _b32 op is a 32-bit word op on every operand, masks included: in wave32 EXEC_LO/VCC_LO are the whole
+            # mask, in wave64 they (and EXEC_HI/VCC_HI) are one half of it. Only _b64 needs 64-bit masks.
+            if parts[2] == "b64":
                 self._check_width(base, op)
                 x, y = self._read_mask(a[1]), self._read_mask(a[2])
                 r = _SOP2_LOGIC[parts[1]](x, y, self.wmask) & self.wmask
@@ -241,7 +247,7 @@ class WaveMachine(cpu_ref.Machine):
         if base in ("s_not_b32", "s_not_b64"):
             # SOP1: D = ~S0, SCC = (D != 0). On a mask the complement is the wave's lanes that are off in S0.
             self._expect(ins, 2)
-            if base == "s_not_b64" or self._touches_mask(a) or self._mask_sgpr(a[1]):
+            if base == "s_not_b64":
                 self._check_width(base, op)
                 r = ~self._read_mask(a[1]) & self.wmask
                 self._write_mask(a[0], r)
@@ -258,10 +264,10 @@ class WaveMachine(cpu_ref.Machine):
             v = (src["v"] & MASK64) if src["k"] == "imm" else self._read_mask(src)
             self._write_mask(a[0], v)
             return None
-        if base == "s_mov_b32" and self._touches_mask(a):
-            self._expect(ins, 2)
-            v = a[1]["v"] & MASK32 if a[1]["k"] == "imm" else self._read_mask(a[1]) & MASK32
-            self._write_mask(a[0], v)
+        if base == "s_cselect_b64":
+            self._check_width(base, op)
+            self._expect(ins, 3)
+            self._write_mask(a[0], self._read_mask(a[1] if self.scc else a[2]))
             return None
         if base in ("s_sub_u32", "s_add_i32", "s_sub_i32"):
             self._expect(ins, 3)
@@ -290,10 +296,6 @@ class WaveMachine(cpu_ref.Machine):
             return None
         super().step(ins)
         return None
-
-    def _mask_sgpr(self, arg):
-        """An SGPR written by a compare (a lane mask) since the program started."""
-        return arg["k"] == "sgpr" and arg["r"] in self.mask_sgprs
 
     @staticmethod
     def _touches_mask(args):
@@ -351,8 +353,6 @@ class WaveMachine(cpu_ref.Machine):
         if self.wave == 64 and dst["k"] == "sgpr" and dst.get("n", 1) < 2:
             raise Unsupported(op, self.pc, "a wave64 compare needs an SGPR pair destination")
         self._write_mask(dst, mask)
-        if dst["k"] == "sgpr":
-            self.mask_sgprs.update(range(dst["r"], dst["r"] + dst.get("n", 1)))
         return None
 
 
