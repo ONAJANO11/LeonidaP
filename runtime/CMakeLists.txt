@@ -924,6 +924,12 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_trace COMMAND "${Python3_EXECUTABLE}" -I
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_d3d12_trace.py" "$<TARGET_FILE:d3d12_gcl8_test>" ${_trace_runner})
 
+    add_executable(d3d12_gcl1_test test/d3d12_gcl1_test.cpp)
+    target_link_libraries(d3d12_gcl1_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_gcl1_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_gcl1_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_gcl1 COMMAND d3d12_gcl1_test)
+
     # The Vulkan device behind the Xbox-ABI proxy, end to end.
     add_executable(d3d12_vulkan_device_test test/d3d12_vulkan_device_test.cpp)
     target_link_libraries(d3d12_vulkan_device_test PRIVATE gta6rt_d3d12_com dxguid)  # IID_ID3D12MetaCommand (#1440)
@@ -1379,6 +1385,14 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      add_executable(d3d12_depth_bounds_test test/d3d12_depth_bounds_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS} ${LEONIDA_TEST_PS})
+      target_link_libraries(d3d12_depth_bounds_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_depth_bounds_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(d3d12_depth_bounds_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth_bounds COMMAND d3d12_depth_bounds_test)
+      set_tests_properties(d3d12_depth_bounds PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
     endif()

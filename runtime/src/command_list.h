@@ -409,6 +409,9 @@ struct Draw {
     std::uint32_t first;  // first vertex or first index
     std::int32_t base_vertex;
     std::uint32_t first_instance;
+    // OMSetDepthBounds; applied only by a pipeline whose depth-bounds test is on (D3D12_DEPTH_STENCIL_DESC1).
+    float depth_bounds_min = 0.0f;
+    float depth_bounds_max = 1.0f;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
