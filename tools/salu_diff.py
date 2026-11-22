@@ -370,7 +370,8 @@ def _parse_src(tok, sgpr, width):
         return sgpr.get(int(tok[1:]), 0)
     v = int(tok, 0)
     if width == 64:
-        # inline constants are sign-extended; a 32-bit literal is zero-extended (not generated here)
+        # inline constants are sign-extended; a 32-bit literal is zero-extended for b64/u64 and sign-extended for i64
+        # (measured on gfx1036, docs/design.md; not generated here)
         return v & M64 if -16 <= v <= 64 else v & M32
     return v & M32
 
