@@ -667,11 +667,11 @@ The compute path, end to end:
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. It also
   keeps CommandList5's shading rate, combiners and shading-rate image. `Reset` and `ClearState` return those to
   1x1, passthrough and no image. Null combiners are passthrough. As on the host PC runtime (measured on a Radeon
-  680M, an RTX 3050 and WARP), a rate or combiner outside its enum makes `Close` return `E_INVALIDARG`, and either
-  VRS call on a compute or copy list makes it return `E_FAIL`; bundles take both calls, and the first invalid
-  call in a list decides. Each `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with
-  no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12.
-  Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
+  680M, an RTX 3050 and WARP), a rate or combiner outside its enum makes `Close` return `E_INVALIDARG`, either VRS
+  call on a compute or copy list makes it return `E_FAIL`, and the first invalid call in a list decides. At tier 2,
+  bundles take both calls, as direct lists do. Each `DrawInstanced` / `DrawIndexedInstanced` records a copy of
+  that state. A draw with no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an empty one
+  rasterizes nothing in D3D12. Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
 
   At replay:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
