@@ -76,7 +76,8 @@ COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh",
 CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc003800]
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 WAVE32_DUMPS = ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
-                "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32")
+                "cs_barrier_divergent", "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_lds_subdword",
+                "cs_w32_lds_wide")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is.
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32")
@@ -89,6 +90,10 @@ CS_DUMPS = [("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_permute", [218, 29, 8, 211, 0, 15, 99, 15]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),
+            # 8/16-bit LDS writes (incl. _d16_hi) and sign/zero-extending reads
+            ("cs_w32_lds_subdword", [0x11B2D444, 0xA1B2C3D4, 0xFFFFFFB2, 0x000000B2, 0x00000011, 0xFFFFA1B2, 0x0000A1B2, 0xFFFFC3D4]),
+            # 64/96/128-bit LDS accesses and ds_read2st64_b32
+            ("cs_w32_lds_wide", [0xCAFEF00D, 0xFEEDFACE, 0x600DD00D, 0x00000000, 0x8BADF00D, 0xDEADC0DE, 0x12345678, 0x9ABCDEF0]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
             ("cs_wm_half_ops", [32, 16, 16, 0, 16]), ("cs_wm_half_cmp", [1, 0, 1, 1]),
             ("cs_wm_bfm64", [16, 8, 8, 40]), ("cs_wm_scc_rfl", [55, 48]),
