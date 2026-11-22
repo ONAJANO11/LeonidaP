@@ -1686,6 +1686,7 @@ class Gen:
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
+        d16_hi = "_d16_hi_" in op           # buffer_load_format_d16_hi_x: the one result goes to the high half
         ncomp = len(op.rsplit("_", 1)[1])
         vd = a[0]
         addr, d3, in_b, step = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
@@ -1811,10 +1812,17 @@ class Gen:
                 il = int_half(lo)
                 r = self.tmp()
                 if i + 1 == len(outs):
-                    # For d16_x and d16_xyz the unaddressed high half keeps its previous bits.
+                    # For d16_x and d16_xyz the unaddressed high half keeps its previous bits; d16_hi_x writes
+                    # the high half and keeps the low one.
                     fl = self.f16_bits(self.tof(lo))
                     self.emit(f"{r} = OpSelect %uint {is_int_fmt} {il} {fl}")
-                    self.write_lo16(dest, r)
+                    if d16_hi:
+                        ins = self.tmp()
+                        self.emit(f"{ins} = OpBitFieldInsert %uint {self.load_reg('vgpr', dest['r'])} {r} "
+                                  f"{self.cu(16)} {self.cu(16)}")
+                        self.dst(dest, ins)
+                    else:
+                        self.write_lo16(dest, r)
                     continue
                 hi = outs[i + 1]
                 ph = self.pack_f16_pair_int(self.tof(lo), self.tof(hi))
@@ -2311,7 +2319,9 @@ class Gen:
                     r = regs[i // 2]
                     v2, f, iv = self.tmp(), self.tmp(), self.tmp()
                     sh = self.tmp()
-                    self.emit(f"{sh} = OpShiftRightLogical %uint {r} {self.cu(16 * (i % 2))}")
+                    # buffer_store_format_d16_hi_x stores the high half of the one register
+                    half = 1 if "_d16_hi_" in op else i % 2
+                    self.emit(f"{sh} = OpShiftRightLogical %uint {r} {self.cu(16 * half)}")
                     self.emit(f"{iv} = OpBitwiseAnd %uint {sh} {self.cu(0xFFFF)}")
                     self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {iv}")
                     self.emit(f"{f} = OpCompositeExtract %float {v2} 0")
@@ -4696,7 +4706,8 @@ class Gen:
         elif op.startswith("buffer_store_dword") or op in ("buffer_store_format_x", "buffer_store_format_xy",
                                                             "buffer_store_format_xyz", "buffer_store_format_xyzw",
                                                             "buffer_store_format_d16_x", "buffer_store_format_d16_xy",
-                                                            "buffer_store_format_d16_xyz", "buffer_store_format_d16_xyzw"):
+                                                            "buffer_store_format_d16_xyz", "buffer_store_format_d16_xyzw",
+                                                            "buffer_store_format_d16_hi_x"):
             self.buffer_store(op, a, mods)
         elif op in ("v_permlanex16_b32", "v_permlane16_b32"):
             # Lane l reads lane sel[l & 15] of (x16: the other 16-lane half of its row; plain: the same half).
@@ -4727,7 +4738,7 @@ class Gen:
             self.buffer_load(op, a, mods)
         elif op in ("buffer_load_format_x", "buffer_load_format_xy", "buffer_load_format_xyz",
                     "buffer_load_format_xyzw", "buffer_load_format_d16_x", "buffer_load_format_d16_xy",
-                    "buffer_load_format_d16_xyz", "buffer_load_format_d16_xyzw"):
+                    "buffer_load_format_d16_xyz", "buffer_load_format_d16_xyzw", "buffer_load_format_d16_hi_x"):
             self.buffer_load_format(op, a, mods)
         elif op in ("tbuffer_load_format_x", "tbuffer_load_format_xy", "tbuffer_load_format_xyz",
                     "tbuffer_load_format_xyzw", "tbuffer_load_format_d16_x", "tbuffer_load_format_d16_xy",
@@ -9992,7 +10003,7 @@ def read_before_write_vgprs(insns):
             elif x["k"] == "vlist":
                 regs += x["r"]
         if (base_op(op) in ("v_fmac_f32", "v_mac_f32", "v_mac_legacy_f32", "v_fmac_f16", "v_dot4c_i32_i8") or
-                (op.startswith("global_load_") and "_d16" in op)) and a[0]["k"] == "vgpr":   # d16 keeps a half
+                (op.startswith("global_load_") and "_d16" in op) or op == "buffer_load_format_d16_hi_x") and a[0]["k"] == "vgpr":   # d16 keeps a half
             regs.append(a[0]["r"])
         for r in regs:
             if r not in written and r not in first:
