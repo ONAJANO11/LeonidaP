@@ -698,6 +698,7 @@ struct GraphicsPipeline {
     std::uint32_t vertex_slots = 0;       // bit per input slot the input layout uses
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
+    bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -754,6 +755,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdDraw draw = nullptr;
+    PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -819,6 +821,7 @@ enum class ReplayResult {
     invalid_predication,
     invalid_query,
     invalid_indirect_arguments,
+    invalid_draw,  // DispatchMesh with a pipeline that has no mesh shader, or a vertex draw with one that has
     unsupported
 };
 
@@ -1525,6 +1528,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
+    if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
+    if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
     p.graphics = *pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
@@ -3079,12 +3084,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
                                     std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
             vk.set_scissor(command_buffer, 0, 1, &scissor);
-            const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
-            vk.set_primitive_topology(command_buffer, topology);
-            const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                 ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
-                                  (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32));
-            vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
+            // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
+            if (!draw->mesh) {
+                const VkPrimitiveTopology topology = detail::vulkan_topology(draw->topology);
+                vk.set_primitive_topology(command_buffer, topology);
+                const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                     ((p.graphics.strip_cut == 1 && p.index_type == VK_INDEX_TYPE_UINT16) ||
+                                      (p.graphics.strip_cut == 2 && p.index_type == VK_INDEX_TYPE_UINT32));
+                vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+            }
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
@@ -3093,7 +3102,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],
                                         &p.vertex_sizes[slot], &p.vertex_strides[slot]);
             }
-            if (draw->indexed) {
+            if (draw->mesh) {
+                vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
+            } else if (draw->indexed) {
                 vk.bind_index_buffer(command_buffer, p.index_buffer, p.index_offset, p.index_type);
                 vk.draw_indexed(command_buffer, draw->count, draw->instances, draw->first, draw->base_vertex,
                                 draw->first_instance);

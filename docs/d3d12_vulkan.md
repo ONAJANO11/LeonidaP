@@ -1270,6 +1270,39 @@ Pipeline creation:
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
 
+**Implemented (D3D-29): pipeline state streams, mesh PSOs and `DispatchMesh`.**
+- **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
+  `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
+  `MeshShaderTier` 1 only then; without the extension it reports `NOT_SUPPORTED` and mesh PSOs are `E_NOTIMPL`.
+- **Streams:** `CreatePipelineState` parses the stream in the d3dx12.h layout: a subobject type, then its
+  description at that description's alignment, each subobject pointer-aligned.
+  - Every type up to `RASTERIZER2` is read.
+  - Missing subobjects take the runtime's defaults: depth test on with `LESS`, back-face culling, no blending, sample
+    mask `0xFFFFFFFF`, one sample.
+  - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
+    a VS stream builds the same PSO as the classic call.
+  - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
+    tessellation or GS, CS with a graphics stage, or no stage at all.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
+    masks, view instancing.
+  - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
+- **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
+  assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
+  and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation
+  is refused when the index's `max_vertices`/`max_primitives` or the workgroup size exceed the device's
+  `VkPhysicalDeviceMeshShaderPropertiesEXT`.
+- **`DispatchMesh`:** recorded as a `Draw` with `mesh` set; the thread-group counts go in `count`/`instances`/`first`.
+  It takes the same state snapshot as `DrawInstanced`: render targets, root arguments, viewport, scissor, blend
+  factor, stencil references. Replay issues `vkCmdDrawMeshTasksEXT`.
+  - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
+  - **Not recorded:** an empty grid.
+  - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
+- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
+  Wine), validation-clean.
+  - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
+  - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
+    question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
+
 ## 4. Object model mapping
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
