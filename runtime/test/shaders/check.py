@@ -13,8 +13,8 @@ The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see 
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
 to check a translator that emulates wave64 on them. scripts/run_gpu_tests.py builds the mesh fixtures and
 fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spirv.
-ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
-vk_sampler_test needs.
+ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp, ps_ssharp_ops and
+ps_ssharp_lod when it lacks one vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
 """
 import collections
@@ -803,6 +803,9 @@ SAMPLER_CASES = [("point", ssharp_words(1), (0, 1)),                       # 0 /
                  ("point min_lod 1", ssharp_words(1, min_lod=1), (0, 1)),  # 1 / 1: MIN_LOD clamps an explicit LOD too
                  ("point bias +1", ssharp_words(1, bias=1), (0, 1)),       # 1 / 1: the S# bias applies to an explicit LOD
                  ("point bias -1", ssharp_words(1, bias=-1), (0, 1)),      # 0 / 0
+                 ("point bias +0.375", ssharp_words(1, bias=0.375), (0, 1)),          # 0 / 1: a fractional bias
+                 ("point bias -1 min_lod 1", ssharp_words(1, min_lod=1, bias=-1), (0, 1)),  # 1 / 1: bias, then clamp
+                 ("point bias +1 max_lod 0", ssharp_words(1, max_lod=0, bias=1), (0, 1)),   # 0 / 0: likewise
                  ("none", ssharp_words(0), (0, 1)),                        # 0 / 0: MIP_FILTER_NONE reads the base level
                  ("none min_lod 1", ssharp_words(0, min_lod=1), (0, 1)),   # 0 / 0: and ignores the LOD clamp
                  ("point base 1", ssharp_words(1), (1, 1))]                # 1 / 1: the T#'s BASE_LEVEL starts the view
@@ -810,16 +813,23 @@ SAMPLER_SIZE = 64          # the target; the texture is twice as wide, so implic
 GREY = 128 / 255
 
 
-def sampler_level(words, view, lod):
+def sampler_level(words, view, lod, min_clamp=None):
     """The texture level one sample reads, from the S# fields and the T# view alone (not from gfx10_descriptors.h).
     MIP_FILTER_NONE reads the view's base level whatever the LOD. Otherwise the LOD plus LOD_BIAS is clamped to
     [MIN_LOD, MAX_LOD], a point mip filter takes the nearest level (ceil(lod + 0.5) - 1, as Vulkan's
-    VK_SAMPLER_MIPMAP_MODE_NEAREST does) and the result stays inside the view."""
+    VK_SAMPLER_MIPMAP_MODE_NEAREST does) and the result stays inside the view. An instruction's min-LOD clamp
+    (`min_clamp`, _cl) raises MIN_LOD; None where that puts it above the top of the range, which Vulkan leaves
+    undefined (MIP_FILTER_NONE's sampler has maxLod 0.25: vulkan_sampler)."""
     base, last = view
-    if (words[2] >> 26) & 3 == 0:
+    none = (words[2] >> 26) & 3 == 0
+    lo, hi = (words[1] & 0xfff) / 256, (words[1] >> 12 & 0xfff) / 256
+    if min_clamp is not None and min_clamp > (0.25 if none else hi):
+        return None
+    if none:
         return base
     bias = ((words[2] & 0x3fff) ^ 0x2000) - 0x2000
-    lo, hi = (words[1] & 0xfff) / 256, (words[1] >> 12 & 0xfff) / 256
+    if min_clamp is not None:
+        lo = max(lo, min_clamp)
     level = math.ceil(min(max(lod + bias / 256, lo), hi) + 0.5) - 1
     return base + min(max(level, 0), last - base)
 
@@ -845,25 +855,88 @@ def sampler_mismatch(data, words, view):
     return ""
 
 
-def sampler_test(tools, spirv):
-    """ps_ssharp: every SAMPLER_CASES S#/T# pair drawn with vk_sampler_test and judged per pixel by sampler_level.
-    A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at each pixel."""
-    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_ssharp")]
+# ps_ssharp_ops: (instruction, base LOD, min-LOD clamp) of mrt0's four channels, in order (see its .asm header).
+SAMPLER_OPS = (("image_sample_l", 0.625, None), ("image_sample_b", 0.75, None), ("image_sample_d", 0.0, None),
+               ("image_sample_d_cl", -1.0, 0.75))
+
+
+def sampler_ops_mismatch(data, words, view):
+    """ps_ssharp_ops: the first pixel whose four r channels are not those of the levels the S# and T# select for
+    SAMPLER_OPS, or "". A channel whose level Vulkan leaves undefined (sampler_level None) is not judged."""
+    if len(data) != SAMPLER_SIZE ** 2 * 16:
+        return f"expected {SAMPLER_SIZE ** 2} RGBA32F pixels, got {len(data)} bytes"
+    levels = [sampler_level(words, view, lod, clamp) for _, lod, clamp in SAMPLER_OPS]
+    for i, got in enumerate(struct.iter_unpack("<4f", data)):
+        y, x = divmod(i, SAMPLER_SIZE)
+        for (op, _, _), level, g in zip(SAMPLER_OPS, levels, got):
+            if level is not None and abs(g - sampler_texel(level, x, y)[0]) > 1e-6:
+                want = tuple(None if lv is None else round(sampler_texel(lv, x, y)[0], 4) for lv in levels)
+                return f"({x},{y}) {op}: {tuple(round(v, 4) for v in got)} != {want}"
+    return ""
+
+
+# ps_ssharp_lod: the calculated LOD of its two image_get_lod queries, (u, v) and (2u, v), before the S#'s bias, and
+# its cases: SAMPLER_CASES without an S# whose MIN_LOD equals its MAX_LOD, as in GET_LOD_TESTS (Mesa llvmpipe 26.3.1
+# leaves such a range out of OpImageQueryLod: 0..0 gave level 1), plus MAX_LOD 0.25 in their place.
+SAMPLER_LOD_QUERIES = (1.0, 2.0)
+SAMPLER_LOD_CASES = ([case for case in SAMPLER_CASES if case[1][1] & 0xfff != case[1][1] >> 12 & 0xfff]
+                     + [("point max_lod 0.25", ssharp_words(1, max_lod=0.25), (0, 1)),         # 0 / 0 at both LODs
+                        ("point bias +1 max_lod 0.25", ssharp_words(1, max_lod=0.25, bias=1), (0, 1))])
+
+
+def sampler_lod_mismatch(data, words, view):
+    """ps_ssharp_lod: the first pixel whose (clamped, calculated) LOD pairs are not, within GET_LOD_TOLERANCE, the
+    level sampler_level selects (relative to the view's base) and the calculated LOD plus the S#'s LOD_BIAS, or ""."""
+    if len(data) != SAMPLER_SIZE ** 2 * 16:
+        return f"expected {SAMPLER_SIZE ** 2} RGBA32F pixels, got {len(data)} bytes"
+    bias = (((words[2] & 0x3fff) ^ 0x2000) - 0x2000) / 256
+    want = ()
+    for lod in SAMPLER_LOD_QUERIES:
+        lod -= view[0]   # LODs count from the view's base level, whose texels are 2^BASE_LEVEL times larger
+        want += (float(sampler_level(words, view, lod) - view[0]), lod + bias)
+    for i, got in enumerate(struct.iter_unpack("<4f", data)):
+        if not all(abs(g - w) <= GET_LOD_TOLERANCE for g, w in zip(got, want)):   # a NaN too
+            y, x = divmod(i, SAMPLER_SIZE)
+            return f"({x},{y}): {tuple(round(g, 4) for g in got)} != {want}"
+    return ""
+
+
+def shader_lod_bias(spirv, name):
+    """Whether the translator made `name` apply its S#'s LOD_BIAS itself (index.json: lod_bias_fallback)."""
+    try:
+        with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+            return bool(json.load(f).get(name, {}).get("lod_bias_fallback"))
+    except (OSError, ValueError):
+        return False
+
+
+def sampler_cases(shader):
+    """The (name, S#, T# view) cases sampler_test draws `shader` with."""
+    return SAMPLER_LOD_CASES if shader == "ps_ssharp_lod" else SAMPLER_CASES
+
+
+def sampler_test(tools, spirv, shader="ps_ssharp"):
+    """ps_ssharp (or ps_ssharp_ops, ps_ssharp_lod): every S#/T# pair of sampler_cases drawn with vk_sampler_test and
+    judged per pixel by sampler_level. A grey level-1 texel differs from every level-0 texel in both channels, so a wrong level fails at
+    each pixel. A shader translated with --lod-bias-fallback gets a sampler without mipLodBias (--shader-lod-bias)."""
+    shaders = [os.path.join(spirv, name + ".spv") for name in ("vs_ids", shader)]
     for path in shaders:
         if not os.path.isfile(path):
             return f"missing {os.path.basename(path)}"
+    judge = {"ps_ssharp_ops": sampler_ops_mismatch, "ps_ssharp_lod": sampler_lod_mismatch}.get(shader, sampler_mismatch)
+    flags = ["--shader-lod-bias"] if shader_lod_bias(spirv, shader) else []
     with tempfile.TemporaryDirectory(prefix="leonida-sampler-") as tmp:
-        for name, words, view in SAMPLER_CASES:
+        for name, words, view in sampler_cases(shader):
             raw = Path(tmp) / "pixels.raw"
             raw.unlink(missing_ok=True)
-            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *shaders, raw,
+            code, out = run(os.path.join(tools, "vk_sampler_test" + EXE), *flags, *shaders, raw,
                             *(f"{w:x}" for w in words), *(str(v) for v in view))
             if code == UNSUPPORTED:
                 m = re.search(r"unsupported: .*", out)
                 return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
             if code or not raw.is_file():
                 return f"{name}: {failure(code, out, 3)}"
-            problem = sampler_mismatch(raw.read_bytes(), words, view)
+            problem = judge(raw.read_bytes(), words, view)
             if problem:
                 return f"{name}: {problem}"
     return ""
@@ -1326,6 +1399,8 @@ def main():
     results.append(("ps_tex", bindless_test(tools, spirv)))
     results.append(("ps_ssharp", sampler_test(tools, spirv)))
     results.append(("ps_imgatomic", bindless_test(tools, spirv, "ps_imgatomic")))
+    results.append(("ps_ssharp_ops", sampler_test(tools, spirv, "ps_ssharp_ops")))
+    results.append(("ps_ssharp_lod", sampler_test(tools, spirv, "ps_ssharp_lod")))
     for name in MIP_TEST_PASSES:
         results.append((name, texture_mip_test(tools, spirv, name)))
     for name in GRADIENT_TESTS:

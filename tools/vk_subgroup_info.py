@@ -27,6 +27,11 @@ per_vertex_inputs says whether the device can run a pixel shader with PerVertexK
 docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
+
+sampler_lod_bias says whether the device's samplers take a LOD bias: false where it has VK_KHR_portability_subset
+and that extension's samplerMipLodBias feature is false (MoltenVK, since Metal samplers have none). Where it is
+false, the shaders are translated with --lod-bias-fallback and apply the S#'s LOD_BIAS themselves, and the runtime
+creates its samplers with mipLodBias 0.
 """
 import ctypes
 import json
@@ -43,6 +48,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES = 53
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR = 1000163000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
@@ -51,6 +57,9 @@ AMD_VENDOR_ID = 0x1002
 # crash reports from 0x13C0, 0x164E, 0x73BF (RX 6800) and 0x73DF (RX 6700).
 RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x1435, 0x1435), (0x1681, 0x1681),
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
+PORTABILITY_FEATURES_SIZE = 80          # 16 + 15 VkBool32, padded to 8
+PORTABILITY_SAMPLER_MIP_LOD_BIAS = 16 + 4 * 8
+EXTENSION_PROPERTIES_SIZE = 260         # sizeof(VkExtensionProperties): char[256] + specVersion
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -158,6 +167,23 @@ def physical_devices(vk, instance):
     raise RuntimeError("vkEnumeratePhysicalDevices repeatedly returned VK_INCOMPLETE")
 
 
+def device_extensions(vk, device) -> set:
+    """The names of the device extensions `device` offers (no layers)."""
+    for _ in range(3):
+        count = ctypes.c_uint32()
+        if vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), None) != 0:
+            return set()
+        buf = ctypes.create_string_buffer(EXTENSION_PROPERTIES_SIZE * max(count.value, 1))
+        result = vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), buf)
+        if result == 0:
+            raw = bytes(buf)
+            return {raw[i * EXTENSION_PROPERTIES_SIZE:i * EXTENSION_PROPERTIES_SIZE + 256].split(b"\0")[0].decode()
+                    for i in range(count.value)}
+        if result != VK_INCOMPLETE:
+            return set()
+    return set()
+
+
 def query() -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
@@ -170,6 +196,7 @@ def query() -> dict:
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
+    vk.vkEnumerateDeviceExtensionProperties.argtypes = [vp, vp, vp, vp]
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
     info = InstanceInfo(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, None, 0, ctypes.pointer(app), 0, None, 0, None)
@@ -206,6 +233,11 @@ def query() -> dict:
             set_next(f12, f13)
             bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
             set_next(f13, bary)
+            # Without VK_KHR_portability_subset the device is conformant: its samplers take a LOD bias.
+            portability = "VK_KHR_portability_subset" in device_extensions(vk, d)
+            subset = block(PORTABILITY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR)
+            if portability:
+                set_next(bary, subset)
             f2 = block(FEATURES2_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
             set_next(f2, f12)
             vk.vkGetPhysicalDeviceFeatures2(d, f2)
@@ -226,7 +258,8 @@ def query() -> dict:
                           sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
+                          not portability or bool(u32(subset, PORTABILITY_SAMPLER_MIP_LOD_BIAS)))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -234,7 +267,8 @@ def query() -> dict:
                     "the runtime needs matches"
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex, vendor, device, driver = chosen
+        (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex, vendor, device, driver,
+         lod_bias) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -258,6 +292,7 @@ def query() -> dict:
             "device_id": device,
             "driver_id": driver,
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
+            "sampler_lod_bias": lod_bias,
         }
     finally:
         vk.vkDestroyInstance(inst, None)

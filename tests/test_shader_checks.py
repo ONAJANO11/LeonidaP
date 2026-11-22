@@ -34,8 +34,8 @@ TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures,
+         # ps_ssharp, ps_ssharp_ops and ps_ssharp_lod
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -785,11 +785,81 @@ class SamplerMipChecks(unittest.TestCase):
 
     def test_levels_follow_the_s_and_t_fields(self):
         want = {"point": (0, 1), "point max_lod 0": (0, 0), "point min_lod 1": (1, 1), "point bias +1": (1, 1),
-                "point bias -1": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
+                "point bias -1": (0, 0), "point bias +0.375": (0, 1), "point bias -1 min_lod 1": (1, 1),
+                "point bias +1 max_lod 0": (0, 0), "none": (0, 0), "none min_lod 1": (0, 0), "point base 1": (1, 1)}
         self.assertEqual({name for name, _, _ in check.SAMPLER_CASES}, set(want))
         for name, words, view in check.SAMPLER_CASES:
             with self.subTest(name=name):
                 self.assertEqual((check.sampler_level(words, view, 0), check.sampler_level(words, view, 1)), want[name])
+
+    def test_ops_levels_follow_the_s_and_t_fields(self):
+        """ps_ssharp_ops: _l at 0.625, _b at 0.75, _d at 0 and _d_cl at -1 clamped to at least 0.75, each plus the
+        bias and inside [MIN_LOD, MAX_LOD]; None where the clamp is above MAX_LOD (or MIP_FILTER_NONE's 0.25)."""
+        want = {"point": (1, 1, 0, 1), "point max_lod 0": (0, 0, 0, None), "point min_lod 1": (1, 1, 1, 1),
+                "point bias +1": (1, 1, 1, 1), "point bias -1": (0, 0, 0, 1), "point bias +0.375": (1, 1, 0, 1),
+                "point bias -1 min_lod 1": (1, 1, 1, 1), "point bias +1 max_lod 0": (0, 0, 0, None),
+                "none": (0, 0, 0, None), "none min_lod 1": (0, 0, 0, None), "point base 1": (1, 1, 1, 1)}
+        for name, words, view in check.SAMPLER_CASES:
+            with self.subTest(name=name):
+                levels = tuple(check.sampler_level(words, view, lod, clamp) for _, lod, clamp in check.SAMPLER_OPS)
+                self.assertEqual(levels, want[name])
+
+    @staticmethod
+    def ops_image(levels):
+        return b"".join(struct.pack("<4f", *(check.sampler_texel(lv or 0, x, y)[0] for lv in levels))
+                        for y in range(64) for x in range(64))
+
+    def test_ops_judge_every_channel_but_an_undefined_one(self):
+        words, view = check.ssharp_words(1), (0, 1)
+        good = self.ops_image((1, 1, 0, 1))
+        self.assertEqual(check.sampler_ops_mismatch(good, words, view), "")
+        for channel, op in enumerate(("image_sample_l", "image_sample_b", "image_sample_d", "image_sample_d_cl")):
+            bad = bytearray(good)
+            struct.pack_into("<f", bad, len(good) - 16 + 4 * channel, 0.25)
+            self.assertTrue(check.sampler_ops_mismatch(bytes(bad), words, view).startswith(f"(63,63) {op}:"))
+        undefined = check.ssharp_words(1, max_lod=0)        # _d_cl's clamp of 0.75 is above MAX_LOD 0
+        self.assertEqual(check.sampler_ops_mismatch(self.ops_image((0, 0, 0, 1)), undefined, view), "")
+        self.assertIn("bytes", check.sampler_ops_mismatch(good[:-16], words, view))
+
+    def test_lod_query_values_follow_the_s_and_t_fields(self):
+        """ps_ssharp_lod: (clamped, calculated) at LOD 1 and 2 before the bias, counted from the view's base level; the
+        clamped LOD is the level a point-filtered sample reads. No case has MIN_LOD == MAX_LOD (llvmpipe)."""
+        want = {"point": (1, 1, 1, 2), "point min_lod 1": (1, 1, 1, 2), "point bias +1": (1, 2, 1, 3),
+                "point bias -1": (0, 0, 1, 1), "point bias +0.375": (1, 1.375, 1, 2.375),
+                "point bias -1 min_lod 1": (1, 0, 1, 1), "none": (0, 1, 0, 2), "none min_lod 1": (0, 1, 0, 2),
+                "point base 1": (0, 0, 0, 1), "point max_lod 0.25": (0, 1, 0, 2),
+                "point bias +1 max_lod 0.25": (0, 2, 0, 3)}
+        self.assertEqual([name for name, _, _ in check.sampler_cases("ps_ssharp_lod")], list(want))
+        self.assertIs(check.sampler_cases("ps_ssharp_ops"), check.SAMPLER_CASES)
+        for name, words, view in check.sampler_cases("ps_ssharp_lod"):
+            with self.subTest(name=name):
+                image = struct.pack("<4f", *want[name]) * 4096
+                self.assertEqual(check.sampler_lod_mismatch(image, words, view), "")
+                bad = bytearray(image)
+                struct.pack_into("<f", bad, len(image) - 12, want[name][1] + 0.125)   # (63,63)'s calculated LOD
+                self.assertTrue(check.sampler_lod_mismatch(bytes(bad), words, view).startswith("(63,63):"))
+                within = bytearray(image)
+                struct.pack_into("<f", within, 4, want[name][1] + 1 / 16)
+                self.assertEqual(check.sampler_lod_mismatch(bytes(within), words, view), "")
+                self.assertIn("bytes", check.sampler_lod_mismatch(image[:-16], words, view))
+
+    def test_a_fallback_shader_gets_a_sampler_without_bias(self):
+        """A shader the index marks lod_bias_fallback is drawn with --shader-lod-bias, the others without."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("vs_ids", "ps_ssharp", "ps_ssharp_ops"):
+                Path(tmp, name + ".spv").touch()
+            Path(tmp, "index.json").write_text(json.dumps({"ps_ssharp_ops": {"lod_bias_fallback": True}}))
+            calls = []
+
+            def tool(*cmd, env=None):
+                calls.append(cmd)
+                return 1, "stop"
+            with patch.object(check, "run", side_effect=tool):
+                check.sampler_test("tools", tmp)
+                check.sampler_test("tools", tmp, "ps_ssharp_ops")
+        self.assertNotIn("--shader-lod-bias", calls[0])
+        self.assertEqual(calls[1][1], "--shader-lod-bias")
+        self.assertTrue(calls[1][3].endswith("ps_ssharp_ops.spv"))
 
     def test_s_words_put_the_fields_where_mesa_does(self):
         self.assertEqual(check.ssharp_words(1, min_lod=1, max_lod=15, bias=-1), (0x92, 0xf00100, 0x04003f00, 0))

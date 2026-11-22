@@ -210,6 +210,18 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+## Macs: sampler LOD bias in the shader
+
+Metal samplers have no LOD bias, so MoltenVK reports `samplerMipLodBias` false in
+`VkPhysicalDevicePortabilitySubsetFeaturesKHR` and ignores a sampler's `mipLodBias` (which is then also invalid
+usage, VUID-VkSamplerCreateInfo-samplerMipLodBias-04467). `run_gpu_tests.py` asks `tools/vk_subgroup_info.py`
+(`sampler_lod_bias`) and, where it is false, translates with `--lod-bias-fallback`: the samples then apply the S#'s
+LOD_BIAS themselves (`docs/design.md`, "Sampler LOD bias in the shader"). `vk_sampler_test` creates its sampler with
+`mipLodBias` 0 on such a device, and wherever the index marks the shader `lod_bias_fallback` (`check.py` passes
+`--shader-lod-bias`). `LEONIDA_LOD_BIAS_FALLBACK=1` or `0` forces the translation on or off; `build.py` (for
+`check.py`) uses the flag only when that variable is `1`. Forced on, `ps_ssharp`, `ps_ssharp_ops` and `ps_ssharp_lod`
+check the fallback on any device; forced off on MoltenVK, they fail at "point bias +1".
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;
@@ -268,6 +280,8 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `vk_harness` doesn't compile: `VK_KHR_maintenance8` names unknown | Vulkan headers older than the SDK the code was written against | Update to current `main` (the code now builds without it), or use current Khronos Vulkan-Headers; conda-forge's package is too old |
 | `ps_bary` and `ps_uniform_branch` fail by about 0.9 | The GPU runs pixel shaders wave64 without fragment barycentrics (GCN3 and RDNA1 on RADV), or an old AMD Windows driver (22.40) | Current `main` skips them on such devices; on Windows, update the driver |
 | `ps_interp_f16_high` fails on a Mac: `PerVertexKHR decoration is not supported in MSL`, then `vkCreateGraphicsPipelines` -3 | MoltenVK can't convert `PerVertexKHR` inputs to Metal | Current `main` translates it with `--f16-interp-fallback` on MoltenVK (see "Macs: 16-bit interpolation") |
+| `ps_ssharp` fails on a Mac: `point bias +1: (0,0): (1.0, 0.0, 0.502, 0.502) != (0.502, 0.502, 0.502, 0.502)` | MoltenVK's samplers ignore `mipLodBias` (portability subset `samplerMipLodBias` false), so the S#'s LOD bias was lost | Current `main` translates with `--lod-bias-fallback` on such a device (see "Macs: sampler LOD bias in the shader") |
+| `ps_ssharp_lod` fails on KosmicKrisp: `point bias +1: (0,0): (2.0, 1.0, 2.0, 2.0) != (1.0, 2.0, 1.0, 3.0)` | KosmicKrisp (Mesa 26.3.1) leaves the sampler's `mipLodBias` out of `OpImageQueryLod`'s calculated LOD and adds it, unrounded and past the last level, to the clamped one; Vulkan's λ′ includes the bias | Expected with that driver. `LEONIDA_LOD_BIAS_FALLBACK=1` puts the bias in the shader, and the test then passes there |
 | `ps_vcmpx_forms` fails on a Mac: word 1 reads `0xf05e8e16`, want `0xf05e8a12` | MoltenVK's fast-math makes a compare of a NaN with itself true (SHADER-234) | Current `main`'s test programs turn it off (`MVK_CONFIG_FAST_MATH_ENABLED=0`, unless you set the variable yourself); rebuild them |
 | On a Mac, a translated shader's GPU time is 1.5 to 16 times what it would be without the precise-arithmetic overhead | MoltenVK's SPIRV-Cross turns every `NoContraction` float add, subtract and multiply into a call to an `[[clang::optnone]]` helper that Metal does not inline. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-234, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions, and the output is still exact. Before you time shaders on a Mac, build MoltenVK with SPIRV-Cross `98cbb7c0` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision` (KhronosGroup/MoltenVK#2917 moves it to `57e4efcc`), and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |

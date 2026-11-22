@@ -151,6 +151,8 @@ def translate_tests(work, names):
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
+    if os.environ.get("LEONIDA_LOD_BIAS_FALLBACK") == "1":   # the S#'s LOD bias in the shader (MoltenVK's samplers)
+        cmd.append("--lod-bias-fallback")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode
