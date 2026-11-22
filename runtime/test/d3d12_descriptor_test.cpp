@@ -676,17 +676,17 @@ int main() {
         // different value in every channel, so a swapped pair shows. Its footprint has two-byte texels; the view
         // samples as RGBA8 with each nibble n read as n * 17.
         {
-            D3D12_RESOURCE_DESC packed_desc = texture_desc;
-            packed_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
-            Ref<ID3D12Resource> packed;
-            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &packed_desc,
+            D3D12_RESOURCE_DESC b4_desc = texture_desc;
+            b4_desc.Format = DXGI_FORMAT_B4G4R4A4_UNORM;
+            Ref<ID3D12Resource> b4_texture;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &b4_desc,
                                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                             IID_PPV_ARGS(&packed.p))));
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT packed_placed{};
+                                                             IID_PPV_ARGS(&b4_texture.p))));
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT b4_placed{};
             UINT64 row_size = 0;
-            device->GetCopyableFootprints(&packed_desc, 0, 1, 49152, &packed_placed, nullptr, &row_size, nullptr);
-            EXPECT(packed_placed.Footprint.Format == DXGI_FORMAT_B4G4R4A4_UNORM && row_size == size * 2 &&
-                   packed_placed.Footprint.RowPitch == 256);
+            device->GetCopyableFootprints(&b4_desc, 0, 1, 49152, &b4_placed, nullptr, &row_size, nullptr);
+            EXPECT(b4_placed.Footprint.Format == DXGI_FORMAT_B4G4R4A4_UNORM && row_size == size * 2 &&
+                   b4_placed.Footprint.RowPitch == 256);
             const auto nibbles = [](UINT x, UINT y) {  // R, G, B, A
                 return std::array<UINT, 4>{x, y + 8, (x + y) & 15, 15 - x};
             };
@@ -694,20 +694,20 @@ int main() {
                 for (UINT x = 0; x < size; ++x) {
                     const auto n = nibbles(x, y);
                     const std::uint16_t word = std::uint16_t(n[2] | (n[1] << 4) | (n[0] << 8) | (n[3] << 12));
-                    std::memcpy(static_cast<std::uint8_t*>(mapped) + packed_placed.Offset +
-                                    y * packed_placed.Footprint.RowPitch + x * 2,
+                    std::memcpy(static_cast<std::uint8_t*>(mapped) + b4_placed.Offset +
+                                    y * b4_placed.Footprint.RowPitch + x * 2,
                                 &word, 2);
                 }
             // Set 0 takes in a view at the next ExecuteCommandLists, so it is made before the upload runs.
-            device->CreateShaderResourceView(packed.p, nullptr, view_slot(null_slot));
+            device->CreateShaderResourceView(b4_texture.p, nullptr, view_slot(null_slot));
             EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
-            D3D12_TEXTURE_COPY_LOCATION to_packed{packed.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+            D3D12_TEXTURE_COPY_LOCATION to_packed{b4_texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
             to_packed.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION from_packed{upload.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
-            from_packed.PlacedFootprint = packed_placed;
+            from_packed.PlacedFootprint = b4_placed;
             list->CopyTextureRegion(&to_packed, 0, 0, 0, &from_packed, nullptr);
             const D3D12_RESOURCE_BARRIER readable =
-                transition(packed.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                transition(b4_texture.p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             list->ResourceBarrier(1, &readable);
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
