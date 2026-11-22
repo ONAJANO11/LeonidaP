@@ -54,6 +54,10 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
 - `test_saveexec_b64.py` does the same for `s_and_saveexec_b64`, `s_or_saveexec_b64`, `s_andn2_saveexec_b64` and
   `s_andn2_wrexec_b64` with S0 a compare result in VCC or in an SGPR pair (13 pairs of S0 and EXEC for each op and
   source), and runs the GPU test `cs_w64x_saveexec_b64`.
+- `test_f32_denorm_flush.py` runs one-line programs with `--f32-denorm-flush` off and on (SHADER-377, docs/design.md
+  "f32 denormals in the game's MODE"): a denormal f32 operand reads as a zero of its sign and a denormal `v_mul_f32`/
+  `v_fma_f32` result is flushed, for `v_cmp_*_f32`, `v_max/min/med3/max3/min3_f32`, `v_mul_f32`, `v_fma_f32`,
+  `v_cvt_flr_i32_f32` and `v_sqrt_f32`. The expected words follow from the rule by hand, not from a GPU run.
 - `spirv_wave_interp.py` runs every invocation of one subgroup at once through structured control flow
   (split at a selection, rejoin at its merge, loops until no invocation is left) with the subgroup
   operations the translator emits. It is the SPIR-V side of `tools/cf_diff.py` (FUZZ-8);

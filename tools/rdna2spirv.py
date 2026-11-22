@@ -48,6 +48,11 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
+# --f32-denorm-flush (SHADER-377): the game's MODE flushes f32 denormals (denorm_mode_32 = 0), so RDNA2 reads a
+# denormal f32 operand as a zero of its sign and flushes a denormal result of v_mul_f32 and v_fma_f32 to a zero of
+# its sign; the translator otherwise leaves denormals to the driver (NVIDIA keeps them). Off by default: it adds
+# a flush to the listed operations only (Gen.src_fm, Gen.res_fm; docs/design.md, "f32 denormals in the game's MODE").
+F32_DENORM_FLUSH = False
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
 # coordinate (coordinate + offset / size of the sampled mip level) instead of the SPIR-V Offset operand, which needs
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
@@ -986,7 +991,7 @@ class Gen:
         dst = None if (scalar or exec_only) else a[0]
         if ty in ("f32", "f16"):
             if ty == "f32":
-                x, y = self.src_f(srcs[0]), self.src_f(srcs[1])
+                x, y = self.src_fm(srcs[0]), self.src_fm(srcs[1])
             else:   # f16 compare: op_sel selects lo/hi half of each source, compared as f32 (exact for f16 values)
                 sel, _ = self.opsel_bits(mods, 2)
                 x, y = self.f16_in(srcs[0], sel[0]), self.f16_in(srcs[1], sel[1])
@@ -3562,6 +3567,16 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    def src_fm(self, a):
+        """``src_f`` for an operand of an f32 operation that reads it through the game's MODE (SHADER-377): with
+        ``--f32-denorm-flush`` a denormal reads as a zero of its sign; without it, ``src_f`` unchanged."""
+        f = self.src_f(a)
+        return self.flush_f32(f) if F32_DENORM_FLUSH else f
+
+    def res_fm(self, r):
+        """A result of an f32 operation that flushes a denormal result in the game's MODE (SHADER-377)."""
+        return self.flush_f32(r) if F32_DENORM_FLUSH else r
+
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
         for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
@@ -4014,7 +4029,7 @@ class Gen:
         elif op == "s_mov_b64":
             self.mov64(a[0], a[1])
         elif op in ("v_max3_f32", "v_min3_f32"):
-            x, y, z = (self.src_f(t) for t in a[1:4])
+            x, y, z = (self.src_fm(t) for t in a[1:4])
             f = "NMax" if "max" in op else "NMin"      # a NaN operand gives the other one (docs/design.md)
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpExtInst %float %glsl {f} {x} {y}")
@@ -6639,13 +6654,16 @@ class Gen:
             self.emit(f"{r} = OpFDiv %float %f1 {x}")
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
-            x, y = self.src_f(a[1]), self.src_f(a[2])
+            mode = op in ("v_mul_f32", "v_max_f32", "v_min_f32")    # the ops measured to read through MODE (SHADER-377)
+            x, y = (self.src_fm(a[1]), self.src_fm(a[2])) if mode else (self.src_f(a[1]), self.src_f(a[2]))
             r = self.tmp()
             if F2[op] in ("max", "min"):
                 self.emit(f"{r} = OpExtInst %float %glsl {'NMax' if F2[op] == 'max' else 'NMin'} {x} {y}")
             else:
                 self.emit(f"{r} = {F2[op]} %float {x} {y}")
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            if op == "v_mul_f32":
+                r = self.res_fm(r)
+            self.dst(a[0], self.tou(self.res_fm(self.clamp_mods(r, mods)) if op == "v_mul_f32" else self.clamp_mods(r, mods)))
         elif op == "v_subrev_f32":
             x, y = self.src_f(a[1]), self.src_f(a[2])
             r = self.tmp()
@@ -6656,18 +6674,18 @@ class Gen:
                 # fmaak D = S0 * S1 + K, printed `vdst, src0, vsrc1, K`; fmamk D = S0 * K + S1, printed
                 # `vdst, src0, K, vsrc1`. In print order both are fma(a[1], a[2], a[3]), like v_fma_f32. Until
                 # 2026-11-21 fmamk read a[3] as the factor, so it computed S0 * S1 + K.
-                x, y, z = (self.src_f(t) for t in a[1:4])
+                x, y, z = (self.src_fm(t) for t in a[1:4])
             elif op == "v_fmac_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
+                x, y, z = self.src_fm(a[1]), self.src_fm(a[2]), self.src_fm(a[0])
             else:
-                r = self.med3_f([self.src_f(t) for t in a[1:4]], a[1:4])
+                r = self.med3_f([self.src_fm(t) for t in a[1:4]], a[1:4])
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
                 return
             r = self.tmp()
             self.emit_fma(r, x, y, z)
-            self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
+            self.dst(a[0], self.tou(self.res_fm(self.clamp_mods(self.res_fm(r), mods))))
         elif op in F1:
-            x = self.src_f(a[1])
+            x = self.src_fm(a[1]) if op == "v_sqrt_f32" else self.src_f(a[1])    # sqrt: measured (SHADER-377)
             r = self.tmp()
             if F1[op] == "rcp":
                 self.emit(f"{r} = OpFDiv %float %f1 {x}")
@@ -6753,7 +6771,7 @@ class Gen:
             #   and rounds to >= 0.5 iff exact x - f >= 0.5 around -0.5), so (frac >= 0.5) ? (f + 1.0) : f is exact.
             # - Out-of-range values (|x| >= 2^31, +-inf) and NaNs all saturate by the sign bit of x (+ -> 0x7FFFFFFF,
             #   - -> 0x80000000). Check x's bits before Floor so a driver cannot lose a NaN's sign bit.
-            x = self.src_f(a[1])
+            x = self.src_fm(a[1]) if op == "v_cvt_flr_i32_f32" else self.src_f(a[1])    # flr: measured (SHADER-377)
             x_bits = self.tou(x)
             x_mag, x_neg, x_in_range, bound, safe_x_u, fl, signed, converted, result = (self.tmp() for _ in range(9))
             self.emit(f"{x_mag} = OpBitwiseAnd %uint {x_bits} {self.cu(0x7FFFFFFF)}")
@@ -11585,13 +11603,19 @@ def main():
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
                          "(guaranteed single rounding; needs VK_KHR_shader_fma + shaderFmaFloat32, listed in the "
                          "shader's metadata as capability FMAKHR / feature shaderFmaFloat32)")
+    ap.add_argument("--f32-denorm-flush", action="store_true",
+                    help="SHADER-377: model the game's MODE (f32 denormals flushed) in v_cmp_*_f32, v_max/min/med3/"
+                         "max3/min3_f32, v_mul_f32, v_fma_f32 (and v_fmac/fmaak/fmamk), v_cvt_flr_i32_f32 and "
+                         "v_sqrt_f32: a denormal operand reads as a zero of its sign, a denormal v_mul/v_fma result "
+                         "is flushed. Off by default (the driver's denormal handling)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, F32_DENORM_FLUSH
     FMA_KHR = a.fma == "khr"
+    F32_DENORM_FLUSH = a.f32_denorm_flush
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
