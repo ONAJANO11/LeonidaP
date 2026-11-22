@@ -1232,6 +1232,12 @@ public:
             } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE2DARRAY) {
                 view = {r->id(), desc->Texture2DArray.MipSlice, desc->Texture2DArray.FirstArraySlice,
                         desc->Texture2DArray.ArraySize};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1D) {
+                // A 1D texture is a one-row 2D image (D3D-63), so its views are the same ranges.
+                view = {r->id(), desc->Texture1D.MipSlice, 0, 1};
+            } else if (desc && desc->ViewDimension == D3D12_DSV_DIMENSION_TEXTURE1DARRAY) {
+                view = {r->id(), desc->Texture1DArray.MipSlice, desc->Texture1DArray.FirstArraySlice,
+                        desc->Texture1DArray.ArraySize};
             } else if (desc) {
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
