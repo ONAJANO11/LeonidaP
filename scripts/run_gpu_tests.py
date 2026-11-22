@@ -215,13 +215,22 @@ def read_raw_u32(path: str) -> list[tuple[int, int, int, int]]:
     return [struct.unpack_from("<4I", data, 16 * i) for i in range(n)]
 
 
-UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders)
+UNSUPPORTED = 77   # vk_harness: the device lacks a stage the test draws with (geometry or mesh shaders);
+                   # vk_store_test: the device can't read or write a storage image without a format (#619)
 
 
 def unsupported_skip(msg: str) -> str:
     """The SKIP detail for a harness that exited UNSUPPORTED, quoting its "unsupported: ..." line."""
     m = re.search(r"unsupported: .*", msg)
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
+
+
+def vk_store_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """The (ok, detail) pair for a vk_store_test run: a skip when the device lacks the image format feature,
+    otherwise whether it exited 0, with its last line."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, (msg.splitlines()[-1] if msg else "")
 
 
 def run_cmd(cmd: list[str], env: dict | None = None) -> tuple[int, str]:
@@ -735,11 +744,9 @@ def run_suite(a, work: str) -> int:
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm"))
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
-            rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + vk_store_result(*run_cmd([vk_store, spv])))
         elif name == "cs_imgload":
-            rc, msg = run_cmd([vk_store, spv, "load"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name,) + vk_store_result(*run_cmd([vk_store, spv, "load"])))
         elif name == TEXTURE_MIP_TEST:
             problem = texture_mip_test(a.build, spirv_dir)
             ok = None if isinstance(problem, Skip) else not problem
