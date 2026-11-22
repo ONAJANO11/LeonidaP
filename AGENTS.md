@@ -65,10 +65,19 @@ These need no game files and run in seconds:
 python -m compileall -q make_game.py tools tests
 python -I make_game.py --help
 python -m unittest discover -s tests/semantic -v   # translator regression suite; no LLVM, SPIR-V tools or GPU needed
-python -I tests/test_<name>.py                     # one unit test
+python -I tests/test_<name>.py                     # standalone standard-library unit test
 node --test tests/test_viewer_streaming.cjs        # viewer streaming; needs Node 22+
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo; cmake --build runtime/build
+```
+
+For pytest-based tests, use a virtual environment and install the pinned dependencies in
+[`tests/requirements.txt`](tests/requirements.txt). From the repository root, run `python -m pytest` with the
+test file you want to check.
+
+```powershell
+python -m pip install -r tests/requirements.txt
+python -m pytest tests/test_user_sgpr_census.py
 ```
 
 With a work folder already built, a translator change is checked on a slice before the full run, and the result is
