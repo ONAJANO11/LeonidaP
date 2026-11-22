@@ -35,6 +35,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace leonida {
@@ -74,9 +75,10 @@ class VulkanPresenter {
 public:
     VulkanPresenter(VulkanContext& context, PFN_vkGetInstanceProcAddr get_instance, VkInstance instance,
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
-                    bool swapchain_maintenance1 = false)
+                    bool swapchain_maintenance1 = false,
+                    std::function<VkExtent2D()> extent_fn = nullptr)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1) {
+          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
@@ -268,12 +270,18 @@ public:
         if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
 
         bool recorded = false;
+        std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
+        std::optional<LayoutTracker> next_tracker;
         if (binding) {
-            // The back buffer's layout is tracked like any other texture; this holds the context while it is read.
-            std::shared_lock lock(context_.resource_mutex_);  // the resource table (vulkan_backend.h)
+            // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_ (vulkan_backend.h).
+            // Release resource_mutex_ before vkQueueSubmit while keeping tracker_mutex_ held so layout updates
+            // commit in submission order and roll back if vkQueueSubmit fails.
+            std::shared_lock resource_lock(context_.resource_mutex_);
             const ResourceBinding* current = context_.resolve(source);
             if (current && current->image && current->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
-                record(frame.commands, *current, source, image, source_rect);
+                tracker_lock.lock();
+                next_tracker.emplace(context_.tracker_);
+                record(frame.commands, *current, source, image, source_rect, *next_tracker);
                 recorded = true;
             }
         } else {
@@ -316,6 +324,8 @@ public:
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
             if (submitted == VK_SUCCESS) result = vkQueuePresentKHR_(queue_, &present);
         }
+        if (submitted == VK_SUCCESS && next_tracker) context_.tracker_ = std::move(*next_tracker);
+        if (tracker_lock.owns_lock()) tracker_lock.unlock();
         if (submitted != VK_SUCCESS) return give_back(frame, submitted);
         ++frame_index_;
         // Only a present the engine took counts (SUBOPTIMAL is shown too). OUT_OF_DATE was not shown: the swapchain
@@ -391,7 +401,7 @@ private:
     }
 
     void record(VkCommandBuffer commands, const ResourceBinding& binding, ResourceId source, std::uint32_t image,
-                const PresentRect* source_rect) {
+                const PresentRect* source_rect, LayoutTracker& tracker) {
         auto& vk = context_.vk;
         const ReplayFunctions& fn = context_.replay_;
         vk.vkResetCommandBuffer(commands, 0);
@@ -404,8 +414,8 @@ private:
         // PRESENT is D3D12's common state: GENERAL for an ordinary texture. A never-written back buffer is
         // zero-filled first, as any committed resource is.
         const VkImageLayout common = image_layout(binding, VK_IMAGE_LAYOUT_GENERAL);
-        auto pieces = detail::current(&context_.tracker_, source, range, common);
-        detail::initialize(fn, commands, binding, source, pieces, common, &context_.tracker_);
+        auto pieces = detail::current(&tracker, source, range, common);
+        detail::initialize(fn, commands, binding, source, pieces, common, &tracker);
         for (const auto& piece : pieces)
             detail::image_barrier(fn, commands, binding, piece.range, piece.layout,
                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -491,9 +501,27 @@ private:
         VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags access = VK_ACCESS_TRANSFER_WRITE_BIT;
         if (capture_ && capture_buffer_) {
-            detail::image_barrier(fn, commands, target_of(image), range, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                  access, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+            // Two frames may be in flight and share `capture_buffer_`: serialize the prior frame's capture copy
+            // before overwriting it, while moving this frame's swapchain image to TRANSFER_SRC.
+            VkBufferMemoryBarrier capture_waw{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            capture_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            capture_waw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            capture_waw.buffer = capture_buffer_;
+            capture_waw.offset = 0;
+            capture_waw.size = VK_WHOLE_SIZE;
+            VkImageMemoryBarrier to_src{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            to_src.srcAccessMask = access;
+            to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            to_src.oldLayout = layout;
+            to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            to_src.image = images_[image];
+            to_src.subresourceRange = range;
+            fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                nullptr, 1, &capture_waw, 1, &to_src);
             VkBufferImageCopy copy{};
             copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             copy.imageExtent = {extent_.width, extent_.height, 1};
@@ -568,7 +596,21 @@ private:
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
-        if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+        VkExtent2D extent = caps.currentExtent;
+        // When the platform leaves the swapchain extent to the application (0xFFFFFFFF, as on Intel UHD / Win32 WSI),
+        // query the window client area or fall back to the last known extent, and clamp to the surface bounds (D3D-165).
+        if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF) {
+            if (extent_fn_) extent = extent_fn_();
+            // ponytail: if no window extent function was supplied, fall back to last extent_ or minImageExtent
+            if (extent.width == 0xFFFFFFFF || extent.height == 0xFFFFFFFF || (extent.width == 0 && extent.height == 0)) {
+                extent = extent_.width && extent_.height ? extent_ : caps.minImageExtent;
+            }
+            if (extent.width && extent.height) {
+                extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+            }
+        }
+        if (extent.width == 0 || extent.height == 0) {
             release(swapchain_);
             swapchain_ = VK_NULL_HANDLE;
             vsync_ = vsync;
@@ -632,7 +674,7 @@ private:
         if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
         info.imageFormat = chosen.format;
         info.imageColorSpace = chosen.colorSpace;
-        info.imageExtent = caps.currentExtent;
+        info.imageExtent = extent;
         info.imageArrayLayers = 1;
         info.imageUsage = usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -686,7 +728,7 @@ private:
         images_ = std::move(images);
         ready_ = std::move(ready);
         format_ = chosen.format;
-        extent_ = caps.currentExtent;
+        extent_ = extent;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -785,6 +827,7 @@ private:
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     std::function<bool()> abort_;
+    std::function<VkExtent2D()> extent_fn_;
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;

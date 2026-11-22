@@ -289,7 +289,9 @@ def write_output(path, rows, summary):
     The stage lives in a private TemporaryDirectory under the destination's parent, so os.replace
     only ever renames within one filesystem. A late failure closes the stage and leaves any prior
     report byte-for-byte intact. The destination is resolved first, so a report path that is a
-    symlink is published through to its target the way open(..., "w") did before.
+    symlink is published through to its target the way open(..., "w") did before. Because os.replace
+    unlinks the previous report file only at the destination name, other hard links to it keep the
+    previous contents.
     """
     ext = os.path.splitext(path)[1].lower()
     dest = os.path.realpath(path)
@@ -301,7 +303,7 @@ def write_output(path, rows, summary):
                 json.dump({"summary": summary, "files": rows}, f, indent=1)
         else:
             with open(staged, "w", encoding="utf-8", newline="") as f:
-                w = csv.writer(f)
+                w = csv.writer(f, lineterminator="\n")
                 w.writerow(COLUMNS)
                 for r in rows:
                     w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
