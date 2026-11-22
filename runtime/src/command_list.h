@@ -409,6 +409,10 @@ struct Draw {
     std::uint32_t first;  // first vertex or first index
     std::int32_t base_vertex;
     std::uint32_t first_instance;
+    // Every viewport and scissor rectangle the list set (RSSetViewports, RSSetScissorRects; up to 16 each).
+    // `viewport` and `scissor` above are their first entries.
+    std::vector<Viewport> viewports;
+    std::vector<Rect> scissors;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.

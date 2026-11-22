@@ -144,7 +144,7 @@ The command-list surface maps to the IR as follows:
 | `Set*Root32BitConstant(s)` / `Set*Root*View` / `Set*RootDescriptorTable` | update root args; build the push-constant block at the draw/dispatch |
 | `SetDescriptorHeaps` | state; scan/populate the bindless arrays and hash table at execute |
 | `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology |
-| `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
+| `RSSetViewports` / `RSSetScissorRects` | state, up to 16 each; dynamic viewport/scissor (with count where `multiViewport` is on) |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
 | `Dispatch` / `DispatchMesh` | command with a state snapshot |
@@ -626,6 +626,18 @@ The compute path, end to end:
     PSO names a format (D3D12 allows it and discards those writes) uses a variant of the pipeline with that format
     undefined, built on first use and kept with the PSO. Bit i of the variant key is colour slot i, and bit 8 is
     depth/stencil.
+  - **Viewport arrays:** with `VulkanDeviceInfo::multi_viewport` (`multiViewport`, `shaderOutputViewportIndex` and
+    `shaderOutputLayer`, which a translated VS writing `ViewportIndex` or `Layer` from its `pos1` misc export
+    needs), pipelines use `VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT` and `SCISSOR_WITH_COUNT`, and each draw sets all of
+    the list's viewports (up to 16). There are as many scissors as viewports: a viewport whose scissor the list did
+    not set gets an empty one, D3D12's default rectangle, and an array entry with no area is set as 1x1 under an
+    empty scissor (Vulkan needs a positive width); with no viewport bound at all, all 16 indices are. Such draws are
+    recorded, not dropped: D3D12 still runs their vertex work, which pipeline statistics count (measured on #873).
+    With no attachment bound, the render area covers every viewport, not viewport 0 alone. More than 16 is an
+    invalid call. `RSSetScissorRects(0, ...)`
+    leaves no rectangle set, so nothing draws until the next call, as on WARP and NVIDIA's driver; AMD's D3D12
+    driver keeps the old rectangles (measured on #873). Without the feature, viewport and scissor 0 are applied
+    (`d3d12_viewport_array_test`).
   - **Instance step rate 0:** every instance reads element 0, done with a stride of 0 for that slot at draw time.
   - **Features:** independent blend state, wireframe fill, a depth-bias clamp, SRC1 blend factors, logic ops and
     disabled depth clipping need `independentBlend`, `fillModeNonSolid`, `depthBiasClamp`, `dualSrcBlend`, `logicOp`

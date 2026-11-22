@@ -112,6 +112,9 @@ struct VulkanDeviceInfo {
     // are only zero or non-zero; without pipelineStatisticsQuery, pipeline-statistics query heaps are refused.
     bool occlusion_query_precise = false;
     bool pipeline_statistics_query = false;
+    // multiViewport, shaderOutputViewportIndex and shaderOutputLayer enabled on `device`: pipelines take viewport
+    // and scissor arrays (RSSetViewports with more than one), which a translated VS selects from with ViewportIndex.
+    bool multi_viewport = false;
     bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
     // VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) and its swapchainMaintenance1 feature are
     // enabled on the device, with VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on the

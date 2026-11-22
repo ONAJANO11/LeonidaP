@@ -285,22 +285,32 @@ public:
                       : leonida::IndexBufferView{};
     }
 
-    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
+    // Up to D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE (16) of each; more is an invalid call. A VS
+    // that writes SV_ViewportArrayIndex picks one; the rest draw with viewport and scissor 0. Without multiViewport
+    // on the device only the first is applied (the pipelines then have one viewport). A count of 0 unbinds the
+    // viewports: draws then rasterize nothing but still run their vertex work (the replay gives them 1x1 viewports
+    // under empty scissors), as the RX 7800 XT, a Radeon iGPU and WARP do natively (#873).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
-        if (!count) {
-            viewport_ = {};
-            return;
+        if (count && !viewports) return check(false);
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
+        viewports_.clear();
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_VIEWPORT& v = viewports[i];
+            viewports_.push_back({v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth});
         }
-        if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
-        const D3D12_VIEWPORT& v = viewports[0];
-        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        viewport_ = count ? viewports_[0] : leonida::Viewport{};
     }
 
+    // The call replaces the whole array. A count of 0 leaves no rectangle set, so every viewport gets D3D12's empty
+    // default and draws nothing, as WARP and NVIDIA's driver do (AMD's D3D12 driver keeps the old rectangles; @Vonsek
+    // measured the split on #873). WARP is the reference.
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
-        if (!count || !rects) return;
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
-        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        if (count && !rects) return check(false);
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
+        scissors_.clear();
+        for (UINT i = 0; i < count; ++i)
+            scissors_.push_back({rects[i].left, rects[i].top, rects[i].right, rects[i].bottom});
+        scissor_ = count ? scissors_[0] : leonida::Rect{};
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -826,6 +836,8 @@ private:
     leonida::IndexBufferView index_{};
     leonida::Viewport viewport_{};
     leonida::Rect scissor_{};
+    std::vector<leonida::Viewport> viewports_;  // all of them; viewport_ and scissor_ are the first
+    std::vector<leonida::Rect> scissors_;
     std::vector<leonida::TargetView> render_targets_;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
@@ -865,6 +877,8 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
+        viewports_.clear();
+        scissors_.clear();
         render_targets_.clear();
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
@@ -875,13 +889,13 @@ private:
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
-        // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
-        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        // No viewport (never set, or unbound with RSSetViewports(0)) or only empty ones: D3D12 rasterizes nothing
+        // but still runs the draw's vertex work, which a pipeline-statistics query counts (@Vonsek measured 6/2/4
+        // natively on #873). The draw is recorded; the replay gives such viewports 1x1 under an empty scissor.
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
+                           base_vertex, first_instance, viewports_, scissors_};
         check(list_.draw(draw));
     }
 };
