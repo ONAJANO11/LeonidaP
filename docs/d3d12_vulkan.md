@@ -666,10 +666,12 @@ The compute path, end to end:
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. It also
   keeps CommandList5's shading rate, combiners and shading-rate image. `Reset` and `ClearState` return those to
-  1x1, passthrough and no image. Null combiners are passthrough, and so is a combiner outside the enum. A rate
-  outside `D3D12_SHADING_RATE` makes `Close` return `E_INVALIDARG`. Each `DrawInstanced` / `DrawIndexedInstanced`
-  records a copy of that state. A draw with no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an
-  empty one rasterizes nothing in D3D12. Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
+  1x1, passthrough and no image. Null combiners are passthrough. As on the host PC runtime (measured on a Radeon
+  680M, an RTX 3050 and WARP), a rate or combiner outside its enum makes `Close` return `E_INVALIDARG`, and either
+  VRS call on a compute or copy list makes it return `E_FAIL`; bundles take both calls, and the first invalid
+  call in a list decides. Each `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with
+  no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12.
+  Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
 
   At replay:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
@@ -748,7 +750,12 @@ divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACH
 depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
 (`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one); `SV_ShadingRate` (per-primitive shading rates); a shading-rate
 image smaller than the render area is not bound (D3D12 reads 1x1 past the image's edge, while Vulkan requires the
-image to cover the render area), so such a draw shades as if no image were bound.
+image to cover the render area), so such a draw shades as if no image were bound; the shading-rate image is checked
+at replay rather than at `Close`: one that is not an `R8_UINT` texture, or is multisampled or 3D, fails the list at
+`ExecuteCommandLists`, and one with several mips or array layers is used through mip 0 and layer 0 (the host
+runtime fails `Close` for each of these except a 3D one); on a device that reports VRS tier 1,
+`RSSetShadingRateImage` is accepted, where the host fails `Close` with `E_FAIL` (WARP); other graphics calls on
+compute and copy lists are not refused yet.
 
 Known gaps found in review, not fixed here:
 - **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a
@@ -1039,9 +1046,11 @@ and any validation error fails them.
     - A four-quadrant shading-rate image under each second combiner, and with no image bound.
     - A pixel shader that writes depth (`ps_vrs_depth.frag`), which must stay 1x1.
     - Without the extension, the rate and the image must be ignored.
-    - A rate outside the enum must make `Close` return `E_INVALIDARG`.
+  - **`Close` results:** with the extension, `Close` must return the host runtime's result after a rate or
+    combiner outside its enum, after each call on direct, bundle, compute and copy lists, and after two invalid
+    calls in one list. These need no PSO.
   - **Limited push constants:** on a device with less than 144 bytes of push constants, PSOs are refused (above),
-    so only the feature answers are checked there, and the test says so.
+    so only the feature answers and the `Close` results are checked there, and the test says so.
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches

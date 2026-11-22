@@ -47,6 +47,8 @@ static_assert(vrs::combiner_override == D3D12_SHADING_RATE_COMBINER_OVERRIDE);
 static_assert(vrs::combiner_min == D3D12_SHADING_RATE_COMBINER_MIN);
 static_assert(vrs::combiner_max == D3D12_SHADING_RATE_COMBINER_MAX);
 static_assert(vrs::combiner_sum == D3D12_SHADING_RATE_COMBINER_SUM);
+static_assert(vrs::valid_combiner(vrs::combiner_passthrough) && vrs::valid_combiner(vrs::combiner_sum));
+static_assert(!vrs::valid_combiner(5) && !vrs::valid_combiner(9) && !vrs::valid_combiner(0xffffffffu));
 static_assert(leonida::d3d12_sync::none == D3D12_BARRIER_SYNC_NONE);
 static_assert(leonida::d3d12_sync::all == D3D12_BARRIER_SYNC_ALL);
 static_assert(leonida::d3d12_sync::draw == D3D12_BARRIER_SYNC_DRAW);

@@ -8,9 +8,11 @@
 //     against the 1x1 per-primitive rate, a shading-rate image of four quadrants with different rates under each
 //     second combiner, an unbound image, and a pixel shader that writes depth, which D3D12 shades per pixel;
 //   - without the extension, the rate and the image are ignored and every pixel is shaded;
-//   - a rate outside D3D12_SHADING_RATE is an invalid call, reported at Close.
+//   - with the extension, Close must return what the host PC D3D12 runtime returns after the VRS calls: for a
+//     rate or combiner outside its enum, for each call on direct, bundle, compute and copy lists, and for two
+//     invalid calls in one list (the first decides).
 // A device with less than 144 bytes of push constants refuses every PSO until #224's uniform-buffer tail exists;
-// there only the feature answers are checked, and the test says so.
+// there only the feature answers and the Close results are checked, and the test says so.
 // The shaders are GLSL written to the translator's contract; no game data. LEONIDA_VK_VALIDATION=1 runs the test
 // under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -153,6 +155,86 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
         } else {
             std::printf("no host D3D12 device on this adapter: feature answers not compared\n");
         }
+    }
+
+    // What Close returns after the VRS calls. The expected results are the host PC D3D12 runtime's, measured on a
+    // Radeon 680M, an RTX 3050 and WARP. They need no PSO, so they run before the push-constant check below. The
+    // host's tier-0 answers are not known, so they run only with the extension; a null image only at tier 2, since
+    // at tier 1 the host fails RSSetShadingRateImage itself (WARP), which the layer does not model.
+    if (shading_rate) {
+        using Record = std::function<void(ID3D12GraphicsCommandList5*)>;
+        const auto closed = [&](D3D12_COMMAND_LIST_TYPE type, const Record& record) {
+            Ref<ID3D12CommandAllocator> a;
+            Ref<ID3D12GraphicsCommandList> l;
+            Ref<ID3D12GraphicsCommandList5> l5;
+            if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&a.p))) ||
+                FAILED(device->CreateCommandList(0, type, a.p, nullptr, IID_PPV_ARGS(&l.p))) ||
+                FAILED(l->QueryInterface(IID_PPV_ARGS(&l5.p))))
+                return E_UNEXPECTED;
+            record(l5.p);
+            return l->Close();
+        };
+        const auto set = [](D3D12_SHADING_RATE r, UINT c0, UINT c1) -> Record {
+            return [=](ID3D12GraphicsCommandList5* l) {
+                const D3D12_SHADING_RATE_COMBINER combiners[2] = {D3D12_SHADING_RATE_COMBINER(c0),
+                                                                  D3D12_SHADING_RATE_COMBINER(c1)};
+                l->RSSetShadingRate(r, combiners);
+            };
+        };
+        const auto plain = [](D3D12_SHADING_RATE r) -> Record {
+            return [=](ID3D12GraphicsCommandList5* l) { l->RSSetShadingRate(r, nullptr); };
+        };
+        const Record no_image = [](ID3D12GraphicsCommandList5* l) { l->RSSetShadingRateImage(nullptr); };
+        const Record bad_barrier = [](ID3D12GraphicsCommandList5* l) {  // E_INVALIDARG on any list type
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE(99);
+            l->ResourceBarrier(1, &b);
+        };
+        const auto then = [](Record first, Record second) -> Record {
+            return [=](ID3D12GraphicsCommandList5* l) {
+                first(l);
+                second(l);
+            };
+        };
+        constexpr UINT pass = D3D12_SHADING_RATE_COMBINER_PASSTHROUGH, max = D3D12_SHADING_RATE_COMBINER_MAX;
+        constexpr auto direct = D3D12_COMMAND_LIST_TYPE_DIRECT, bundle = D3D12_COMMAND_LIST_TYPE_BUNDLE;
+        constexpr auto compute = D3D12_COMMAND_LIST_TYPE_COMPUTE, copy = D3D12_COMMAND_LIST_TYPE_COPY;
+        const auto r1x1 = D3D12_SHADING_RATE_1X1, r2x2 = D3D12_SHADING_RATE_2X2, r7 = D3D12_SHADING_RATE(7);
+        struct Case {
+            const char* name;
+            D3D12_COMMAND_LIST_TYPE type;
+            Record record;
+            HRESULT expected;
+        };
+        std::vector<Case> cases = {
+            {"direct: 2x2, {max, max}", direct, set(r2x2, max, max), S_OK},
+            {"direct: 2x2, null combiners", direct, plain(r2x2), S_OK},
+            {"direct: rate 7 (outside the enum)", direct, plain(r7), E_INVALIDARG},
+            {"direct: combiners {9, 9}", direct, set(r2x2, 9, 9), E_INVALIDARG},
+            {"direct: combiners {passthrough, 5}", direct, set(r1x1, pass, 5), E_INVALIDARG},
+            {"bundle: 2x2, {max, max}", bundle, set(r2x2, max, max), S_OK},
+            {"bundle: combiners {5, passthrough}", bundle, set(r1x1, 5, pass), E_INVALIDARG},
+            {"compute: 1x1, null combiners", compute, plain(r1x1), E_FAIL},
+            {"compute: rate 7", compute, plain(r7), E_FAIL},
+            {"compute: null image", compute, no_image, E_FAIL},
+            {"copy: 1x1, null combiners", copy, plain(r1x1), E_FAIL},
+            {"copy: null image", copy, no_image, E_FAIL},
+            {"compute: invalid barrier, then 1x1", compute, then(bad_barrier, plain(r1x1)), E_INVALIDARG},
+            {"compute: 1x1, then invalid barrier", compute, then(plain(r1x1), bad_barrier), E_FAIL},
+        };
+        if (tier == D3D12_VARIABLE_SHADING_RATE_TIER_2) {
+            cases.push_back({"direct: null image", direct, no_image, S_OK});
+            cases.push_back({"bundle: null image", bundle, no_image, S_OK});
+        }
+        unsigned wrong = 0;
+        for (const Case& c : cases) {
+            const HRESULT result = closed(c.type, c.record);
+            const bool bad = result != c.expected;
+            std::printf("  Close after %-42s 0x%08lx %s\n", c.name, static_cast<unsigned long>(result),
+                        bad ? "FAILED" : "ok");
+            if (bad) ++wrong;
+        }
+        EXPECT(!wrong);
     }
 
     // An empty root signature, and a pipeline per pixel shader. No input layout: the VS reads SV_VertexID only.
@@ -377,9 +459,6 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
         check("2x2, max with the per-primitive rate: 2x2", everywhere({2, 2}));
         EXPECT(render(pso.p, nullptr, rate(D3D12_SHADING_RATE_2X2, D3D12_SHADING_RATE_COMBINER_SUM)));
         check("2x2, sum with the per-primitive rate: 2x2", everywhere({2, 2}));
-        EXPECT(render(pso.p, nullptr,
-                      rate(D3D12_SHADING_RATE_2X2, D3D12_SHADING_RATE_COMBINER(9), D3D12_SHADING_RATE_COMBINER(9))));
-        check("2x2, combiners outside the enum (passthrough): 2x2", everywhere({2, 2}));
         // No image bound: the image's rate is 1x1.
         EXPECT(render(pso.p, nullptr,
                       rate(D3D12_SHADING_RATE_2X2, D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
@@ -433,11 +512,6 @@ int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& v
         }
     }
 
-    // A rate outside D3D12_SHADING_RATE is an invalid call.
-    EXPECT(SUCCEEDED(list->Reset(allocator.p, pso.p)));
-    list5->RSSetShadingRate(D3D12_SHADING_RATE(3), nullptr);
-    EXPECT(list->Close() == E_INVALIDARG);
-
     for (auto* r : {&target, &readback, &upload, &rate_image}) r->reset();
     pso.reset();
     pso_depth.reset();
@@ -490,7 +564,8 @@ int main() {
         return 1;
     }
     if (draws_refused) {
-        std::printf("D3D-32: feature answers matched; no draws, because this device refuses PSOs (#224)\n");
+        std::printf("D3D-32: feature answers and Close results matched; no draws, because this device refuses PSOs "
+                    "(#224)\n");
         return 0;
     }
     std::printf("D3D-32: variable rate shading matched on every pixel of every case\n");

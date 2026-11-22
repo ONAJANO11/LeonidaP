@@ -225,6 +225,10 @@ inline constexpr bool valid_rate(std::uint32_t rate) {
     return rate == rate_1x1 || rate == rate_1x2 || rate == rate_2x1 || rate == rate_2x2 || rate == rate_2x4 ||
            rate == rate_4x2 || rate == rate_4x4;
 }
+
+inline constexpr bool valid_combiner(std::uint32_t combiner) {
+    return combiner <= combiner_sum;
+}
 } // namespace d3d12_shading_rate
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
