@@ -71,6 +71,8 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
+    std::vector<std::uint8_t> ro_depth_less(size * 256), ro_depth_le(size * 256);
+    std::vector<std::uint8_t> ro_stencil_eq1(size * 256), ro_stencil_eq2(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -376,6 +378,149 @@ int main() {
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
         std::memcpy(second_pixels.data(), mapped, second_pixels.size());
 
+        // Read-only DSV (D3D12_DSV_FLAG_READ_ONLY_DEPTH / READ_ONLY_STENCIL), depth test, and OMSetStencilRef.
+        {
+            D3D12_RESOURCE_DESC ds_desc = rt_desc;
+            ds_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            ds_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            D3D12_CLEAR_VALUE ds_clear{};
+            ds_clear.Format = ds_desc.Format;
+            ds_clear.DepthStencil = {0.5f, 0};
+            Ref<ID3D12Resource> ds_target;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &ds_desc,
+                                                             D3D12_RESOURCE_STATE_DEPTH_WRITE, &ds_clear,
+                                                             IID_PPV_ARGS(&ds_target.p))));
+            D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 3,
+                                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> dsv_heap;
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&dsv_heap_desc, IID_PPV_ARGS(&dsv_heap.p))));
+            const UINT dsv_step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            const auto dsv_base = reinterpret_cast<XboxHeapHandleFn>(slot(dsv_heap.p, 9))(dsv_heap.p);
+            const auto dsv_slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(dsv_base + i * dsv_step)}; };
+            D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc{};
+            dsv_desc.Format = ds_desc.Format;
+            dsv_desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            dsv_desc.Flags = D3D12_DSV_FLAG_NONE;
+            device->CreateDepthStencilView(ds_target.p, &dsv_desc, dsv_slot(0));
+            dsv_desc.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+            device->CreateDepthStencilView(ds_target.p, &dsv_desc, dsv_slot(1));
+            dsv_desc.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+            device->CreateDepthStencilView(ds_target.p, &dsv_desc, dsv_slot(2));
+
+            // PSO 1: write depth (0.0 < 0.5) and stencil (REPLACE with ref 1).
+            auto ds_pso_desc = pso_desc;
+            ds_pso_desc.DSVFormat = ds_desc.Format;
+            ds_pso_desc.DepthStencilState.DepthEnable = TRUE;
+            ds_pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            ds_pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            ds_pso_desc.DepthStencilState.StencilEnable = TRUE;
+            ds_pso_desc.DepthStencilState.StencilReadMask = 0xFF;
+            ds_pso_desc.DepthStencilState.StencilWriteMask = 0xFF;
+            ds_pso_desc.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                       D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS};
+            ds_pso_desc.DepthStencilState.BackFace = ds_pso_desc.DepthStencilState.FrontFace;
+            Ref<ID3D12PipelineState> ds_write_pso, ds_ro_less_pso, ds_ro_le_pso, ds_ro_stencil_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ds_pso_desc, IID_PPV_ARGS(&ds_write_pso.p))));
+
+            // PSO 2 & 3: read-only depth test (DepthWriteMask = ZERO), LESS vs LESS_EQUAL (negative control).
+            auto ro_depth_desc = pso_desc;
+            ro_depth_desc.DSVFormat = ds_desc.Format;
+            ro_depth_desc.DepthStencilState.DepthEnable = TRUE;
+            ro_depth_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            ro_depth_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ro_depth_desc, IID_PPV_ARGS(&ds_ro_less_pso.p))));
+            ro_depth_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ro_depth_desc, IID_PPV_ARGS(&ds_ro_le_pso.p))));
+
+            // PSO 4: read-only stencil EQUAL test (DepthEnable = FALSE).
+            auto ro_stencil_desc = pso_desc;
+            ro_stencil_desc.DSVFormat = ds_desc.Format;
+            ro_stencil_desc.DepthStencilState.StencilEnable = TRUE;
+            ro_stencil_desc.DepthStencilState.StencilReadMask = 0xFF;
+            ro_stencil_desc.DepthStencilState.StencilWriteMask = 0x00;
+            ro_stencil_desc.DepthStencilState.FrontFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                           D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_EQUAL};
+            ro_stencil_desc.DepthStencilState.BackFace = ro_stencil_desc.DepthStencilState.FrontFace;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ro_stencil_desc, IID_PPV_ARGS(&ds_ro_stencil_pso.p))));
+
+            const float br_offset[2] = {1.0f, -1.0f};
+            const auto dsv0 = dsv_slot(0), dsv1 = dsv_slot(1), dsv2 = dsv_slot(2);
+            const auto ds_to_read = transition(ds_target.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
+            const auto ds_to_write = transition(ds_target.p, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            UINT64 ds_fence = 10;
+
+            // Subpass 1 & 2: read-only depth test LESS vs LESS_EQUAL.
+            for (UINT pass = 0; pass < 2; ++pass) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ds_write_pso.p)));
+                list->ResourceBarrier(1, &to_target);
+                if (pass > 0) list->ResourceBarrier(1, &ds_to_write);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->ClearDepthStencilView(dsv0, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5f, 0, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->IASetVertexBuffers(0, 1, &vbv);
+                list->IASetIndexBuffer(&ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, &dsv0);
+                list->OMSetStencilRef(1);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+                // Switch depth to read-only and draw green over both top-left and bottom-right.
+                list->ResourceBarrier(1, &ds_to_read);
+                list->SetPipelineState(pass == 0 ? ds_ro_less_pso.p : ds_ro_le_pso.p);
+                list->OMSetRenderTargets(1, &rtv, FALSE, &dsv1);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 768);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                list->SetGraphicsRoot32BitConstants(0, 2, br_offset, 0);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++ds_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, ds_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(ds_fence, nullptr)));
+                auto& out = pass == 0 ? ro_depth_less : ro_depth_le;
+                std::memcpy(out.data(), mapped, out.size());
+            }
+
+            // Subpass 3 & 4: read-only stencil test EQUAL with OMSetStencilRef(1) vs OMSetStencilRef(2).
+            for (UINT pass = 0; pass < 2; ++pass) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ds_ro_stencil_pso.p)));
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->IASetVertexBuffers(0, 1, &vbv);
+                list->IASetIndexBuffer(&ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, &dsv2);
+                list->OMSetStencilRef(pass == 0 ? 1u : 2u);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                list->SetGraphicsRoot32BitConstants(0, 2, br_offset, 0);
+                list->DrawIndexedInstanced(6, 1, 0, 0, 0);
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++ds_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, ds_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(ds_fence, nullptr)));
+                auto& out = pass == 0 ? ro_stencil_eq1 : ro_stencil_eq2;
+                std::memcpy(out.data(), mapped, out.size());
+            }
+        }
+
         // A draw with no viewport (never set, or unbound with a count of 0) rasterizes nothing in D3D12. It is not
         // recorded, so the list closes and executes cleanly (Vulkan forbids a 0x0 viewport).
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -388,7 +533,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 20)) && SUCCEEDED(fence->SetEventOnCompletion(20, nullptr)));
 
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -449,6 +594,47 @@ int main() {
         }
     }
     EXPECT(!mismatches);
+    // Read-only DSV passes:
+    // - ro_depth_less: top-left stays red (z=0 < 0 fails), bottom-right turns green (z=0 < 0.5 passes).
+    // - ro_depth_le (negative control): top-left flips to green (z=0 <= 0 passes).
+    // - ro_stencil_eq1: top-left red (stencil==1), bottom-right blue (stencil==0).
+    // - ro_stencil_eq2 (negative control): all 4096 pixels stay blue (ref 2 matches nothing).
+    UINT depth_le_flipped = 0, stencil_ref2_flipped = 0;
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const bool top = row < size / 2, left = col < size / 2;
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel want_less = top && left     ? Pixel{255, 0, 0, 255}
+                                    : !top && !left ? Pixel{0, 255, 0, 255}
+                                                    : Pixel{0, 0, 255, 255};
+            const Pixel want_le = (top && left) || (!top && !left) ? Pixel{0, 255, 0, 255} : Pixel{0, 0, 255, 255};
+            const Pixel want_st1 = top && left ? Pixel{255, 0, 0, 255} : Pixel{0, 0, 255, 255};
+            const Pixel want_st2 = {0, 0, 255, 255};
+            const std::uint8_t* g_less = ro_depth_less.data() + row * 256 + col * 4;
+            const std::uint8_t* g_le = ro_depth_le.data() + row * 256 + col * 4;
+            const std::uint8_t* g_st1 = ro_stencil_eq1.data() + row * 256 + col * 4;
+            const std::uint8_t* g_st2 = ro_stencil_eq2.data() + row * 256 + col * 4;
+            if (!std::equal(want_less.begin(), want_less.end(), g_less) && mismatches++ < 6)
+                std::fprintf(stderr, "ro-depth LESS (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row, g_less[0],
+                             g_less[1], g_less[2], g_less[3], want_less[0], want_less[1], want_less[2], want_less[3]);
+            if (!std::equal(want_le.begin(), want_le.end(), g_le) && mismatches++ < 6)
+                std::fprintf(stderr, "ro-depth LESS_EQUAL (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                             g_le[0], g_le[1], g_le[2], g_le[3], want_le[0], want_le[1], want_le[2], want_le[3]);
+            if (!std::equal(want_st1.begin(), want_st1.end(), g_st1) && mismatches++ < 6)
+                std::fprintf(stderr, "ro-stencil ref=1 (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row, g_st1[0],
+                             g_st1[1], g_st1[2], g_st1[3], want_st1[0], want_st1[1], want_st1[2], want_st1[3]);
+            if (!std::equal(want_st2.begin(), want_st2.end(), g_st2) && mismatches++ < 6)
+                std::fprintf(stderr, "ro-stencil ref=2 (%u,%u): got %u,%u,%u,%u want 0,0,255,255\n", col, row, g_st2[0],
+                             g_st2[1], g_st2[2], g_st2[3]);
+            if (top && left && std::memcmp(g_less, g_le, 4) != 0) ++depth_le_flipped;
+            if (top && left && std::memcmp(g_st1, g_st2, 4) != 0) ++stencil_ref2_flipped;
+        }
+    }
+    EXPECT(!mismatches);
+    EXPECT(depth_le_flipped == (size / 2) * (size / 2) && stencil_ref2_flipped == (size / 2) * (size / 2));
+    std::printf("read-only DSV (depth & stencil): 4096/4096 pixels matched across 4 passes (LESS_EQUAL flipped %u/%u, "
+                "stencil ref=2 flipped %u/%u top-left pixels)\n",
+                depth_le_flipped, (size / 2) * (size / 2), stencil_ref2_flipped, (size / 2) * (size / 2));
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

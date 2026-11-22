@@ -211,6 +211,7 @@ struct TargetView {
     std::uint32_t first_layer;
     std::uint32_t layer_count;
     ColorViewFormat format = ColorViewFormat::resource;
+    std::uint8_t dsv_flags = 0;  // D3D12_DSV_FLAGS: bit 0 = READ_ONLY_DEPTH, bit 1 = READ_ONLY_STENCIL
 };
 
 // D3D12_RECT: right and bottom are exclusive.
