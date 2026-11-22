@@ -255,6 +255,21 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
         device->CreateUnorderedAccessView(resource.Get(), nullptr, &other, source);
         EXPECT(read_slot(source) != key && g::is_image(read_slot(source)));
     }
+    if (partial && kind == Kind::float_volume && shape.Format == DXGI_FORMAT_R32_FLOAT) {
+        // The typed SRV of this same mip must remain unsliced and must not replace the live partial UAV.
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = shape.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture3D = {mip, 1, 0.0f};
+        device->CreateShaderResourceView(resource.Get(), &srv, source);
+        const auto srv_key = read_slot(source);
+        g::Image sampled{};
+        EXPECT(g::decode(srv_key, sampled) && sampled.type == g::ImageType::image_3d &&
+               sampled.address == decoded.address && sampled.first_mip == mip && sampled.mip_count == 1 &&
+               sampled.depth == decoded.depth && sampled.first_layer == 0 && sampled.layer_count == 1);
+        EXPECT(!(srv_key[4] & g::sliced_uav_flag) && srv_key[7] == 0 && srv_key != read_slot(copy));
+    }
     EXPECT(flush_descriptors(device));
 
     std::vector<std::uint32_t> input(extent.width * extent.height * extent.depth);
