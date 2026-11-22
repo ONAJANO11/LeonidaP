@@ -851,7 +851,7 @@ def sampler_test(tools, spirv):
 
 # Shaders vk_texture_test draws and judges in one of its own modes (it loads vs_ids.spv and the shader from its
 # working directory and prints PASSED), as scripts/run_gpu_tests.py runs them: name -> mode.
-TEXTURE_MODES = {"ps_cube_sample": "cube", "ps_sample_c_lz": "dref"}
+TEXTURE_MODES = {"ps_cube_sample": "cube", "ps_sample_c_lz": "dref", "ps_sample_c_lz_a16": "dref_a16"}
 
 
 def texture_mode_test(tools, spirv, name):
