@@ -15,6 +15,7 @@
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
+#include "../src/moltenvk_no_contraction.h"
 
 #include <cctype>
 #include <cmath>
@@ -122,7 +123,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    sgProps.pNext = &driver;
     VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     subgroup.pNext = &sgProps;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -226,8 +229,11 @@ int main(int argc, char** argv) {
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
+    std::vector<uint32_t> spirv(code.size() / 4);
+    std::memcpy(spirv.data(), code.data(), spirv.size() * 4);
+    spirv = leonida::drop_no_contraction(spirv, leonida::moltenvk_safe_math(driver.driverID, props.driverVersion));
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    smi.codeSize = spirv.size() * 4; smi.pCode = spirv.data();
     VkShaderModule sm; CHECK(vkCreateShaderModule(dev, &smi, nullptr, &sm));
     VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 144};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
