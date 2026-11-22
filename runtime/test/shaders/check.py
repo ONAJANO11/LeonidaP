@@ -300,7 +300,11 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
-              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
+              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be),
+              # v_mad_legacy_f32 / v_mac_legacy_f32: legacy zero rule and denormal flush (the .asm header derives the words)
+              "ps_mad_legacy": (0x3f800000, 0xc0000000, 0x00800000, 0x40400000),
+              # v_mad_f32 / v_mac_f32 denormal flush: operand, product, result, after div:2 (.asm header)
+              "ps_mad_flush": (0x3f800000, 0x00800000, 0x80000000, 0x00000000)}
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
 # a required subgroup size onto the fragment stage ("fragment subgroup size: N required"). A device that cannot
 # require 64 there (NVIDIA: 32 only; llvmpipe: 8) has no frame to judge: the test is skipped, not failed.

@@ -1152,6 +1152,10 @@ def run_suite(a, work: str) -> int:
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
+                # v_mad_legacy_f32 / v_mac_legacy_f32: legacy zero rule and denormal flush (.asm header)
+                "ps_mad_legacy": (0x3F800000, 0xC0000000, 0x00800000, 0x40400000),
+                # v_mad_f32 / v_mac_f32 denormal flush: operand, product, result, after div:2 (.asm header)
+                "ps_mad_flush": (0x3F800000, 0x00800000, 0x80000000, 0x00000000),
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
                 results.append((name, None, str(skip)))

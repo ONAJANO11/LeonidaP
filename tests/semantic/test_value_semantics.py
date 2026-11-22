@@ -36,6 +36,10 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  v_mad_legacy_f32 /    D = S0 * S1 + S2 (mac: + D), the product +0 when S0 or S1 is 0 (inf/NaN included);
+  v_mac_legacy_f32        a denormal operand, product or result reads as zero of its sign (SHADER-118).
+  v_mad_f32 / v_mac_f32 D = S0 * S1 + S2 (mac: + D), product rounded before the add; the same flush, the result's
+                          after omod.
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -76,6 +80,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_MAD_LEGACY = [0x3F800000, 0xC0000000, 0x00800000, 0x40400000]
+EXPECTED_MAD_FLUSH = [0x3F800000, 0x00800000, 0x80000000, 0x00000000]
 
 
 def _f32_bits(x):
@@ -293,6 +299,41 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def _from_bits(b):
+    return struct.unpack("<f", struct.pack("<I", b))[0]
+
+
+def _flush(x):
+    """No f32 denormals in the mad opcodes: a subnormal reads as zero of its sign (inf and NaN pass)."""
+    return math.copysign(0.0, x) if abs(x) < 2.0 ** -126 else x
+
+
+def _mad_legacy(s0, s1, s2):
+    """v_mad_legacy_f32 on bit patterns: flushed operands, legacy product rounded to f32 and flushed, then the add."""
+    x, y, z = (_flush(_from_bits(b)) for b in (s0, s1, s2))
+    prod = 0.0 if x == 0.0 or y == 0.0 else _flush(_from_bits(_f32_bits(x * y)))
+    return _f32_bits(_flush(_from_bits(_f32_bits(prod + z))))
+
+
+def _mad(s0, s1, s2, omod=1.0):
+    """v_mad_f32 on bit patterns: flushed operands, product rounded to f32 and flushed, the sum, omod, flush."""
+    x, y, z = (_flush(_from_bits(b)) for b in (s0, s1, s2))
+    prod = _flush(_from_bits(_f32_bits(x * y)))
+    return _f32_bits(_flush(_from_bits(_f32_bits(_from_bits(_f32_bits(prod + z)) * omod))))
+
+
+def reference_mad_flush():
+    one = _f32_bits(1.0)
+    return [_mad(0x00000001, 0x7E800000, one), _mad(0x1C800000, 0x1C800000, 0x00800000),
+            _mad(0x81000000, one, 0x00C00000), _mad(0x00800000, one, 0, omod=0.5)]
+
+
+def reference_mad_legacy():
+    zero, nzero, inf, nan = 0x00000000, 0x80000000, 0x7F800000, 0x7FC00000
+    return [_mad_legacy(zero, inf, _f32_bits(1.0)), _mad_legacy(nan, nzero, _f32_bits(-2.0)),
+            _mad_legacy(0x1C800000, 0x1C800000, 0x00800000), _mad_legacy(0x80000001, inf, _f32_bits(3.0))]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -342,6 +383,8 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_mad_legacy(), EXPECTED_MAD_LEGACY)
+        self.assertEqual(reference_mad_flush(), EXPECTED_MAD_FLUSH)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -403,6 +446,16 @@ class TranslatorValueSemantics(unittest.TestCase):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
+    def test_mad_mac_legacy_zero_rule_and_denormal_flush(self):
+        # 0 * inf and NaN * -0 give +0 before the add; a denormal product (2^-140) and a denormal operand are
+        # flushed, so FLT_MIN stays FLT_MIN and -denormal * inf is +0; v_mac_legacy_f32 adds D.
+        self.check("ps_mad_legacy", EXPECTED_MAD_LEGACY)
+
+    def test_mad_mac_f32_denormal_flush(self):
+        # A denormal operand, a denormal product (2^-140) and a denormal sum read as zero of their sign; the
+        # result is flushed after div:2, so FLT_MIN div:2 is +0.
+        self.check("ps_mad_flush", EXPECTED_MAD_FLUSH)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
