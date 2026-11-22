@@ -21,8 +21,9 @@ The FSSM blob is the precompiled RDNA2 program plus its metadata. It contains th
 the code.
 
 Usage:
-    python -I fssm_unpack.py <carved_shader_dir> [--payload first|last]
+    python -I fssm_unpack.py <carved_shader_dir> [--payload first|last] [--indexed]
     (writes <dir>/fssm/<name>.fssm and fssm_index.json)
+    --indexed (make_game.py): only the .dxbc files <dir>/index.json lists; any other is left alone.
 """
 import argparse
 import json
@@ -31,6 +32,9 @@ import struct
 import sys
 import zlib
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shader_members  # noqa: E402
 
 
 def parts(d: bytes) -> dict:
@@ -91,6 +95,8 @@ def main(argv=None) -> int:
     ap.add_argument("src", help="carved shader directory")
     ap.add_argument("--payload", choices=("first", "last"), default="last",
                     help="tag-0x0D payload when a container has more than one (default: last)")
+    ap.add_argument("--indexed", action="store_true",
+                    help="only the .dxbc files src/index.json lists (make_game.py), not every one in the folder")
     a = ap.parse_args(argv)
     src = a.src
     # Check before anything is created: makedirs below would otherwise make a mistyped source folder.
@@ -99,9 +105,16 @@ def main(argv=None) -> int:
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
     try:
-        names = sorted(os.listdir(src))
-    except OSError as e:
-        print(f"ERROR: cannot list {src}: {e.strerror or e}", file=sys.stderr)
+        if a.indexed:
+            index = os.path.join(src, "index.json")
+            names = [n + ".dxbc" for n in sorted(shader_members.listed(index, "file", ".dxbc"))]
+            for name in names:
+                if not os.path.isfile(os.path.join(src, name)):
+                    raise ValueError(f"missing shader listed by {index}: {name}")
+        else:
+            names = sorted(os.listdir(src))
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot list shaders in {src}: {e}", file=sys.stderr)
         return 2
     out = os.path.join(src, "fssm")
     os.makedirs(out, exist_ok=True)

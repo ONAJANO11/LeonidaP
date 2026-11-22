@@ -6,8 +6,10 @@ The code ends with s_endpgm (0xBF810000). If the header guess doesn't hold for a
 scanning back from the first s_endpgm to the start that decodes with no invalid instructions.
 
 Usage:
-    python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N]
+    python -I shader_disasm.py <fssm dir or file> [--out DIR] [--mcpu gfx1013] [--limit N] [--indexed]
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
+--indexed (make_game.py): only the shaders index.json and fssm_index.json beside the fssm dir both list; on success
+it writes <out>/selected.json last, with the ones that produced a .s file.
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
 """
@@ -20,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc_command import mc_command  # noqa: E402
+import shader_members  # noqa: E402
 
 TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
@@ -133,11 +136,26 @@ def main():
     ap.add_argument("--mcpu", default="gfx1013")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--indexed", action="store_true",
+                    help="only the shaders index.json and fssm_index.json beside SRC both list (make_game.py); "
+                         f"writes OUT/{shader_members.SELECTED} with the ones that produced code")
     a = ap.parse_args()
     if not os.path.isfile(a.src) and not os.path.isdir(a.src):
         fail(f"{a.src} is not a file or folder")
-    files = [a.src] if os.path.isfile(a.src) else sorted(
-        os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
+    if a.indexed:
+        if not os.path.isdir(a.src):
+            fail(f"--indexed needs the fssm folder, not {a.src}")
+        try:
+            names = shader_members.current(os.path.dirname(os.path.abspath(a.src)))
+        except ValueError as e:
+            fail(str(e))
+        files = [os.path.join(a.src, n + ".fssm") for n in names]
+        missing = [p for p in files if not os.path.isfile(p)]
+        if missing:
+            fail(f"{len(missing)} listed shader(s) have no .fssm file, first {missing[0]}")
+    else:
+        files = [a.src] if os.path.isfile(a.src) else sorted(
+            os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".fssm"))
     if not files:
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files
@@ -146,13 +164,19 @@ def main():
     probe(a.mcpu)
     from collections import Counter
     with ThreadPoolExecutor(a.jobs) as ex:
-        res = Counter(ex.map(lambda p: one(p, out, a.mcpu), files))
+        status = list(ex.map(lambda p: one(p, out, a.mcpu), files))
+    res = Counter(status)
     print(f"{len(files)} shaders -> {os.path.abspath(out)}: {dict(res)}")
     if FAILED:
         path, reason = FAILED[0]
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
     if not (res["clean"] or res["invalid words"]):
         fail(f"no disassembly produced for {a.src}")
+    if a.indexed:
+        # Written last, on success only: a .s file of a shader this run skipped (no code) can be left from before.
+        shader_members.write(os.path.join(out, shader_members.SELECTED),
+                             [os.path.splitext(os.path.basename(p))[0] for p, s in zip(files, status)
+                              if s in ("clean", "invalid words")])
     return 0
 
 

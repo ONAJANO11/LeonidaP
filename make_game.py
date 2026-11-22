@@ -414,7 +414,9 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     if not os.path.isfile(unpacked):
         log("shaders: unpacking native code")
         drop(disassembled, translated, shard_plan)
-        py("fssm_unpack.py", dxbc)
+        # --indexed here and below: the carve folder keeps the files of an earlier carve (a game update), and only
+        # the shaders the current index.json lists go on (tools/shader_members.py). Nothing is deleted.
+        py("fssm_unpack.py", dxbc, "--indexed")
     # rdna2spirv.py finds index.json, the .dxbc files and fssm/ in the parent of the .s files' folder, so the
     # disassembly must sit inside the carve folder: next to it, every stage reads as "?" and is rejected.
     disasm = os.path.join(dxbc, "disasm")
@@ -433,7 +435,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
              "Install LLVM 21 or newer with the AMDGPU target, or set LLVM_MC to llvm-mc's path or whole command.")
         log("shaders: disassembling (gfx1013)")
         drop(translated, shard_plan)
-        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs)
+        py("shader_disasm.py", os.path.join(dxbc, "fssm"), "--out", disasm, "--mcpu", "gfx1013", "--jobs", jobs,
+           "--indexed")
         mark_done(disassembled)
     # The translation also depends on the translator's own files, so their digest is kept beside it. A folder without
     # it (from before the file existed), with an unreadable one or with another one is translated again; carving, unpacking and
@@ -557,7 +560,7 @@ def runtime_gpu_native64():
 
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py",
-                       "shader_meta.py", "spirv_stubs.py", "gfx10_formats.json")
+                       "shader_meta.py", "spirv_stubs.py", "shader_members.py", "gfx10_formats.json")
 
 
 def translation_sources_digest() -> str:
@@ -594,15 +597,22 @@ def translator_digest() -> str:
     return h.hexdigest()
 
 
-def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None:
+def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False, indexed=None) -> None:
     """rdna2spirv.py runs on one core: start one --shard per job side by side, then merge their index parts.
 
     A shard renames its index.part<i>.json into place last, so a part on disk is a finished shard. A run stopped
     part-way, or during the merge, keeps those parts when it resumes with the same --jobs, wave64 mode and translator
-    source, and starts only the shards that have none. shaders() drops the plan whenever an earlier step reruns."""
+    source, and starts only the shards that have none. shaders() drops the plan whenever an earlier step reruns.
+
+    indexed: pass --indexed, translating only the current shaders (tools/shader_members.py). By default it is on in
+    shaders()' layout, where disasm.done sits beside the disassembly folder, and off for a bare folder."""
+    if indexed is None:
+        indexed = os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(disasm)), "disasm.done"))
     os.makedirs(spirv, exist_ok=True)
     plan_path = os.path.join(spirv, SHARD_PLAN)
     plan = {"jobs": jobs, "wave64_emulate": bool(emulate), "translator": translator_digest()}
+    if indexed:
+        plan["indexed"] = True     # parts of a run over the whole folder can hold shaders of an earlier carve
     try:
         with open(plan_path, encoding="utf-8") as f:
             same = json.load(f) == plan
@@ -620,7 +630,7 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False) -> None
     if len(todo) < jobs:
         log(f"  keeping {jobs - len(todo)} of {jobs} shards finished by the run before")
     tool = os.path.join(TOOLS, "rdna2spirv.py")
-    extra = ["--wave64-emulate"] if emulate else []
+    extra = (["--wave64-emulate"] if emulate else []) + (["--indexed"] if indexed else [])
     if todo:
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))

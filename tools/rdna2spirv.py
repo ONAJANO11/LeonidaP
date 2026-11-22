@@ -14,9 +14,10 @@ Supported in v0 (anything else is reported, never guessed):
 Vertex inputs: v0 = VertexIndex (the full-screen-triangle shaders read only that).
 
 Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
-    python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N]
+    python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N] [--indexed]
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
+--indexed (make_game.py): only the current shaders (shader_members.py); a run over all of them replaces index.json.
 """
 import argparse
 import hashlib
@@ -35,6 +36,7 @@ import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import shader_meta as _shader_meta  # noqa: E402
+import shader_members  # noqa: E402
 
 STRUCTURED = True     # False (--dispatch-loop): every shader with branches as one loop around a switch
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
@@ -8132,6 +8134,9 @@ def main():
     ap.add_argument("--wave64-emulate", action="store_true",
                     help="wave64 compute and mesh shaders exact on any subgroup size (32-wide NVIDIA, Intel): "
                          "cross-lane operations go through workgroup memory instead of subgroup operations")
+    ap.add_argument("--indexed", action="store_true",
+                    help="only the current shaders: those index.json and fssm_index.json beside SRC both list, and "
+                         "SRC/selected.json when there is one (make_game.py); index.json is replaced, not merged into")
     a = ap.parse_args()
     global STRUCTURED, WAVE64_EMULATE
     STRUCTURED = not a.dispatch_loop
@@ -8148,7 +8153,14 @@ def main():
         write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
-    files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
+    if a.indexed:
+        try:
+            files = shader_members.disassembled(a.src)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+    else:
+        files = [a.src] if a.src.endswith(".s") else sorted(os.path.join(a.src, f) for f in os.listdir(a.src) if f.endswith(".s"))
     files = files[: a.limit] if a.limit is not None else files
     shard = None
     if a.shard:
@@ -8190,7 +8202,7 @@ def main():
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
-    if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
+    if shard is None and not a.indexed and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
         with open(idx_path, encoding="utf-8") as f:
             old = _js.load(f)  # partial runs merge into an existing index
         for name in invalid:
