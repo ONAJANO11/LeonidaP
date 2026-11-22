@@ -194,6 +194,10 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
 - GPU tests count only validation-type errors. Loader and layer messages, such as a third-party implicit layer
   that fails to load, are printed but don't fail the run; to silence one, set
   `VK_LOADER_LAYERS_DISABLE=<layer name pattern>`.
+- `d3d12_depth_clamp_test` — output depth against the viewport's depth range (`SV_Depth`, bias and clipped
+  triangles, `DepthClipEnable` TRUE and FALSE), read back from a D32_FLOAT target on the layer and on the host's
+  D3D12 and compared; a second layer pass runs as if `VK_EXT_depth_clip_enable` were absent. It skips without
+  `VK_EXT_depth_clip_enable` and `depthClamp`.
 - `d3d12_draw_test` — milestone M1: a VS+PS pipeline found by FSSM hash, the input layout matched by semantic,
   and five draws plus a culled triangle, compared pixel by pixel. They also cover an unbound render target and
   DSV, a rebound root signature, instance step rate 0, an unbound vertex slot, and PSOs, buffers and heaps that

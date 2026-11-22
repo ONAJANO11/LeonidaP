@@ -1418,6 +1418,30 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Output depth against the viewport's depth range, compared with the host's D3D12 (default adapter, or
+      # LEONIDA_HOST_ADAPTER); needs VK_EXT_depth_clip_enable and depthClamp on the GPU.
+      set(LEONIDA_TEST_VS_DEPTH_CLAMP ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth_clamp.spv)
+      set(LEONIDA_TEST_PS_DEPTH_CLAMP ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_depth_clamp.spv)
+      foreach(pair "vs_depth_clamp.vert;${LEONIDA_TEST_VS_DEPTH_CLAMP}" "ps_depth_clamp.frag;${LEONIDA_TEST_PS_DEPTH_CLAMP}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the depth clamp test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_depth_clamp_test test/d3d12_depth_clamp_test.cpp ${LEONIDA_TEST_VS_DEPTH_CLAMP}
+                     ${LEONIDA_TEST_PS_DEPTH_CLAMP})
+      target_link_libraries(d3d12_depth_clamp_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_depth_clamp_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS_DEPTH_CLAMP}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS_DEPTH_CLAMP}")
+      target_compile_options(d3d12_depth_clamp_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_depth_clamp COMMAND d3d12_depth_clamp_test)
+      set_tests_properties(d3d12_depth_clamp PROPERTIES SKIP_RETURN_CODE 77)
       # Set 0 from the compute bind point: a compute PSO whose shader declares set-0 bindings samples through the
       # device's bindless set, which nothing but the layer binds.
       set(LEONIDA_TEST_CS_SET0_SAMPLE ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_set0_sample.spv)
@@ -1447,7 +1471,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_pipeline_library COMMAND d3d12_pipeline_library_test)
       set_tests_properties(d3d12_pipeline_library PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_depth_clamp_test and d3d12_set0_compute_test are not built")
     endif()
 
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with

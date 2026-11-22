@@ -2245,9 +2245,21 @@ public:
         raster.depthBiasClamp = r.DepthBiasClamp;
         raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
         raster.lineWidth = 1.0f;
-        // No depth clipping: fragments outside the viewport's depth range are kept and their depth clamped to it, as
-        // D3D12 clamps output depth to MinDepth..MaxDepth anyway (needs depthClamp, checked below).
-        raster.depthClampEnable = r.DepthClipEnable ? VK_FALSE : VK_TRUE;
+        // D3D12 clamps a pixel's final depth (SV_Depth, or the interpolated depth after bias) to the viewport's
+        // MinDepth..MaxDepth with DepthClipEnable on or off; the flag only decides whether primitives are clipped to
+        // the near and far planes (measured on the default adapter and WARP, docs/d3d12_vulkan.md). Vulkan clamps to
+        // the viewport range only with depthClampEnable, which also turns clipping off unless
+        // VK_EXT_depth_clip_enable sets it separately. So with the extension and depthClamp, clamping is always on and
+        // the extension carries the flag. Without them DepthClipEnable = FALSE keeps its clamp (checked below), and
+        // TRUE keeps clipping but leaves a shader-written or biased depth unclamped.
+        const bool clip_state = device_.info.depth_clip_enable && device_.info.features.depthClamp;
+        raster.depthClampEnable = clip_state || !r.DepthClipEnable ? VK_TRUE : VK_FALSE;
+        VkPipelineRasterizationDepthClipStateCreateInfoEXT depth_clip{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
+        depth_clip.depthClipEnable = r.DepthClipEnable ? VK_TRUE : VK_FALSE;
+        if (!clip_state && r.DepthClipEnable)
+            log_once("depth clamping to the viewport range with clipping on needs VK_EXT_depth_clip_enable and "
+                     "depthClamp, which the device lacks: an out-of-range depth is not clamped; flag", 1);
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
@@ -2407,6 +2419,8 @@ public:
         recipe_.bindings = std::move(bindings);
         recipe_.assembly = assembly;
         recipe_.raster = raster;
+        recipe_.depth_clip = depth_clip;
+        recipe_.chain_depth_clip = clip_state;
         recipe_.multisample = multisample;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
@@ -2517,6 +2531,8 @@ private:
         std::vector<VkVertexInputBindingDescription> bindings;
         VkPipelineInputAssemblyStateCreateInfo assembly{};
         VkPipelineRasterizationStateCreateInfo raster{};
+        VkPipelineRasterizationDepthClipStateCreateInfoEXT depth_clip{};  // chained to `raster` when chain_depth_clip
+        bool chain_depth_clip = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
         VkSampleMask sample_mask = ~0u;
         VkPipelineDepthStencilStateCreateInfo depth{};
@@ -2555,6 +2571,9 @@ private:
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
         viewport.viewportCount = 1;
         viewport.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo raster = r.raster;
+        VkPipelineRasterizationDepthClipStateCreateInfoEXT depth_clip = r.depth_clip;
+        if (r.chain_depth_clip) raster.pNext = &depth_clip;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
@@ -2570,7 +2589,7 @@ private:
         info.pVertexInputState = &vertex_input;
         info.pInputAssemblyState = &r.assembly;
         info.pViewportState = &viewport;
-        info.pRasterizationState = &r.raster;
+        info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
         info.pDepthStencilState = &r.depth;
         info.pColorBlendState = &blend;
@@ -6344,6 +6363,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    // VK_EXT_depth_clip_enable where the GPU has it: with depthClamp it lets a PSO clamp depth to the viewport range
+    // and clip against the near and far planes at once, as D3D12 does by default.
+    VkPhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depth_clip};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.depth_clip_enable = depth_clip.depthClipEnable == VK_TRUE;
+        if (info.depth_clip_enable) {
+            depth_clip.pNext = *v13.next();
+            *v13.next() = &depth_clip;
+        }
+    }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
     // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
     enable.independentBlend = chosen_features.independentBlend;
@@ -6411,6 +6445,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.depth_clip_enable) device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
