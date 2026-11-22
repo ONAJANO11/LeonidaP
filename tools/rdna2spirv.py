@@ -283,8 +283,9 @@ class Gen:
         self.emit(f"OpStore {p} {val}")
 
     def imm_val(self, a):
-        """Integer literal value if 'a' is an immediate or known SGPR constant, else None."""
-        if a.get("abs") or a.get("neg"):
+        """Integer literal value if 'a' is an immediate or known SGPR constant, else None. An SDWA source with a
+        src_sel or sext is not folded: load() narrows it in sdwa_src, which the constant would skip."""
+        if a.get("abs") or a.get("neg") or "sdwa_sel" in a:
             return None
         k = a.get("k")
         if k == "imm":

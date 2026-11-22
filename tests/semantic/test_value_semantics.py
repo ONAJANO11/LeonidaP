@@ -76,6 +76,8 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# SDWA v_lshrrev/v_lshlrev/v_ashrrev by a constant SGPR narrowed by src0_sel (derivation in ps_sdwa_shift_sel.asm)
+EXPECTED_SDWA_SHIFT_SEL = [0x040C0000, 0x04000000, 0xFC040000, 0x06000000]
 
 
 def _f32_bits(x):
@@ -322,6 +324,19 @@ FLAT_ATTR1_X = struct.unpack("<f", struct.pack("<I", 0x101))[0]
 CS_BOUNDS_FSSM = _fssm(0x8088, (64, 1, 1))
 
 
+def reference_sdwa_shift_sel():
+    s2, s3, v0, v1 = 0x00040001, 0x00000300, 0x40C00000, 0xC0400000
+
+    def sel(word, off, width):                  # SDWA src0_sel without sext: the field, zero-extended
+        return (word >> off) & ((1 << width) - 1)
+
+    def ashr(x, n):
+        return ((x - (1 << 32) if x >> 31 else x) >> n) & 0xFFFFFFFF
+
+    return [v0 >> (sel(s2, 16, 16) & 31), (v1 << (sel(s2, 16, 16) & 31)) & 0xFFFFFFFF,
+            ashr(v1, sel(s2, 16, 8) & 31), (v0 << (sel(s3, 8, 8) & 31)) & 0xFFFFFFFF]
+
+
 class OracleTests(unittest.TestCase):
     """The hand-written constants and the plain-Python reference agree (so the oracle is self-consistent)."""
 
@@ -342,6 +357,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sdwa_shift_sel(), EXPECTED_SDWA_SHIFT_SEL)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -403,6 +419,11 @@ class TranslatorValueSemantics(unittest.TestCase):
         # S1 - S0 in the _e32 and _e64 forms (neg, clamp), low half out, the destination's high half kept, also
         # when the destination is a source.
         self.check("ps_valu16_subrev", EXPECTED_VALU16_SUBREV)
+
+    def test_sdwa_shift_by_constant_sgpr_keeps_src0_sel(self):
+        # The shift amount is an SGPR set by s_mov_b32, so the translator knows it; SDWA still narrows it to
+        # src0_sel (WORD_1 / BYTE_2 of 0x00040001 = 4, BYTE_1 of 0x300 = 3) before the low five bits are used.
+        self.check("ps_sdwa_shift_sel", EXPECTED_SDWA_SHIFT_SEL)
 
     def test_s_buffer_load_dwordx2_into_vcc(self):
         # The V# in s[0:3] points at 0x1000; the two dwords must come back in vcc_lo and vcc_hi, not be lost.
