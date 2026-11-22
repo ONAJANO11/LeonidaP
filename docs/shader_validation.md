@@ -1081,18 +1081,21 @@ the two wave sizes agree on every word. `tools/fma_mix_probe.py --oracle hw` (th
 `tests/semantic/spirv_mini_interp.py`, then compared with the hardware under the MODE the translator assumes for the
 game (IEEE 0, DX10_CLAMP 1, f32 denormals flushed, f16 denormals kept). It gives the same word for the float
 constants in every `op_sel`/`op_sel_hi` combination, for the integer constants as f16 halves, for clamp on values that
-are not NaN, and for the f16 denormals. It differs in five ways, none fixed here:
+are not NaN, and for the f16 denormals. It differed in five ways. The first is fixed by SHADER-297, the third by
+#1774 (SHADER-296) and the fourth by #1763 (SHADER-298); the second and fifth are open:
 
-1. **f16 omod.** The translator applies `mul:2`/`mul:4`/`div:2` to every f16 result. The hardware ignores them in this
+1. **f16 omod (fixed, SHADER-297).** The translator applied `mul:2`/`mul:4`/`div:2` to every f16 result. The hardware ignores them in this
    MODE (24 words: `v_add/mul/fma/fmac/exp/rcp_f16`). `v_cvt_f16_f32` drops its omod and clamp today, so its omod
    matches by accident; #718 would make it apply. The two assumptions can't both hold for the game. Either its shaders
    run with f16 denormals flushed, and keeping them is wrong, or every f16 omod in them does nothing. A corpus count
    of omod on f16 instructions would decide, since a compiler that emits one expects it to act (LLVM folds an omod only
-   when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). That count needs the game files.
+   when "output denormals" are off, the `SIFoldOperands.cpp` comment quoted above). The count over 1.0.2.1 finds none
+   on any of the 201,864 f16-result instructions (102,365 on f32 ones), so it decides nothing for the game and the
+   translator now follows the hardware: clamp kept, omod dropped (`Gen.clamp_f16`, `ps_f16_omod.asm`).
 2. **clamp of a NaN.** The interpreter refuses `FClamp` with a NaN operand, which GLSL.std.450 leaves undefined. The
    hardware gives +0 with DX10_CLAMP 1, for `v_fmac_f16`, `v_fma_mixlo_f16` and `v_fma_mix_f32` alike (SHADER-186).
-3. **Mix-op rounding.** The hardware rounds once (the section above).
-4. **f32 denormal operands of the mix ops.** They are not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
+3. **Mix-op rounding (fixed, #1774).** The hardware rounds once (the section above).
+4. **f32 denormal operands of the mix ops (fixed, #1763).** They were not flushed with `denorm_mode_32 = 0`: `0x00000001`, `0x807fffff`
    and the integer constants `1` and `64` used as f32 give the denormal, where the hardware gives a zero of its sign
    (compare SHADER-118 for the mad ops).
 5. **NaN payloads.** Where the hardware keeps the payload and, with IEEE 0, the signalling bit, the translator writes

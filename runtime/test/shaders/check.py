@@ -279,7 +279,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
               "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3f800000),
               "ps_cvt_off": (0xbf000000, 0x3ee00000, 0xbe800000, 0x3f800000),
-              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3e00, 0xaaaa0000, 0xaaaa4000),
+              "ps_fmac_f16_mods": (0xaaaa3c00, 0xaaaa3a00, 0xaaaa0000, 0xaaaa4400),
               "ps_vop3_const_mods": (0xc0000000, 0xbf800000, 0x3f800000, 0xaaaabc00),
               "ps_interp_f32_mods": (0x3f800000, 0x00000000, 0x3f400000, 0x3f800000),
               "ps_interp_mov_mods": (0x3f800000, 0x3fc00000, 0x40000000, 0x3f400000),
@@ -287,7 +287,10 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
               "ps_valu16_subrev": (0xaaaabc00, 0xaaaac000, 0xaaaa3c00, 0x42003800),
               # v_readlane_b32 across both halves of a wave64 (the .asm header derives the words)
-              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be)}
+              "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000be),
+              # SHADER-297: no omod on f16 results with f16 denormals kept (measured on gfx1036, .asm header)
+              "ps_f16_omod": (0xaaaa3f00, 0xaaaa3a00, 0xaaaa3f00, 0xaaaa3c00)}
+
 # Pixel shaders that are exact only when the pixel stage really ran 64 lanes wide. vk_harness says so when it chained
 # a required subgroup size onto the fragment stage ("fragment subgroup size: N required"). A device that cannot
 # require 64 there (NVIDIA: 32 only; llvmpipe: 8) has no frame to judge: the test is skipped, not failed.

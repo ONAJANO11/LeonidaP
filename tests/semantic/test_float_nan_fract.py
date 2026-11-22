@@ -170,9 +170,11 @@ class FractNearOne(unittest.TestCase):
         got = run_op("v_fract_f16_e32 v0, v1", (0x7C00,))
         self.assertTrue(is_nan16(got & 0xFFFF) and got >> 16 == 0, hex(got))
 
-    def test_v_fract_f16_mul2_keeps_a_true_one(self):
-        # fract(0.5) * 2 = 1.0 exactly: the 0x3c00 -> 0x3bff fix-up is only for Fract's own rounding.
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x3800,)), 0x3C00)
+    def test_v_fract_f16_ignores_mul2(self):
+        # An f16 result takes no omod with f16 denormals kept (gfx1036, SHADER-135/297): fract(0.5) stays 0.5, and
+        # a Fract that rounds up to 1.0 still gets the 0x3c00 -> 0x3bff fix-up with mul:2 written on the op.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x3800,)), 0x3800)
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", (0x8800,)), 0x3BFF)
 
     def test_fract_alone_rounds_to_one(self):
         # Without the select, fract(-1e-10) is exactly 1.0: the select is what gives 0x3f7fffff.

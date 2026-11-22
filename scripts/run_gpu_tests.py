@@ -1133,7 +1133,7 @@ def run_suite(a, work: str) -> int:
                 # TEST-175: docs/design.md rules that were checked on the CPU only (derivations in the .asm headers)
                 "ps_cmp_nlg": (0x40000037, 0x40000007, 0x40000001, 0x3F800000),
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
-                "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
+                "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3A00, 0xAAAA0000, 0xAAAA4400),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
@@ -1141,6 +1141,7 @@ def run_suite(a, work: str) -> int:
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
+                "ps_f16_omod": (0xAAAA3F00, 0xAAAA3A00, 0xAAAA3F00, 0xAAAA3C00),   # SHADER-297, measured on gfx1036
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
                 results.append((name, None, str(skip)))

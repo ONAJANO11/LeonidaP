@@ -700,11 +700,12 @@ class RcpF16ExecutionTests(unittest.TestCase):
         self.assertEqual(run_op("v_rcp_f16_e64 v0, |v1| op_sel:[1,1]", v1), merge_half(OLD, H_2P0, 1))
         self.assertEqual(run_op("v_rcp_f16_e64 v0, -|v1| op_sel:[1,0]", v1), merge_half(OLD, H_NEG_2P0, 0))
 
-        # Output modifiers scale first, then clamp to [0.0, 1.0], then pack to f16 keeping the other half.
-        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, H_0P5, 0))
-        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 div:2", v1), merge_half(OLD, 0x3000, 0))        # 0.125
-        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 op_sel:[1,1] mul:2", v1), merge_half(OLD, H_NEG_4P0, 1))
+        # clamp to [0.0, 1.0] applies, then pack to f16 keeping the other half; the omod does nothing on an f16 result
+        # with f16 denormals kept (gfx1036, SHADER-297): rcp(4.0) stays 0.25 and rcp(-0.5) stays -2.0.
+        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 mul:2", v1), merge_half(OLD, 0x3400, 0))        # 0.25
+        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 mul:4", v1), merge_half(OLD, 0x3400, 0))
+        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 div:2", v1), merge_half(OLD, 0x3400, 0))
+        self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 op_sel:[1,1] mul:2", v1), merge_half(OLD, H_NEG_2P0, 1))
         self.assertEqual(run_op("v_rcp_f16_e64 v0, v1 op_sel:[1,1] clamp", v1), merge_half(OLD, H_POS_ZERO, 1))
         self.assertEqual(run_op("v_rcp_f16_e64 v0, |v1| op_sel:[1,0] mul:2 clamp", v1), merge_half(OLD, H_1P0, 0))
         self.assertEqual(run_op("v_rcp_f16_e64 v0, |v1| op_sel:[1,1] clamp div:2", v1), merge_half(OLD, H_1P0, 1))

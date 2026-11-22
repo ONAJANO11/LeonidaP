@@ -534,7 +534,7 @@ class FractF16ExecutionTests(unittest.TestCase):
             ("clamp", H_NEG_0P25, 0, dict(clamp=True)),
             ("clamp", H_NEG_2PM13, 0, dict(clamp=True)),
             ("clamp", H_NEG_ZERO, 0, dict(clamp=True)),
-            # mul:2 / mul:4 / div:2 (true 1.0 stays 0x3c00 when omod is active)
+            # mul:2 / mul:4 / div:2: no omod on an f16 result with f16 denormals kept (gfx1036, SHADER-297)
             ("mul:2", H_0P5, 0, dict(mul=2)),
             ("mul:2", H_0P75, 0, dict(mul=2)),
             ("mul:2", H_NEG_0P25, 0, dict(mul=2)),
@@ -558,15 +558,15 @@ class FractF16ExecutionTests(unittest.TestCase):
         for suffix, h_in, dst_hi, kw in cases:
             v1 = ((h_in << 16) | H_0P25) if "op_sel:[1,1]" in suffix else ((H_3P75 << 16) | h_in)
             line = f"v_fract_f16_e64 v0, v1 {suffix}"
-            want = oracle_fract_f16(h_in, **kw)
+            want = oracle_fract_f16(h_in, clamp=kw.get("clamp", False))   # the hardware drops the omod
             with self.subTest(line=line, h_in=hex(h_in)):
                 self.assertEqual(run_op(line, v1), merge_half(OLD, want, dst_hi))
 
-        # Verify explicit exact values for the critical omod transitions.
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", H_0P5), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", H_0P75), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", H_0P5), merge_half(OLD, H_2P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", H_0P5), merge_half(OLD, H_0P25, 0))
+        # Explicit values: the omod is ignored, so fract(0.5) and fract(0.75) come out unscaled.
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2", H_0P5), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:2 clamp", H_0P75), merge_half(OLD, H_0P75, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 mul:4", H_0P5), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, v1 div:2", H_0P5), merge_half(OLD, H_0P5, 0))
 
     def test_inline_f16_constants(self):
         for lit, h in (("0.5", H_0P5), ("-0.5", H_NEG_0P5), ("1.0", H_1P0), ("-1.0", H_NEG_1P0)):
@@ -579,8 +579,9 @@ class FractF16ExecutionTests(unittest.TestCase):
             # Inline float constants place +0.0 in the high half (docs/design.md / src_h).
             self.assertEqual(run_op(f"v_fract_f16_e64 v0, {lit} op_sel:[1,0]"), merge_half(OLD, H_POS_ZERO, 0))
 
-        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 mul:2"), merge_half(OLD, H_1P0, 0))
-        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 div:2"), merge_half(OLD, H_0P25, 0))
+        # fract(-0.5) = 0.5; the omod is ignored on an f16 result (SHADER-297).
+        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 mul:2"), merge_half(OLD, H_0P5, 0))
+        self.assertEqual(run_op("v_fract_f16_e64 v0, -0.5 div:2"), merge_half(OLD, H_0P5, 0))
 
     def test_sgpr_sources_and_destination_aliasing(self):
         s4 = (H_NEG_1P25 << 16) | H_0P25
