@@ -116,6 +116,23 @@ bool poison_image(vktest::Device& d, VkImage image, std::uint32_t width, std::ui
     });
 }
 
+// Transition a newly created image from UNDEFINED to GENERAL so registering it in GENERAL matches its Vulkan layout.
+bool transition_image_to_general(vktest::Device& d, VkImage image) {
+    return d.run([&](VkCommandBuffer cb) {
+        VkImageMemoryBarrier to_general{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_general.image = image;
+        to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                                                               nullptr, 1, &to_general);
+        return true;
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -143,6 +160,7 @@ int main() {
                                              VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         EXPECT(array_img != VK_NULL_HANDLE && side_img != VK_NULL_HANDLE);
         EXPECT(poison_image(d, array_img, width, height, 2));
+        EXPECT(transition_image_to_general(d, side_img));
 
         constexpr std::uint32_t row_pitch = 256;  // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
         constexpr VkDeviceSize layer_bytes = VkDeviceSize(row_pitch) * height;
