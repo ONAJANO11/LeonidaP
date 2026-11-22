@@ -26,22 +26,34 @@ methods are still open.
 
 ## Working on the code
 
+- Local checks: `python -I scripts/run_checks.py` runs the CI checks in one command (`--list` to see all checks,
+  `--only <names>` to run a subset, `--runtime` to build/test `runtime/`, and `--lint` for `jactionlint`).
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise.
-- `tools/rpf9dump` needs the submodule: `git submodule update --init`.
+- `tools/rpf9dump` needs the submodule: `git submodule update --init`. Build it with
+  `dotnet build tools/rpf9dump/rpf9dump.csproj -c Release` and run the C# diagnostic tests with
+  `dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
-- `python -I tests/test_<name>.py` runs one of the unit tests (standard library only; CI runs them all).
-- Runtime tests: `cmake -S runtime -B runtime/build`, `cmake --build runtime/build --config RelWithDebInfo`, then
-  `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. The CPU tests that need no game data are configured
-  on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR` (and `LEONIDA_MOVIE` for the Bink
-  decode test) in place and print `SKIP` when the variable is unset; never copy or commit those files.
+- `python -I tests/test_<name>.py` runs one of the standard-library unit tests (CI runs them all). The
+  pytest-based ones need `pip install -r tests/requirements.txt` and `python -m pytest tests/test_<name>.py`
+  (**not** `-I`: it hides user site-packages, so `import pytest` fails); `python -m pytest tests -q` runs all of
+  them.
+- Runtime tests: `cmake -S runtime -B runtime/build -DLEONIDA_D3D12_SHIM_TESTS=ON`,
+  `cmake --build runtime/build --config RelWithDebInfo`, then
+  `ctest --test-dir runtime/build -C RelWithDebInfo --output-on-failure`. On Windows, `VULKAN_SDK` can point to
+  Khronos `Vulkan-Headers` alone (without the full LunarG SDK) to build the D3D12 COM targets and CPU tests. The CPU
+  tests that need no game data are configured on Windows. Tests that need the retail package read `LEONIDA_GAME_DIR`
+  (and `LEONIDA_MOVIE` for the Bink decode test) in place and print `SKIP` when the variable is unset; never copy or
+  commit those files.
 - Viewer streaming tests: `node --test tests/test_viewer_streaming.cjs` (Node.js 22+, CI tests 24 LTS; no packages,
   browser, network or game data). These execute the viewer streaming code with a synthetic loader and clock.
 - `loader_test` writes small PE images to a `leonida_loader_test` folder in `%TEMP%`. Antivirus that blocks newly
   written executables makes it stop with that reason; exclude the folder or set `LEONIDA_TEST_DIR` to one it skips.
-- Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
+- Tool checks: `python -m compileall -q make_game.py tools tests scripts`. The optional
   `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
   pipeline) for every translated shader and reports failures plus the saved cache path.
+- Workflow changes: `.github/workflows/jactionlint.yml` lints `.github/**` in CI; install `jactionlint` locally or
+  run `python -I scripts/run_checks.py --only lint` to check workflow edits before pushing.
 - GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
   SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
   the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
