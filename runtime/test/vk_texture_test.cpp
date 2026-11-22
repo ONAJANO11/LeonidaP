@@ -550,20 +550,29 @@ int main(int argc, char** argv) {
         std::printf("vk_texture_test dref: PASSED (%u pixels, f32 and d16 depth compares exact)\n", W * H);
     }
     if (autonomous && !cube && !dref) {
+        // Expected: pixel (px, py) reads texel (floor(8u), floor(8v)) at u = (px + 0.5) / 64 (never on a texel edge),
+        // the gradient's (32x, 32y, 128, 255) as UNORM. Every pixel and channel: the center pixel's blue and alpha
+        // alone also passed a sample of the wrong texel, or with R and G swapped.
         const float* pixels = static_cast<const float*>(rbp);
-        // Sample center pixel (32, 32)
-        int idx = (32 * W + 32) * 4;
-        float r = pixels[idx + 0];
-        float g = pixels[idx + 1];
-        float b = pixels[idx + 2];
-        float a = pixels[idx + 3];
-        if (std::abs(b - (128.0f / 255.0f)) > 0.05f || std::abs(a - 1.0f) > 0.05f) {
-            std::fprintf(stderr, "vk_texture_test: pixel check FAILED at (32,32): rgba=(%f, %f, %f, %f), expected gradient sample (~0.5, ~0.5, 0.5, 1.0)\n",
-                         r, g, b, a);
+        int wrong = 0, first = -1;
+        for (uint32_t py = 0; py < H; py++)
+            for (uint32_t px = 0; px < W; px++) {
+                const uint32_t tx = std::min(TW - 1, uint32_t((px + 0.5f) / W * TW));
+                const uint32_t ty = std::min(TW - 1, uint32_t((py + 0.5f) / H * TW));
+                const float want[4] = {tx * 32 / 255.f, ty * 32 / 255.f, 128 / 255.f, 1.0f};
+                const float* p = pixels + (py * W + px) * 4;
+                bool ok = true;
+                for (int c = 0; c < 4; ++c) ok = ok && std::fabs(p[c] - want[c]) < 1e-3f;
+                if (!ok && first < 0) first = int(py * W + px);
+                wrong += !ok;
+            }
+        if (wrong) {
+            const float* p = pixels + first * 4;
+            std::fprintf(stderr, "vk_texture_test: %d of %u pixels FAILED, first at (%d,%d): rgba=(%f, %f, %f, %f)\n",
+                         wrong, W * H, first % int(W), first / int(W), p[0], p[1], p[2], p[3]);
             return 1;
         }
-        std::printf("vk_texture_test: PASSED (verified center pixel rgba=(%.3f, %.3f, %.3f, %.3f) from gradient texture via descriptor table)\n",
-                    r, g, b, a);
+        std::printf("vk_texture_test: PASSED (%u pixels, each the gradient texel its UV reads)\n", W * H);
     }
     return 0;
 }
