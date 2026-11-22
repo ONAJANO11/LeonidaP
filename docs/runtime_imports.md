@@ -161,6 +161,14 @@ What this does not cover: a title that `LoadLibrary`s one of the package's bundl
 `XboxBvhBuilder.dll`, the FidelityFX DLLs) still gets the host loader, which loads the Xbox build without the
 registry's bindings for its own console imports (`xmem.dll`, `d3d12_xs.dll`).
 
+## Thread stack imports
+
+`CreateThread` is registered for `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-processthreads-l1-1-{0,1,2,3}.dll`;
+`_beginthreadex` and `_beginthread` for `api-ms-win-crt-runtime-l1-1-0.dll`, `ucrtbase.dll`, `ucrtbased.dll` and
+`msvcrt.dll` (`runtime/shims/process.cpp`). They supply the mapped image's `SizeOfStackReserve` for a size of 0 and
+for a nonzero commit without `STACK_SIZE_PARAM_IS_A_RESERVATION`; a size with the flag is left alone. Imports under
+other names, `CreateRemoteThread(Ex)` and threads started inside host DLLs fall through to the host.
+
 ## What this proves and what it does not
 
 - It proves the loader parses real Xbox Series PE files, maps their sections, applies no unnecessary relocation,

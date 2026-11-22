@@ -608,7 +608,7 @@ if(BUILD_TESTING)
     add_test(NAME gameinput COMMAND ${CMAKE_COMMAND} -E echo "built without SDL3")
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
-  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+  if(WIN32 AND TARGET gta6rt AND TARGET tiny_game AND TARGET stack_reserve_fixture)
     add_test(NAME run_tiny_async COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_async>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_async.cmake")

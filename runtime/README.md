@@ -125,10 +125,16 @@ all-zero one) load normally.
 `load()` also records the image's `OptionalHeader.SizeOfStackReserve` (and `SizeOfStackCommit`). With `--run`, the
 entry-point thread and any thread a title creates with stack size 0 get that reserve: Windows gives a size-0 thread
 the main image's reserve, but gta6rt maps the title into a host EXE with a smaller one. The `CreateThread` (`kernel32`,
-`kernelbase`, `api-ms-win-core-processthreads-l1-1-0`) and `_beginthreadex` (the UCRT names and `msvcrt`) shims
-substitute it only for size 0; a nonzero size is the caller's commit size and is left alone (RT-119). The
-`run_stack_reserve` CTest fixture is linked with `/STACK:64MB` and checks `GetCurrentThreadStackLimits` on the entry
-point and both size-0 thread paths; `stack_reserve_shim` checks the import names and the nonzero path.
+`kernelbase`, `api-ms-win-core-processthreads-l1-1-{0,1,2,3}`), `_beginthreadex` and `_beginthread` (the UCRT names
+and `msvcrt`) shims supply it for size 0. A nonzero `CreateThread` commit without `STACK_SIZE_PARAM_IS_A_RESERVATION`
+also gets the image reserve, raised to a 1 MiB-rounded commit if that is larger, and is passed on with the flag: real
+Windows keeps the image reserve in that case too. The host's smaller default commit replaces the caller's commit; the
+stack grows to the reserve, which is what matters. A size that already has the flag is left alone (RT-119).
+`_beginthread` has no flag argument, so the CRT forwards the reserve as a commit to the host's CreateThread; the
+reserve still reaches the image size, at the cost of a larger initial commit. The CRT starters now initialise their
+per-thread state in gta6rt's static UCRT rather than in `msvcrt.dll`. The `run_stack_reserve` CTest fixture is linked
+with `/STACK:64MB` and checks `GetCurrentThreadStackLimits` on the entry point, the size-0 and nonzero-commit
+`CreateThread` paths and both CRT thread paths; `stack_reserve_shim` checks the import names and the nonzero paths.
 
 Current limits, by design:
 
