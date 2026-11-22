@@ -1,8 +1,9 @@
 ﻿# Builds runtime\build\gta6rt.exe with MSVC at BelowNormal priority, on half the cores.
-# Uses VS's CMake + Ninja when the "C++ CMake tools" component is installed, otherwise calls cl.exe directly.
+# Uses VS's CMake + Ninja (or cmake/ninja on PATH) via runtime\CMakePresets.json when available,
+# otherwise calls cl.exe directly. Pass -Test to run CTest after building.
 # The GameInput controller shim (SDL3, docs/gameinput.md) is built only on the CMake path: with an installed SDL3, or
 # with -FetchSdl3, which lets CMake download the pinned SDL3 release. The cl.exe fallback never builds it.
-param([switch]$Debug, [switch]$FetchSdl3)
+param([switch]$Debug, [switch]$FetchSdl3, [switch]$Test)
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -18,19 +19,29 @@ New-Item -ItemType Directory -Force $out | Out-Null
 
 $cmakeDir = Join-Path $vs "Common7\IDE\CommonExtensions\Microsoft\CMake"
 $cmake = Join-Path $cmakeDir "CMake\bin\cmake.exe"
+$ctest = Join-Path $cmakeDir "CMake\bin\ctest.exe"
 $ninja = Join-Path $cmakeDir "Ninja\ninja.exe"
-$cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
-$sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
+if (-not (Test-Path $cmake)) { $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source }
+if (-not (Test-Path $ctest)) { $ctest = (Get-Command ctest -ErrorAction SilentlyContinue).Source }
+if (-not (Test-Path $ninja)) { $ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source }
+$sdl = if ($FetchSdl3) { " -DLEONIDA_SDL3_FETCH=ON" } else { "" }
 
-if ((Test-Path $cmake) -and (Test-Path $ninja)) {
+if ($cmake -and $ninja) {
+    if ($Test -and -not $ctest) {
+        throw "Running -Test requires ctest (install VS's 'C++ CMake tools' or put ctest on PATH)."
+    }
+    $cfgOverride = if ($Debug) { " -DCMAKE_BUILD_TYPE=Debug" } else { "" }
+    $testCmd = if ($Test) { "`r`n`"$ctest`" --preset windows-ninja || exit /b 1" } else { "" }
     $body = @"
-"$cmake" -S "$src" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" -DCMAKE_BUILD_TYPE=$cfg $sdl || exit /b 1
-"$cmake" --build "$out" -j $jobs || exit /b 1
+cd /d "$src" || exit /b 1
+"$cmake" --preset windows-ninja "-DCMAKE_MAKE_PROGRAM=$ninja"$cfgOverride$sdl || exit /b 1
+"$cmake" --build --preset windows-ninja -j $jobs || exit /b 1$testCmd
 "@
 } else {
+    if ($Test) { throw "Running -Test requires CMake and Ninja (install VS's 'C++ CMake tools' or put them on PATH)." }
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
     # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
-    Write-Warning "VS C++ CMake tools not found: building with cl.exe directly, without the GameInput shim (SDL3). Install the CMake tools component to get it."
+    Write-Warning "CMake and Ninja not found (VS C++ CMake tools or PATH): building with cl.exe directly, without the GameInput shim (SDL3). Install CMake and Ninja to get it."
     $xtaskqueueDir = Join-Path $root "third_party\xtaskqueue"
     $xtaskqueueFiles = "Source\Task\TaskQueue.cpp", "Source\Task\AsyncLib.cpp", "Source\Task\ThreadPool_win32.cpp", "Source\Task\WaitTimer_win32.cpp" | ForEach-Object { "`"$xtaskqueueDir\$_`"" }
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp", "shims\xgameruntime.cpp", "shims\library_loader.cpp", "shims\process.cpp" | ForEach-Object { "`"$src\$_`"" }
