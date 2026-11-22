@@ -805,7 +805,7 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32"):
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_buf_atomic_x2"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 is per-lane and needs no particular subgroup width either.
@@ -826,6 +826,9 @@ def run_suite(a, work: str) -> int:
                 "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED0028, 0, 0xBEEF0000,
                                    0xBEEF0001],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
+                # buffer_atomic_and/or/swap_x2: memory and the glc returns (derivation in the .asm header)
+                "cs_buf_atomic_x2": [0xFF00FF00, 0x0FF00FF0, 0x12005600, 0x0AB00EF0, 0x12FF5600, 0x0AB00EFF,
+                                     0xCAFEF00D, 0xDEADBEEF],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []

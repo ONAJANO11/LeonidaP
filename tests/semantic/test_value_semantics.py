@@ -623,6 +623,33 @@ class MeasuredBoundsShaders(unittest.TestCase):
                 self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 
+class BufferAtomicX2Shader(unittest.TestCase):
+    """runtime/test/shaders/cs_buf_atomic_x2.asm: buffer_atomic_and_x2 (no glc), or_x2 and swap_x2 (glc) on one
+    64-bit element at heap byte 0x40, run here in the interpreter on a 256-byte heap of 0xee bytes like
+    vk_compute_test's. The words are the GPU check's (check.py BOUNDS), derived by hand in the .asm header."""
+
+    WANT = [0xFF00FF00, 0x0FF00FF0, 0x12005600, 0x0AB00EF0, 0x12FF5600, 0x0AB00EFF, 0xCAFEF00D, 0xDEADBEEF]
+
+    def test_words(self):
+        spv = support.translate_fixture("cs_buf_atomic_x2", fssm=CS_BOUNDS_FSSM)
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in self.WANT])
+        self.assertEqual((memory[0x40], memory[0x44]), (0xCAFEF00D, 0xDEADBEEF), "the element after the swap")
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
+
+    def test_words_follow_from_the_ops(self):
+        # Plain-Python reference: each op on the 64-bit value, the old value returned only with glc.
+        m = 0x9ABCDEF0_12345678
+        and_data, or_data, swap_data = 0x0FF00FF0_FF00FF00, 0x0000000F_00FF0000, 0xDEADBEEF_CAFEF00D
+        m &= and_data                       # no glc: the data registers keep and_data
+        ret_or, m = m, m | or_data
+        ret_swap, m = m, swap_data
+        words = [w for v in (and_data, ret_or, ret_swap, m) for w in (v & 0xFFFFFFFF, v >> 32)]
+        self.assertEqual(words, self.WANT)
+
+
 class LaneMaskConstants(unittest.TestCase):
     """runtime/test/shaders/cs_w32_mask_imm.asm and cs_w64_mask_imm.asm: a constant read as a lane mask (saveexec,
     wrexec, s_and_b64 / s_not_b64 / s_mov_b64 into EXEC or VCC) gives lane L its bit L, not bit 0 for every lane.
