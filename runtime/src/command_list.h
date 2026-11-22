@@ -146,7 +146,8 @@ inline constexpr std::uint32_t clear_stencil = 0x2;
 inline constexpr std::uint32_t texture_barrier_discard = 0x1;
 
 // Portable color-view interpretation. Other views inherit their resource format as before.
-enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint };
+// vulkan: any other typed view of a TYPELESS resource; TargetView::vulkan_format holds the view's VkFormat.
+enum class ColorViewFormat : std::uint32_t { resource, rgba8_unorm, rgba8_srgb, rgba8_uint, vulkan };
 
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
@@ -155,6 +156,7 @@ struct TargetView {
     std::uint32_t first_layer;
     std::uint32_t layer_count;
     ColorViewFormat format = ColorViewFormat::resource;
+    std::uint32_t vulkan_format = 0;  // VkFormat, with ColorViewFormat::vulkan
 };
 
 // D3D12_RECT: right and bottom are exclusive.

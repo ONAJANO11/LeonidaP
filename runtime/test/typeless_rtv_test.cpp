@@ -1,4 +1,4 @@
-// CPU-only replay tests for typed RGBA8 views. No Vulkan loader, GPU or game data.
+// CPU-only replay tests for typed views of TYPELESS resources. No Vulkan loader, GPU or game data.
 #include "../src/vulkan_replay.h"
 #include <array>
 #include <cstdio>
@@ -91,7 +91,9 @@ int main() {
             if (format == ColorViewFormat::rgba8_uint) {
                 EXPECT(captured.uint32[0] == 1 && captured.uint32[1] == 2 && captured.uint32[2] == 255 && captured.uint32[3] == 0);
             } else {
-                EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
+                // UNORM and sRGB views round and clamp like D3D (render_target_clear_color): 1.5 and 256 are 1.0, -1 is 0.
+                const VkClearColorValue converted = leonida::detail::render_target_clear_color(expected, color);
+                EXPECT(std::memcmp(captured.float32, converted.float32, sizeof(captured)) == 0);
             }
             ++checks;
         }
@@ -163,6 +165,47 @@ int main() {
     EXPECT(invalid_batch.clear_render_target({1, 0, 0, 1, static_cast<ColorViewFormat>(99)}, color) && invalid_batch.close());
     EXPECT(run(invalid_batch, binding, vk) == ReplayResult::invalid_clear && !image_clears && !attachment_clears);
     checks += 3;
+
+    // Other TYPELESS families (and RGBA8 views without a named format) carry the view's VkFormat.
+    auto rg16 = binding;
+    rg16.rgba8_typeless = false;
+    rg16.mutable_format = true;
+    rg16.format = VK_FORMAT_R16G16_SFLOAT;
+    const ClearColor wide{70000.0f, -3.5f, 0, 0};
+    const auto vulkan_view = [](VkFormat format) {
+        return TargetView{1, 0, 0, 1, ColorViewFormat::vulkan, std::uint32_t(format)};
+    };
+    for (const bool rect : {false, true}) {
+        CommandList cast;
+        EXPECT(cast.clear_render_target(vulkan_view(VK_FORMAT_R16G16_UINT), wide,
+                                        rect ? std::span<const Rect>(&rectangle, 1) : std::span<const Rect>{}));
+        EXPECT(cast.close());
+        EXPECT(run(cast, rg16, vk) == ReplayResult::success && !image_clears && attachment_clears == 1);
+        EXPECT(requested_format == VK_FORMAT_R16G16_UINT);
+        EXPECT(captured.uint32[0] == 65535 && captured.uint32[1] == 0);
+        EXPECT(captured_rect.rect.extent.width == (rect ? 3u : 5u));
+        CommandList sint;
+        EXPECT(sint.clear_render_target(vulkan_view(VK_FORMAT_R8G8B8A8_SINT), color,
+                                        rect ? std::span<const Rect>(&rectangle, 1) : std::span<const Rect>{}));
+        EXPECT(sint.close());
+        EXPECT(run(sint, binding, vk) == ReplayResult::success && !image_clears && attachment_clears == 1);
+        EXPECT(requested_format == VK_FORMAT_R8G8B8A8_SINT);
+        EXPECT(captured.int32[0] == 1 && captured.int32[1] == 2 && captured.int32[2] == 127 && captured.int32[3] == -1);
+        checks += 2;
+    }
+    // The resource's own format through a vulkan view is still a single vkCmdClearColorImage.
+    CommandList own;
+    EXPECT(own.clear_render_target(vulkan_view(VK_FORMAT_R16G16_SFLOAT), wide) && own.close());
+    EXPECT(run(own, rg16, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears);
+    ++checks;
+    auto fixed = rg16; fixed.mutable_format = false;
+    EXPECT(rejects(fixed, vulkan_view(VK_FORMAT_R16G16_UINT)));        // not created TYPELESS
+    EXPECT(rejects(rg16, vulkan_view(VK_FORMAT_R32G32_UINT)));         // another texel size
+    EXPECT(rejects(rg16, vulkan_view(VK_FORMAT_UNDEFINED)));
+    EXPECT(rejects(rg16, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));  // named RGBA8 views need R8G8B8A8_TYPELESS
+    auto mipped = rg16; mipped.mip_levels = 2;
+    EXPECT(rejects(mipped, vulkan_view(VK_FORMAT_R16G16_UINT)));
+    checks += 5;
     std::printf("typeless_rtv_test: %u format, snapshot, whole/rectangle and rejection scenarios passed\n", checks);
     return 0;
 }

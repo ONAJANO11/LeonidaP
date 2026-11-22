@@ -167,7 +167,7 @@ private:
         // would incorrectly require it from an sRGB view, even though this view is never used as storage.
         VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
         usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.rgba8_typeless) info.pNext = &usage;
+        if (r.rgba8_typeless || r.mutable_format) info.pNext = &usage;
         VkImageView view = VK_NULL_HANDLE;
         if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
         views_[key] = view;

@@ -214,8 +214,10 @@ int main() {
         };
         D3D12_RENDER_TARGET_VIEW_DESC invalid{};
         invalid.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        // SINT and SNORM views are supported (d3d12_clear_formats_test compares them with WARP); a format of another
+        // family is not, also with the same texel size (R16G16_UINT, R32_FLOAT).
         for (const auto format : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                 DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R8G8B8A8_SNORM}) {
+                                 DXGI_FORMAT_R16G16_UINT, DXGI_FORMAT_R32_FLOAT}) {
             invalid.Format = format;
             if (!rejects(DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid)) return 1;
         }
