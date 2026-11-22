@@ -122,12 +122,16 @@ def comments(name, line, langs):
 
 
 def bank_names(names, rel_dir):
-    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown."""
+    """The stream names of the bank in `rel_dir`, trying shorter paths from the left when the full path is unknown.
+    Each path is tried as is, then with ".awc": awc_names.py labels a bank read from an audio_manifest.json with
+    its archive path, extension included, while awc_opus.py's folder has none. A label as is wins."""
     parts = rel_dir.split("/")
     for i in range(len(parts)):
-        found = names.get("/".join(parts[i:]))
-        if found is not None:
-            return found
+        path = "/".join(parts[i:])
+        for label in (path, path + ".awc"):
+            found = names.get(label)
+            if found is not None:
+                return found
     return None
 
 
