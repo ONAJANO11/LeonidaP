@@ -6928,12 +6928,12 @@ class Gen:
             except ValueError:
                 raise Unsupported(f"{op} offset:{inst[0]}") from None
         reg = None
+        const_off = 0
         off_val = self.imm_val(off)
         if off["k"] == "imm":
             imm = off["v"]                              # immediate-only form
         elif off_val is not None:
-            off_trunc = off_val & ~3
-            imm = (imm & ~3) + off_trunc
+            const_off = off_val & 0xFFFFFFFC            # zext(sOFF & ~3), as the run-time path below
         else:
             reg = self.src_u(off)
         if sbuf:
@@ -6941,6 +6941,9 @@ class Gen:
         else:
             imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
         imm &= ~3                                       # two's complement: -1 -> -4, -6 -> -8
+        # A constant sOFF is added after the immediate is normalised and in 64 bits, as the run-time path does: a
+        # 32-bit sum would wrap 0xFFFFFFFC + 20 to 16, an in-bounds read where RDNA2 reads 0 (SHADER-328).
+        imm += const_off
         # Byte offset from the 4-truncated base, in 64 bits: zext(sOFF & ~3) + imm, or the constant alone.
         if reg is not None:
             r4, r64 = self.tmp(), self.tmp()
