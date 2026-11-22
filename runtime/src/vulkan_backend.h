@@ -818,27 +818,31 @@ public:
     }
 
     void remove_resource(ResourceId id) {
-        VkImage img = VK_NULL_HANDLE;
-        {
-            std::unique_lock rlock(resource_mutex_);
-            const auto it = resources_.find(id);
-            if (it == resources_.end()) return;
-            img = it->second.image;
-            resources_.erase(it);
-        }
+        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Hold resource_mutex_ and tracker_mutex_ together so:
+        //   1. No concurrent add_resource(id) on a reused ResourceId can slip between erasing resources_[id] and
+        //      forgetting tracker_[id] (ABA loss of LayoutTracker state).
+        //   2. Any in-flight VulkanQueue::execute() that already unlocked resource_mutex_ finishes submit() and
+        //      record_submit_locked() before cached VkImageViews are stamped for deferred destruction.
+        std::unique_lock rlock(resource_mutex_);
+        std::lock_guard tlock(tracker_mutex_);
+        const auto it = resources_.find(id);
+        if (it == resources_.end()) return;
+        const VkImage img = it->second.image;
+        resources_.erase(it);
+        tracker_.forget(id);
+        std::vector<VkImageView> views_to_retire;
         if (img) {
             std::lock_guard vlock(views_mutex_);
-            for (auto v = views_.begin(); v != views_.end();) {
-                if (std::get<0>(v->first) == img) {
-                    defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
-                    v = views_.erase(v);
-                } else {
-                    ++v;
-                }
+            const auto first = std::make_tuple(img, VkImageAspectFlags{0}, std::uint32_t{0}, std::uint32_t{0},
+                                               std::uint32_t{0}, VK_FORMAT_UNDEFINED);
+            for (auto v = views_.lower_bound(first); v != views_.end() && std::get<0>(v->first) == img;) {
+                views_to_retire.push_back(v->second);
+                v = views_.erase(v);
             }
         }
-        std::lock_guard tlock(tracker_mutex_);
-        tracker_.forget(id);
+        for (const VkImageView view : views_to_retire)
+            defer_destroy(DeferredDeletionQueue::Kind::image_view, view);
     }
 
     // A query heap, by its stable ID (the COM query heap pointer). The pool stays the caller's to destroy, after
