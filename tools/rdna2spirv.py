@@ -1854,9 +1854,9 @@ class Gen:
             return addr, d3, in_b, (check if mode in (None, 0, 3) else None)
         return addr, d3, in_b
 
-    def buffer_store(self, op, a, mods):
-        """buffer_store_dword[xN] (raw) and buffer_store_format_* (f32 formats stored raw, f16x2/x4, unorm8x4).
-        Only active lanes store, inside a structured if."""
+    def buffer_store(self, op, a, mods, fixed_fmt=None):
+        """buffer_store_dword[xN] (raw) and buffer_store_format_* / tbuffer_store_format_*
+        (f32 formats stored raw, f16x2/x4, unorm8x4). Only active lanes store, inside a structured if."""
         if any(m in mods for m in ("lds", "tfe", "d16")):
             raise Unsupported(op + " form")
         d16 = "_d16_" in op
@@ -1865,7 +1865,11 @@ class Gen:
         if dword_store:
             addr, d3, in_b, per = self.buffer_address(a, mods, parts=True)
         else:
-            addr, d3, in_b = self.buffer_address(a, mods, elem="fmt")
+            if fixed_fmt is not None:
+                self.fixed_format_codes.add(fixed_fmt)
+            else:
+                self.dynamic_format = True
+            addr, d3, in_b = self.buffer_address(a, mods, elem="fmt", fixed_fmt=fixed_fmt)
             per = None
         if dword_store:
             n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -1890,8 +1894,11 @@ class Gen:
             else:
                 comps = [self.load_reg("vgpr", vd["r"] + i) for i in range(n)]
                 icomps = comps
-            fmt = self.tmp()
-            self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+            if fixed_fmt is not None:
+                fmt = self.cu(fixed_fmt)
+            else:
+                fmt = self.tmp()
+                self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
             # Encodings for the formats that appear in store-heavy shaders; others store nothing.
             f32 = {22: 1, 64: 2, 74: 3, 77: 4}
             # Float views of the components, computed before any branch so every branch can use them.
@@ -1941,13 +1948,7 @@ class Gen:
                 self.emit(f"{nan} = OpIsNan %bool {float_value}")
                 self.emit(f"{value} = OpSelect %uint {nan} {self.cu(0)} {component}")
                 normalized.append(value)
-            for code, (size, kind, widths) in self.FORMATS.items():
-                e = self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
-                ld, le = self.tmp() + "_s", self.tmp() + "_se"
-                self.emit(f"OpSelectionMerge {le} None")
-                self.emit(f"OpBranchConditional {e} {ld} {le}")
-                self.emit(f"{ld} = OpLabel")
+            def emit_store_for_format(code, size, kind, widths):
                 ncomp = min(len(widths), n)
                 source = normalized if kind in ("unorm", "snorm") else fc
                 fcs = source[:ncomp] + [self.cu(0)] * (len(widths) - ncomp)
@@ -1980,8 +1981,22 @@ class Gen:
                     self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
                     self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
                     self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
-                self.emit(f"OpBranch {le}")
-                self.emit(f"{le} = OpLabel")
+
+            if fixed_fmt is not None:
+                if fixed_fmt in self.FORMATS:
+                    size, kind, widths = self.FORMATS[fixed_fmt]
+                    emit_store_for_format(fixed_fmt, size, kind, widths)
+            else:
+                for code, (size, kind, widths) in self.FORMATS.items():
+                    e = self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {fmt} {self.cu(code)}")
+                    ld, le = self.tmp() + "_s", self.tmp() + "_se"
+                    self.emit(f"OpSelectionMerge {le} None")
+                    self.emit(f"OpBranchConditional {e} {ld} {le}")
+                    self.emit(f"{ld} = OpLabel")
+                    emit_store_for_format(code, size, kind, widths)
+                    self.emit(f"OpBranch {le}")
+                    self.emit(f"{le} = OpLabel")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
 
@@ -3961,6 +3976,15 @@ class Gen:
                                                             "buffer_store_format_d16_x", "buffer_store_format_d16_xy",
                                                             "buffer_store_format_d16_xyz", "buffer_store_format_d16_xyzw"):
             self.buffer_store(op, a, mods)
+        elif op in ("tbuffer_store_format_x", "tbuffer_store_format_xy", "tbuffer_store_format_xyz",
+                    "tbuffer_store_format_xyzw", "tbuffer_store_format_d16_x", "tbuffer_store_format_d16_xy",
+                    "tbuffer_store_format_d16_xyz", "tbuffer_store_format_d16_xyzw"):
+            fm = next((m for m in mods if m.startswith("format:")), "format:[BUF_FMT_8_UNORM]")
+            name = "GFX10_FORMAT_" + fm.split("BUF_FMT_")[-1].rstrip("]")
+            code = next((c for c, n in GFX10_FORMATS.items() if n == name), None)
+            if code is None or code not in self.FORMATS:
+                raise Unsupported(op + " " + name)
+            self.buffer_store(op[1:], a, mods, fixed_fmt=code)
         elif op in ("v_permlanex16_b32", "v_permlane16_b32"):
             # Lane l reads lane sel[l & 15] of (x16: the other 16-lane half of its row; plain: the same half).
             # The 4-bit selectors for lanes 0-7 are in src1, for lanes 8-15 in src2.
@@ -8406,7 +8430,7 @@ def read_before_write_vgprs(insns):
         a, op = ins["args"], ins["op"]
         if not a:
             continue
-        reads_all = op.startswith(("exp", "buffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
+        reads_all = op.startswith(("exp", "buffer_store", "tbuffer_store", "image_store", "v_cmp", "v_cmpx", "ds_write", "global_store"))
         regs = []
         for x in (a if reads_all else a[1:]):
             if x["k"] == "vgpr":

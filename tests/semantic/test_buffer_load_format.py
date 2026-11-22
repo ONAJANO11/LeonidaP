@@ -265,6 +265,77 @@ class TbufferDefaultFormat(unittest.TestCase):
             self.tload(0, 1, " format:[BUF_FMT_INVALID]")
 
 
+def store_format(fmt: int, offset: int, values: list[int], ncomp: int = 4,
+                 memory: dict | None = None, d16: bool = False, *, op: str = "tbuffer_store_format",
+                 mods: str = "") -> dict:
+    if _TMP_DIR is None:
+        setUpModule()
+    suffix = ("d16_" if d16 else "") + "xyzw"[:ncomp]
+    nregs = (ncomp + 1) // 2 if d16 else ncomp
+    vdata = "v2" if nregs == 1 else f"v[2:{1 + nregs}]"
+    init_regs = [f"\tv_mov_b32 v{2 + i}, {values[i]:#x}\n" for i in range(nregs)]
+    asm = (
+        "; test_tbuffer_store_format\n"
+        f"\ts_mov_b32 s0, {BASE:#x}\n"
+        "\ts_mov_b32 s1, 0\n"                  # base high bits 0, stride 0 (raw)
+        "\ts_mov_b32 s2, 0x100\n"              # num_records (bytes)
+        f"\ts_mov_b32 s3, {fmt << 12 | 0x30000000:#x}\n"
+        f"\tv_mov_b32 v1, {offset:#x}\n"
+        + "".join(init_regs)
+        + f"\t{op}_{suffix} {vdata}, v1, s[0:3], 0{mods} offen\n"
+        "\ts_waitcnt vmcnt(0)\n"
+        "\ts_endpgm\n"
+    )
+    with open(_SRC_PATH, "w", encoding="utf-8") as f:
+        f.write(asm)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        spv = rdna2spirv.translate(_SRC_PATH)
+    mem = dict(memory if memory is not None else {})
+    si.run_fragment(spv, memory=mem)
+    return mem
+
+
+class TbufferStoreTests(unittest.TestCase):
+    def test_default_format_8_unorm_atomic_merge(self):
+        # BUF_FMT_8_UNORM stores float into a 1-byte unorm channel via atomic merge
+        # 1.0 (0x3F800000) encodes to 0xFF.
+        # Initial memory: BASE is 0x11223344. Offset 0 should replace byte 0 with 0xFF: 0x112233FF.
+        mem = store_format(FMT_U32, 0, [0x3F800000], ncomp=1, memory={BASE: 0x11223344})
+        self.assertEqual(mem.get(BASE), 0x112233FF)
+
+    def test_explicit_uint8x4_store(self):
+        # 4 components of uint8 stored into 1 dword
+        mem = store_format(FMT_U32, 4, [1, 2, 3, 4], ncomp=4,
+                           mods=" format:[BUF_FMT_8_8_8_8_UINT]")
+        self.assertEqual(mem.get(BASE + 4), 0x04030201)
+
+    def test_explicit_u32x2_store(self):
+        mem = store_format(FMT_U32, 0, [0xDEADBEEF, 0xCAFEF00D], ncomp=2,
+                           mods=" format:[BUF_FMT_32_32_UINT]")
+        self.assertEqual(mem.get(BASE), 0xDEADBEEF)
+        self.assertEqual(mem.get(BASE + 4), 0xCAFEF00D)
+
+    def test_d16_store_xyzw(self):
+        # Packed d16 stores 4 components in 2 registers.
+        # BUF_FMT_16_16_16_16_UINT:
+        # v2 = 0x00020001 (x=1, y=2), v3 = 0x00040003 (z=3, w=4)
+        mem = store_format(FMT_U32, 0, [0x00020001, 0x00040003], ncomp=4, d16=True,
+                           mods=" format:[BUF_FMT_16_16_16_16_UINT]")
+        self.assertEqual(mem.get(BASE), 0x00020001)
+        self.assertEqual(mem.get(BASE + 4), 0x00040003)
+
+    def test_out_of_bounds_store_is_dropped(self):
+        # num_records is 0x100 (256 bytes). Storing at offset 0x200 should be dropped.
+        mem = store_format(FMT_U32, 0x200, [0xDEADBEEF], ncomp=1,
+                           mods=" format:[BUF_FMT_32_UINT]", memory={BASE: 0x11223344})
+        self.assertEqual(mem, {BASE: 0x11223344})
+
+    def test_explicit_invalid_format_rejected(self):
+        with self.assertRaises(rdna2spirv.Unsupported):
+            store_format(FMT_U32, 0, [0], ncomp=1, mods=" format:[BUF_FMT_INVALID]")
+
+
 class InterpreterConversions(unittest.TestCase):
     """The ops the format decode needs from spirv_mini_interp: integer to float and GLSL FMin/FMax."""
 
