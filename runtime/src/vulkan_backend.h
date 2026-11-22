@@ -58,7 +58,8 @@ struct VulkanDeviceFunctions {
     X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
     X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                  \
+    X(vkCmdFillBuffer)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -152,6 +153,14 @@ public:
         std::lock_guard lock(mutex_);
         resources_[id] = binding;
     }
+    // A device-local buffer D3D12 says starts zeroed (D3D-71): the host cannot write it, so the next submission on
+    // any queue fills it with zeros before its own commands. The application cannot have used the buffer in an
+    // earlier one, since it did not exist yet.
+    void zero_on_next_submit(ResourceId id, VkBuffer buffer, VkDeviceSize size) {
+        std::lock_guard lock(mutex_);
+        pending_zero_.push_back({id, buffer, size});
+    }
+
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::lock_guard lock(mutex_);
         resources_[id] = binding;
@@ -171,7 +180,21 @@ public:
             }
         }
         tracker_.forget(id);
+        std::erase_if(pending_zero_, [id](const PendingZero& zero) { return zero.id == id; });
         resources_.erase(it);
+    }
+
+    // Records the pending zero fills, then a barrier so every later command sees them. mutex_ held.
+    void record_pending_zero(VkCommandBuffer command_buffer) {
+        if (pending_zero_.empty()) return;
+        for (const PendingZero& zero : pending_zero_)
+            vk.vkCmdFillBuffer(command_buffer, zero.buffer, 0, VK_WHOLE_SIZE, 0);
+        pending_zero_.clear();
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                1, &barrier, 0, nullptr, 0, nullptr);
     }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
@@ -238,6 +261,12 @@ private:
     VkDevice device_;
     bool loaded_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
+    struct PendingZero {
+        ResourceId id;
+        VkBuffer buffer;
+        VkDeviceSize size;
+    };
+    std::vector<PendingZero> pending_zero_;  // zero_on_next_submit
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
@@ -343,6 +372,7 @@ public:
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
+        context_.record_pending_zero(command_buffer);
         for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
