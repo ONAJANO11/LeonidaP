@@ -1146,6 +1146,11 @@ def run_suite(a, work: str) -> int:
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
                 "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3E00, 0xAAAA0000, 0xAAAA4000),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
+                # sum-of-absolute-differences family and v_lerp_u8 (.asm headers)
+                "ps_sad": (0x4000010D, 0x00FDABCD, 0x40000004, 0x2DCBA989),
+                "ps_msad_lerp": (0x4000000E, 0x3F80004D, 0xFF7F0380, 0x00FE3BE9),
+                "ps_qsad": (0x01D500FB, 0x01FE0119, 0x01D0000B, 0x00FF0099),
+                "ps_mqsad_u32": (0x4000000B, 0x010001CE, 0xC0000099, 0x123457D7),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
                 "ps_interp_mov_mods": (0x3F800000, 0x3FC00000, 0x40000000, 0x3F400000),
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)

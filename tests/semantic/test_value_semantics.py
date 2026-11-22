@@ -76,6 +76,12 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# Sum-of-absolute-differences family and v_lerp_u8 (derivations in the .asm headers; a word below 2^23 is XORed with
+# 0x40000000 there so the float render target keeps it).
+EXPECTED_SAD = [0x4000010D, 0x00FDABCD, 0x40000004, 0x2DCBA989]
+EXPECTED_MSAD_LERP = [0x4000000E, 0x3F80004D, 0xFF7F0380, 0x00FE3BE9]
+EXPECTED_QSAD = [0x01D500FB, 0x01FE0119, 0x01D0000B, 0x00FF0099]
+EXPECTED_MQSAD_U32 = [0x4000000B, 0x010001CE, 0xC0000099, 0x123457D7]
 
 
 def _f32_bits(x):
@@ -293,6 +299,58 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def _lanes(x, width):
+    """The unsigned lanes of a 32-bit word, lowest first."""
+    return [(x >> o) & ((1 << width) - 1) for o in range(0, 32, width)]
+
+
+def _sad(x, y, width, masked=False):
+    """Sum over the lanes of |x - y|, unsigned; masked skips a lane where y's lane is 0 (v_msad_u8)."""
+    return sum(abs(a - b) for a, b in zip(_lanes(x, width), _lanes(y, width)) if not (masked and b == 0))
+
+
+def _window(s0, k):
+    """Bytes k..k+3 of the 64-bit S0 (S0[8k+31:8k]), the k-th window of v_qsad / v_mqsad."""
+    return (s0 >> (8 * k)) & 0xFFFFFFFF
+
+
+def reference_sad():
+    m, mark = 0xFFFFFFFF, 0x40000000
+    return [((0xFFFFFF00 + _sad(0x80FF0170, 0x7F00FE80, 8)) & m) ^ mark,
+            (0xFEF0ABCD + (_sad(0x80FF0170, 0x7F00FE80, 8) << 16)) & m,
+            ((0xFFFE8005 + _sad(0x0001C000, 0xFFFF3FFF, 16)) & m) ^ mark,
+            (0x80000000 + abs(0x12345678 - 0xC0000001)) & m]
+
+
+def reference_msad_lerp():
+    m = 0xFFFFFFFF
+
+    def lerp(x, y, z):
+        return sum(((a + b + (c & 1)) >> 1) << (8 * i)
+                   for i, (a, b, c) in enumerate(zip(_lanes(x, 8), _lanes(y, 8), _lanes(z, 8))))
+    return [((0xFFFFFF80 + _sad(0x40C00033, 0x00FF0280, 8, masked=True)) & m) ^ 0x40000000,
+            (0x3F800000 + _sad(0x11223344, 0x00008000, 8, masked=True)) & m,
+            lerp(0xFF80017F, 0xFF7F0480, 0x01FE0301),
+            lerp(0x00FE33F1, 0x01FF44E0, 1)]
+
+
+QSAD_S0, QSAD_S1 = 0x337F00FF_8005F010, 0x7FFF0020
+
+
+def reference_qsad():
+    def qsad(masked, s2):
+        lanes = [((s2 >> (16 * k)) + _sad(_window(QSAD_S0, k), QSAD_S1, 8, masked)) & 0xFFFF for k in range(4)]
+        return [lanes[0] | lanes[1] << 16, lanes[2] | lanes[3] << 16]
+    s2 = 0xFFA0FFFF_0001FF00
+    return qsad(False, s2) + qsad(True, s2)
+
+
+def reference_mqsad_u32():
+    s2 = (0xFFFFFF00, 0x00FFFFFF, 0xBFFFFFFF, 0x12345678)
+    d = [(s2[k] + _sad(_window(QSAD_S0, k), QSAD_S1, 8, masked=True)) & 0xFFFFFFFF for k in range(4)]
+    return [d[0] ^ 0x40000000] + d[1:]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -342,6 +400,10 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_sad(), EXPECTED_SAD)
+        self.assertEqual(reference_msad_lerp(), EXPECTED_MSAD_LERP)
+        self.assertEqual(reference_qsad(), EXPECTED_QSAD)
+        self.assertEqual(reference_mqsad_u32(), EXPECTED_MQSAD_U32)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -477,6 +539,24 @@ class TranslatorValueSemantics(unittest.TestCase):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+    def test_sad_u8_hi_u16_u32_unsigned_and_wrapping(self):
+        # Every byte or half of S0/S1 differs, signed lanes would give other sums, and every S2 carries out of bit 31.
+        self.check("ps_sad", EXPECTED_SAD)
+
+    def test_msad_u8_masks_on_s1_and_lerp_u8_rounds_from_s2_bit0(self):
+        # v_msad_u8 skips the byte where S1 (not S0) is 0; v_lerp_u8 takes only bit 0 of each S2 byte and keeps the
+        # ninth bit of 0xff + 0xff + 1 before the shift; the second lerp reads an SGPR and an inline S2.
+        self.check("ps_msad_lerp", EXPECTED_MSAD_LERP)
+
+    def test_qsad_pk_and_mqsad_pk_slide_over_a_64_bit_s0(self):
+        # Four windows of the 64-bit VGPR pair against S1, each added to its own u16 of the 64-bit S2, wrapping at
+        # 16 bits without a carry into the next lane; the m form skips the byte where S1 is 0.
+        self.check("ps_qsad", EXPECTED_QSAD)
+
+    def test_mqsad_u32_has_four_32_bit_accumulators(self):
+        # The 128-bit S2 and D: each window's masked SAD lands in its own dword, wrapping at 32 bits, not 16.
+        self.check("ps_mqsad_u32", EXPECTED_MQSAD_U32)
 
 
 class ReadLog(dict):

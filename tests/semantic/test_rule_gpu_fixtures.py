@@ -23,7 +23,7 @@ import support  # noqa: E402
 import check    # noqa: E402  (runtime/test/shaders/check.py; importing it runs nothing)
 
 FIXTURES = ("ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods",
-            "ps_interp_mov_mods")
+            "ps_interp_mov_mods", "ps_sad", "ps_msad_lerp", "ps_qsad", "ps_mqsad_u32")
 INTERP_VERTEX = "vs_interp_consts"
 INLINE_F32 = {"0.5": 0x3F000000, "-0.5": 0xBF000000, "1.0": 0x3F800000, "-1.0": 0xBF800000, "2.0": 0x40000000,
               "-2.0": 0xC0000000, "4.0": 0x40800000, "-4.0": 0xC0800000, "0.25": 0x3E800000, "-0.25": 0xBE800000}
