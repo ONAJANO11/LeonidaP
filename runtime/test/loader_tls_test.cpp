@@ -307,36 +307,93 @@ void test_thread_outlives_loader(const fs::path& dll) {
           "its copy is freed when it ends after the Loader, with no callback into the unmapped image");
 }
 
-void test_second_tls_module_rejected(const fs::path& dll, const fs::path& temp) {
-    std::printf("\n-- one mapped TLS module at a time --\n");
-    const fs::path copy = temp / "tiny_tls_second.dll";
+void test_multiple_tls_modules(const fs::path& dll, const fs::path& temp) {
+    std::printf("\n-- multiple simultaneous mapped TLS modules --\n");
+    const fs::path copy2 = temp / "tiny_tls_second.dll";
+    const fs::path copy3 = temp / "tiny_tls_third.dll";
     // CopyFileW, not fs::copy_file: MSVC's copy_file calls CopyFile2, which Wine 9 doesn't implement.
-    check(CopyFileW(dll.c_str(), copy.c_str(), FALSE) != 0, "copied the TLS fixture under a second name");
+    check(CopyFileW(dll.c_str(), copy2.c_str(), FALSE) != 0, "copied the TLS fixture under a second name");
+    check(CopyFileW(dll.c_str(), copy3.c_str(), FALSE) != 0, "copied the TLS fixture under a third name");
 
     {
         rt::Loader loader(dll.parent_path());
         rt::Module& first = loader.load(dll);
-        check(first.tls_index != rt::kNoTlsIndex, "the first TLS module is initialized");
+        rt::Module& second = loader.load(copy2);
+        rt::Module& third = loader.load(copy3);
+        loader.initialise();
 
-        bool rejected = false;
-        std::string message;
-        try {
-            loader.load(copy);
-        } catch (const std::runtime_error& e) {
-            rejected = true;
-            message = e.what();
-        }
-        check(rejected, "a second mapped module with TLS is rejected instead of sharing a slot");
-        check(message.find("only one manually mapped module") != std::string::npos,
-              "the rejection explains the one-module TLS limit");
+        check(first.tls_index != rt::kNoTlsIndex && second.tls_index != rt::kNoTlsIndex &&
+                  third.tls_index != rt::kNoTlsIndex,
+              "all three simultaneous TLS modules receive reserved module TLS indices");
+        check(first.tls_index != second.tls_index && first.tls_index != third.tls_index &&
+                  second.tls_index != third.tls_index,
+              "each simultaneous TLS module gets a distinct OS module TLS index");
+
+        auto get1 = find_export<int(__cdecl*)()>(first, "tiny_tls_get");
+        auto set1 = find_export<void(__cdecl*)(int)>(first, "tiny_tls_set");
+        auto get2 = find_export<int(__cdecl*)()>(second, "tiny_tls_get");
+        auto set2 = find_export<void(__cdecl*)(int)>(second, "tiny_tls_set");
+        auto get3 = find_export<int(__cdecl*)()>(third, "tiny_tls_get");
+        auto set3 = find_export<void(__cdecl*)(int)>(third, "tiny_tls_set");
+        auto cb1 = find_export<int(__cdecl*)()>(first, "tiny_tls_callback_count");
+        auto cb2 = find_export<int(__cdecl*)()>(second, "tiny_tls_callback_count");
+        auto cb3 = find_export<int(__cdecl*)()>(third, "tiny_tls_callback_count");
+
+        check(get1() == 7 && get2() == 7 && get3() == 7, "all three modules start from their template value 7");
+        set1(101);
+        set2(202);
+        set3(303);
+        check(get1() == 101 && get2() == 202 && get3() == 303,
+              "writes to each module's TLS slot stay isolated on the main thread");
+
+        // A worker thread started after load() must get its own fresh template copies for all three modules and run
+        // DLL_THREAD_ATTACH / DLL_THREAD_DETACH callbacks on all three.
+        struct WorkerCtx {
+            int(__cdecl* get1)();
+            void(__cdecl* set1)(int);
+            int(__cdecl* get2)();
+            void(__cdecl* set2)(int);
+            int(__cdecl* get3)();
+            void(__cdecl* set3)(int);
+            int init1 = 0, init2 = 0, init3 = 0;
+            int after1 = 0, after2 = 0, after3 = 0;
+        };
+        WorkerCtx ctx{get1, set1, get2, set2, get3, set3};
+        HANDLE thread = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto* c = static_cast<WorkerCtx*>(p);
+                c->init1 = c->get1();
+                c->init2 = c->get2();
+                c->init3 = c->get3();
+                c->set1(1111);
+                c->set2(2222);
+                c->set3(3333);
+                c->after1 = c->get1();
+                c->after2 = c->get2();
+                c->after3 = c->get3();
+                return 0;
+            },
+            &ctx, 0, nullptr);
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+
+        check(ctx.init1 == 7 && ctx.init2 == 7 && ctx.init3 == 7,
+              "worker thread receives fresh template copies for all three modules");
+        check(ctx.after1 == 1111 && ctx.after2 == 2222 && ctx.after3 == 3333,
+              "worker thread writes stay isolated across all three modules");
+        check(get1() == 101 && get2() == 202 && get3() == 303,
+              "main thread TLS values are untouched by the worker thread");
+        check(cb1() >= 3 && cb2() >= 3 && cb3() >= 3,
+              "all three modules received process attach, thread attach, and thread detach callbacks");
     }
 
-    // After the first loader restores its slot, the copy loads normally.
+    // After the loader is destroyed, all slots are released and reusable.
     {
-        rt::Loader loader(copy.parent_path());
-        rt::Module& m = loader.load(copy);
-        check(m.tls_index != rt::kNoTlsIndex, "the copied TLS module loads after the first loader is destroyed");
-        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "the copied module reads its template value");
+        rt::Loader loader(copy2.parent_path());
+        rt::Module& m = loader.load(copy2);
+        check(m.tls_index != rt::kNoTlsIndex, "slots are reusable after the first loader is destroyed");
+        check(find_export<int(__cdecl*)()>(m, "tiny_tls_get")() == 7, "the reloaded module reads its template value");
     }
 }
 
@@ -370,7 +427,7 @@ int main(int argc, char** argv) {
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);
-        test_second_tls_module_rejected(tls_dll, temp.path);
+        test_multiple_tls_modules(tls_dll, temp.path);
     } catch (const std::exception& e) {
         ++g_checks;
         ++g_failures;
