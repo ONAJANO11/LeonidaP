@@ -2,9 +2,8 @@ name: Sincronizar con repositorio original
 
 on:
   schedule:
-    # Se ejecuta automáticamente todos los días a las 00:00 UTC
     - cron: '*/5 * * * *'
-  workflow_dispatch: # Añade un botón para poder ejecutarlo manualmente cuando quieras
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,7 +21,15 @@ jobs:
         run: |
           git config user.name "GitHub Action"
           git config user.email "action@github.com"
-          git remote add upstream https://github.com/USUARIO/REPOSITORIO.git
+          git remote add upstream https://github.com/ItsNotRexed/Leonida.git
           git fetch upstream
-          git merge upstream/main --no-edit --allow-unrelated-histories
-          git push origin main
+          git merge upstream/main --no-commit --no-ff --allow-unrelated-histories
+          git reset HEAD -- .github/workflows/
+          git checkout -- .github/workflows/
+          git clean -fd .github/workflows/
+          if ! git diff --cached --quiet; then
+            git commit -m "Sincronizar con repositorio original"
+            git push origin main
+          else
+            echo "No hay cambios nuevos que subir."
+          fi
