@@ -848,5 +848,129 @@ OpFunctionEnd
         self.assertIn("OpConvertPtrToU", str(ctx.exception))
 
 
+class SmemConstantOffsetWrapRegressionTests(unittest.TestCase):
+    """Regression tests for SHADER-328: constant SGPR offsets in scalar loads must not wrap modulo 2^32.
+
+    When an SGPR offset is a known constant (e.g. s_mov_b32 s8, -4 = 0xFFFFFFFC), adding it to an
+    immediate (e.g. offset:20) in 32 bits wraps to +16, reading in-bounds data where the run-time
+    path and RDNA2 hardware zero-extend the SGPR offset in 64 bits (0xFFFFFFFC + 20 = 4294967312),
+    exceeding NUM_RECORDS and reading 0.
+    """
+
+    VSHARP_BASE = 0x0000000200001000
+    POINTER = 0x0000000300000000
+
+    def test_s_buffer_load_negative_constant_offset_does_not_wrap(self):
+        # Reproduces Impre-visible's finding on main since #1686:
+        # V# base with NUM_RECORDS = 64; byte 16 contains 0x12345678.
+        # s_mov_b32 s8, -4 then s_buffer_load_dword s12, s[24:27], s8 offset:20
+        # The sum 0xFFFFFFFC + 20 in 64 bits is 4294967312 > 64, which must read 0.
+        bank = SmemMemoryBank()
+        bank.write_dword(self.VSHARP_BASE + 16, 0x12345678)
+
+        ins = parse_line("s_buffer_load_dword s12, s[24:27], s8 offset:20")
+        sgpr_vals = {24: 0x00001000, 25: 0x00000002, 26: 64, 27: 0x00140000, 8: 0xFFFFFFFC}
+
+        # 1. Constant folded path: s8 is tracked in sgpr_imm
+        g_const = rdna2spirv.Gen("ps")
+        g_const.sgpr_imm[24] = 0x00001000
+        g_const.sgpr_imm[25] = 0x00000002
+        g_const.sgpr_imm[26] = 64
+        g_const.sgpr_imm[27] = 0x00140000
+        g_const.sgpr_imm[8] = 0xFFFFFFFC
+        g_const.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_const = SmemBodyEvaluator(g_const, sgpr_vals, bank)
+        self.assertEqual(ev_const.reads, [], "Constant folded path should not issue PSB load for OOB offset")
+        self.assertEqual(ev_const.sgpr.get(12, 0), 0, "Constant folded path should yield 0 for OOB offset")
+
+        # 2. Dynamic run-time path: s8 is NOT in sgpr_imm
+        g_dyn = rdna2spirv.Gen("ps")
+        g_dyn.sgpr_imm[24] = 0x00001000
+        g_dyn.sgpr_imm[25] = 0x00000002
+        g_dyn.sgpr_imm[26] = 64
+        g_dyn.sgpr_imm[27] = 0x00140000
+        g_dyn.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_dyn = SmemBodyEvaluator(g_dyn, sgpr_vals, bank)
+        self.assertEqual(ev_dyn.reads, [], "Dynamic path should not issue PSB load for OOB offset")
+        self.assertEqual(ev_dyn.sgpr.get(12, 0), 0, "Dynamic path should yield 0 for OOB offset")
+
+    def test_s_buffer_load_in_bounds_constant_offset_matches_dynamic(self):
+        # In-bounds offset: s8 = 16, offset:20 -> total offset = 36.
+        # Both paths must read exactly at base + 36 and return the stored data.
+        bank = SmemMemoryBank()
+        bank.write_dword(self.VSHARP_BASE + 36, 0xCAFEBABE)
+
+        ins = parse_line("s_buffer_load_dword s12, s[24:27], s8 offset:20")
+        sgpr_vals = {24: 0x00001000, 25: 0x00000002, 26: 64, 27: 0x00140000, 8: 16}
+
+        # Constant folded path
+        g_const = rdna2spirv.Gen("ps")
+        g_const.sgpr_imm[24] = 0x00001000
+        g_const.sgpr_imm[25] = 0x00000002
+        g_const.sgpr_imm[26] = 64
+        g_const.sgpr_imm[27] = 0x00140000
+        g_const.sgpr_imm[8] = 16
+        g_const.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_const = SmemBodyEvaluator(g_const, sgpr_vals, bank)
+        self.assertEqual(ev_const.reads, [self.VSHARP_BASE + 36])
+        self.assertEqual(ev_const.sgpr.get(12, 0), 0xCAFEBABE)
+
+        # Dynamic path
+        g_dyn = rdna2spirv.Gen("ps")
+        g_dyn.sgpr_imm[24] = 0x00001000
+        g_dyn.sgpr_imm[25] = 0x00000002
+        g_dyn.sgpr_imm[26] = 64
+        g_dyn.sgpr_imm[27] = 0x00140000
+        g_dyn.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_dyn = SmemBodyEvaluator(g_dyn, sgpr_vals, bank)
+        self.assertEqual(ev_dyn.reads, [self.VSHARP_BASE + 36])
+        self.assertEqual(ev_dyn.sgpr.get(12, 0), 0xCAFEBABE)
+
+    def test_s_buffer_load_negative_constant_offset_dynamic_descriptor(self):
+        # When descriptor bounds are dynamic (V# not in sgpr_imm), constant s8 = -4
+        # with offset:20 must still evaluate dynamically to out-of-bounds without reading memory.
+        bank = SmemMemoryBank()
+        bank.write_dword(self.VSHARP_BASE + 16, 0x12345678)
+
+        ins = parse_line("s_buffer_load_dword s12, s[24:27], s8 offset:20")
+        sgpr_vals = {24: 0x00001000, 25: 0x00000002, 26: 64, 27: 0x00140000, 8: 0xFFFFFFFC}
+
+        g = rdna2spirv.Gen("ps")
+        # Descriptor is NOT in sgpr_imm (dynamic limit)
+        g.sgpr_imm[8] = 0xFFFFFFFC
+        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev = SmemBodyEvaluator(g, sgpr_vals, bank)
+        self.assertEqual(ev.reads, [])
+        self.assertEqual(ev.sgpr.get(12, 0), 0)
+
+    def test_s_load_large_constant_offset_does_not_mask_bits(self):
+        # s_load_dword with s8 >= 2^20: the 21-bit immediate sign extension must not
+        # truncate the constant SGPR offset.
+        bank = SmemMemoryBank()
+        bank.write_dword(self.POINTER + 0x200014, 0xDEADBEEF)
+
+        ins = parse_line("s_load_dword s12, s[24:25], s8 offset:20")
+        sgpr_vals = {24: 0x00000000, 25: 0x00000003, 8: 0x200000}
+
+        # Constant path
+        g_const = rdna2spirv.Gen("ps")
+        g_const.sgpr_imm[24] = 0x00000000
+        g_const.sgpr_imm[25] = 0x00000003
+        g_const.sgpr_imm[8] = 0x200000
+        g_const.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_const = SmemBodyEvaluator(g_const, sgpr_vals, bank)
+        self.assertEqual(ev_const.reads, [self.POINTER + 0x200014])
+        self.assertEqual(ev_const.sgpr.get(12, 0), 0xDEADBEEF)
+
+        # Dynamic path
+        g_dyn = rdna2spirv.Gen("ps")
+        g_dyn.sgpr_imm[24] = 0x00000000
+        g_dyn.sgpr_imm[25] = 0x00000003
+        g_dyn.scalar_load(ins["op"], ins["args"], ins["mods"])
+        ev_dyn = SmemBodyEvaluator(g_dyn, sgpr_vals, bank)
+        self.assertEqual(ev_dyn.reads, [self.POINTER + 0x200014])
+        self.assertEqual(ev_dyn.sgpr.get(12, 0), 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()

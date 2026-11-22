@@ -6931,16 +6931,24 @@ class Gen:
         off_val = self.imm_val(off)
         if off["k"] == "imm":
             imm = off["v"]                              # immediate-only form
-        elif off_val is not None:
-            off_trunc = off_val & ~3
-            imm = (imm & ~3) + off_trunc
+            if sbuf:
+                imm &= 0xFFFFFFFF                       # unsigned (measured up to 0xffffc)
+            else:
+                imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
+            imm &= ~3                                   # two's complement: -1 -> -4, -6 -> -8
+            total_off = imm
         else:
-            reg = self.src_u(off)
-        if sbuf:
-            imm &= 0xFFFFFFFF                           # unsigned (measured up to 0xffffc)
-        else:
-            imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
-        imm &= ~3                                       # two's complement: -1 -> -4, -6 -> -8
+            if sbuf:
+                imm &= 0xFFFFFFFF                       # unsigned (measured up to 0xffffc)
+            else:
+                imm = ((imm & 0x1FFFFF) ^ 0x100000) - 0x100000   # 21-bit signed
+            imm &= ~3                                   # two's complement: -1 -> -4, -6 -> -8
+            if off_val is not None:
+                soff_u = (off_val & 0xFFFFFFFF) & ~3
+                total_off = soff_u + imm
+            else:
+                reg = self.src_u(off)
+                total_off = None
         # Byte offset from the 4-truncated base, in 64 bits: zext(sOFF & ~3) + imm, or the constant alone.
         if reg is not None:
             r4, r64 = self.tmp(), self.tmp()
@@ -6952,7 +6960,7 @@ class Gen:
             else:
                 o64 = r64
         else:
-            o64 = self.cl(imm)
+            o64 = self.cl(total_off)
         lo4, l64, h64, sh, addr, full = (self.tmp() for _ in range(6))
         self.emit(f"{lo4} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFFFFFC)}")
         self.emit(f"{l64} = OpUConvert %ulong {lo4}")
@@ -6988,7 +6996,7 @@ class Gen:
                 self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                 self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
             elif lim_val is not None and reg is None:
-                end_val = imm + 4 * i + 4
+                end_val = total_off + 4 * i + 4
                 if lim_val >= end_val:
                     self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
@@ -7001,7 +7009,7 @@ class Gen:
                 if reg is not None:
                     self.emit(f"{end} = OpIAdd %ulong {o64} {self.cl(4 * i + 4)}")
                 else:
-                    end = self.cl(imm + 4 * i + 4)
+                    end = self.cl(total_off + 4 * i + 4)
                 self.emit(f"{ok} = OpUGreaterThanEqual %bool {lim} {end}")
                 pre = self.current_label_placeholder()
                 self.emit(f"OpSelectionMerge {lbl_end} None")
