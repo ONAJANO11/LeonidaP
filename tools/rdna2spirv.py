@@ -2812,7 +2812,7 @@ class Gen:
         if a["k"] == "special" and a["t"] in ("exec", "exec_lo", "exec_hi"):
             return self.exec_value()
         if a["k"] == "imm":
-            return self.cu(0xFFFFFFFF if a["v"] & 1 else 0)
+            return self.imm_mask_bit(a["v"])
         raise Unsupported("mask operand")
 
     def is_mask_op(self, x):
@@ -2837,6 +2837,33 @@ class Gen:
             raise Unsupported(op + " destination")
         self.store_reg("sgpr", d["r"], rlo)
         self.store_reg("sgpr", d["r"] + 1, rhi)
+
+    def imm_mask_bit(self, v):
+        """An immediate used as a lane mask: this lane's bit of it, as all ones or zero. Inline constants (-16..-1)
+        are sign-extended to the mask width, so -2 is every lane but lane 0. Until 2026-11-22 every lane took bit 0,
+        which is right only for 0 and -1: `s_mov_b64 exec, 1` left every lane on."""
+        width = 64 if self.wave64 else 32
+        bits = v & ((1 << width) - 1)
+        if bits in (0, (1 << width) - 1):
+            return self.cu(0xFFFFFFFF if bits else 0)
+        lane, word, sh, shifted, bit, r = (self.tmp() for _ in range(6))
+        self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+        if self.wave64:
+            lo = self.tmp()
+            self.emit(f"{lo} = OpULessThan %bool {lane} {self.cu(32)}")
+            self.emit(f"{word} = OpSelect %uint {lo} {self.cu(bits & 0xFFFFFFFF)} {self.cu(bits >> 32)}")
+        else:
+            self.emit(f"{word} = OpCopyObject %uint {self.cu(bits)}")
+        self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+        self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {sh}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
+        self.emit(f"{r} = OpISub %uint {self.cu(0)} {bit}")
+        return r
+
+    def imm64_words(self, v):
+        """An immediate read as 64-bit data: its low and high words, inline constants sign-extended."""
+        bits = v & ((1 << 64) - 1)
+        return self.cu(bits & 0xFFFFFFFF), self.cu(bits >> 32)
 
     def mask_dst(self, d, v):
         if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
@@ -3639,6 +3666,8 @@ class Gen:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
             elif op.endswith("b64") and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
                 lo, hi = self.load_reg("sgpr", a[1]["r"]), self.load_reg("sgpr", a[1]["r"] + 1)
+            elif op.endswith("b64") and a[1]["k"] == "imm":
+                lo, hi = self.imm64_words(a[1]["v"])
             else:
                 lo, hi = (self.mask_src(a[1]), self.cu(0)) if op.endswith("b64") else (self.src_u(a[1]), self.cu(0))
             if "bcnt0" in op:
@@ -3749,9 +3778,12 @@ class Gen:
                     half = self.mask_half(a[1])
                     if half is not None:
                         lo, hi = (hi if half == "hi" else lo), self.cu(0)
-            elif op.endswith("b32") or a[1]["k"] == "imm":
-                # A b32 source is a plain scalar value, not a lane mask; for b64 an immediate is the low word.
+            elif op.endswith("b32"):
+                # A b32 source is a plain scalar value, not a lane mask.
                 lo, hi = self.src_u(a[1]), self.cu(0)
+            elif a[1]["k"] == "imm":
+                # A b64 immediate is 64-bit data, its high word the sign extension (s_ff0_i32_b64 of -1 is -1).
+                lo, hi = self.imm64_words(a[1]["v"])
             elif a[1]["k"] != "sgpr" or a[1].get("n") != 2:
                 lo, hi = self.mask_src(a[1]), self.cu(0)
             else:
