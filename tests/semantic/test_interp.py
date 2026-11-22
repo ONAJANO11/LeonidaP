@@ -1,8 +1,14 @@
 """Self-tests for the mini SPIR-V interpreter, using hand-written modules and expectations taken from the SPIR-V
 and GLSL.std.450 specifications (not from the translator)."""
+import os
+import sys
 import unittest
 
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
 
 HEADER = """\
 OpCapability Shader

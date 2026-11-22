@@ -4,13 +4,19 @@ RDNA2 ISA reference guide (30-November-2020), 11.1 and 11.2.1: with VM set EXEC 
 sent is used, and an export to NULL may carry only the mask. Not measured on hardware; docs/design.md, EXEC.
 Hand-written programs, no tools needed.
 """
+import os
+import sys
 import unittest
 
-import support
-import rdna2spirv
-import shader_ir
-from spirv_mini_interp import run_fragment
-from spirv_wave_interp import run_wave
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
+import shader_ir  # noqa: E402
+from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_wave_interp import run_wave  # noqa: E402
 
 ONE = 0x3F800000
 SEED = [f"v_mov_b32_e32 v2, 0x{ONE:x}", "v_mov_b32_e32 v1, 1"]

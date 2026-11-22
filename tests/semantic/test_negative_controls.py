@@ -1,11 +1,17 @@
 """Negative controls: textually sabotage the translator's *output* and show the oracle notices.
 This proves the value checks are sensitive without touching the translator. (Mutations of the translator's own
 source are in test_mutations.py.)"""
+import os
+import sys
 import unittest
 
-import support
-import test_ps_semantics as sem
-import test_value_semantics as vals
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import test_ps_semantics as sem  # noqa: E402
+import test_value_semantics as vals  # noqa: E402
 
 CONTROLS = [
     # (shader, expected words, text to replace, replacement, what the sabotage models)

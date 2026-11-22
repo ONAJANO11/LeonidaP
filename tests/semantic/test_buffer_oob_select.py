@@ -14,12 +14,18 @@ hand from those rules (not computed), and every row runs twice: with word3 a lit
 word3 or-ed together at run time, which it selects with OpSelect. The multi-dword tail of RAW loads is in
 test_value_semantics.py (measured on an RX 6800); mode 0's is by analogy.
 """
+import os
 import re
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
-import test_value_semantics as tv         # module only: importing its classes would collect them a second time
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+import test_value_semantics as tv  # noqa: E402  # module only: importing its classes would collect them a second time
 
 BASE = tv.VEC_REGION
 OUT_V = 0x31016FAC                          # the output V# in s[0:3]: RAW, base 0

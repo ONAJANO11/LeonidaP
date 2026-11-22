@@ -24,11 +24,17 @@ inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
 """
+import os
 import struct
+import sys
 import unittest
 
-import support
-import rdna2spirv
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 # Barycentric weights of vertices 0, 1, 2 as Vulkan hands them over ((k, i, j); AMD's i, j are .y/.z).
 BARY = (0.25, 0.25, 0.5)

@@ -1,8 +1,13 @@
 """The committed fixtures are exactly what tests/semantic/regen_fixtures.py generates from the .asm sources."""
 import os
+import sys
 import unittest
 
-import regen_fixtures as rf
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import regen_fixtures as rf  # noqa: E402
 
 
 class FixtureTests(unittest.TestCase):

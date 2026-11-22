@@ -13,10 +13,16 @@ a plain-Python solve of the 2x2 system.
 
     python -m unittest tests/semantic/test_image_bvh_tri.py -v
 """
+import os
 import struct
+import sys
 import unittest
 
-from support import mrt0_words, translate_lines
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from support import mrt0_words, translate_lines  # noqa: E402
 
 INF = float("inf")
 SLOTS = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0.5, 2, 0)]

@@ -15,13 +15,19 @@ smooth inputs. Interpolating the decoded halves is the same P0 + i(P1 - P0) + j(
 The GPU check is runtime/test/shaders/ps_interp_f16_high drawn with vs_f16_pack, which run_gpu_tests.py translates
 with the flag where tools/vk_subgroup_info.py reports per_vertex_inputs false (MoltenVK).
 """
+import os
 import struct
+import sys
 import unittest
 
-import support
-import rdna2spirv
-from spirv_mini_interp import run_fragment
-from test_interp_f16_high import ATTR0, ATTR1, BARY, CTRL, HI, LO, SHADER
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
+from spirv_mini_interp import run_fragment  # noqa: E402
+from test_interp_f16_high import ATTR0, ATTR1, BARY, CTRL, HI, LO, SHADER  # noqa: E402
 
 
 def f32(w):

@@ -16,11 +16,17 @@ the andn2 ops is in test_andn2_exec_b64.py.
 The GPU test is runtime/test/shaders/cs_w64x_saveexec_b64.asm; its fixture also runs here. The --wave64-emulate
 output needs Workgroup memory, which the interpreter rejects, so it is covered by the GPU test only.
 """
+import os
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 VSHARP = [0, 0, 0x1000, 0x31016FAC]
 ALL64 = (1 << 64) - 1

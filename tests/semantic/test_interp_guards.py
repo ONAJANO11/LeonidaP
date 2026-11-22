@@ -25,11 +25,17 @@ so anything else is refused instead of silently translating wrong (docs/design.m
 On main (before the guards) the refused cases translated silently and passed spirv-val: the operand
 was ignored outright, so a second-pair I/J produced the very module of the standard pair.
 """
+import os
 import struct
+import sys
 import unittest
 
-import support
-import rdna2spirv
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 ATTR0 = (0.5, 0.25, 0.0, 1.0)
 FLAT_ATTR1_X = 0x101          # attr1.x read through v_interp_mov only: the provoking vertex's word

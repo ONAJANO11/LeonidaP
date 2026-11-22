@@ -11,12 +11,18 @@ run by spirv_mini_interp.run_workgroup as one 32-thread workgroup on one 32-wide
 32 or more raises UndefinedResult there, so a translation that masks with 63 fails loudly instead of passing on
 a driver's wrap.
 """
+import os
 import re
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 # 4 user SGPRs (the output V#), workgroup id in s4, 512 bytes of LDS, 32x1x1 threads (the .asm's "; group:").
 FSSM = bytearray(0x148)

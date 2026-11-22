@@ -1,8 +1,14 @@
 """VOP1 conversions with known binary32 inputs and integer output words."""
+import os
 import struct
+import sys
 import unittest
 
-import support
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import support  # noqa: E402
 
 
 # Input bits, unsigned result, signed result (as an untyped 32-bit word).

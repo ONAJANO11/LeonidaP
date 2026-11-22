@@ -18,12 +18,18 @@ literal the translator folds, and with words 1 and 3 or-ed together at run time,
 Offsets are dword aligned: the ISA requires it of swizzled accesses, and the interpreter rejects an unaligned
 PhysicalStorageBuffer access, so the offset % 4 term is in the translation but not exercised here.
 """
+import os
 import re
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
-import test_value_semantics as tv         # module only: importing its classes would collect them a second time
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+import test_value_semantics as tv  # noqa: E402  # module only: importing its classes would collect them a second time
 
 BASE = tv.VEC_REGION
 OUT_V = 0x31016FAC                          # the output V# in s[0:3]: RAW, base 0

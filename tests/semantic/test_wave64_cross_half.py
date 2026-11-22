@@ -24,12 +24,18 @@ Limits: --wave64-emulate output uses Workgroup memory and a round loop, which th
 emulated path is covered only by the GPU tests. The subgroup layout (invocation i in subgroup i // 32) is the
 usual one for a 1-D workgroup but Vulkan does not guarantee it.
 """
+import os
 import re
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 # 4 user SGPRs (the output V#), workgroup id in s4, 512 bytes of LDS, 64x1x1 threads: build.py's default header.
 FSSM = bytearray(0x148)

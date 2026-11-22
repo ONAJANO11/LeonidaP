@@ -53,8 +53,12 @@ import struct
 import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 # Independent constants, written down by hand (derivations are in the reference functions).
 EXPECTED_LEGACY_MUL = [0x00000000, 0x00000000, 0x00000000, 0x40C00000]

@@ -17,11 +17,17 @@ LDS dword 0 = 0x7F80FF01, presets every destination to 0xBEEF1234 and reads sing
 or base. It is translated for wave32 and run as one invocation (lane 0); the eight words it stores are compared
 with values derived here from the ISA text above (the same values check.py / run_gpu_tests.py expect).
 """
+import os
 import struct
+import sys
 import unittest
 
-import support
-import spirv_mini_interp as si
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
 
 # 4 user SGPRs (the output V#), workgroup id in s4, 512 bytes of LDS, 32x1x1 threads.
 FSSM = bytearray(0x148)
