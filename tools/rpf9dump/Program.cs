@@ -4,18 +4,40 @@ using System.Diagnostics;
 using System.Text.Json;
 using RpfPreview.Core;
 
-if (args.Length < 3) { Console.WriteLine("usage: rpf9dump ttpf|models|textures <source> <outdir>"); return 2; }
-string mode = args[0], src = Path.GetFullPath(args[1]), outRoot = Path.GetFullPath(args[2]);
+// Optional --jobs N anywhere among the args (default: every core). Stripped before mode/src/outdir.
+var argv = args.ToList();
+int jobs = Environment.ProcessorCount;
+for (int i = 0; i < argv.Count; )
+{
+    if (argv[i] == "--jobs")
+    {
+        if (i + 1 >= argv.Count || !int.TryParse(argv[i + 1], out jobs) || jobs < 1)
+        {
+            Console.Error.WriteLine("--jobs must be at least 1");
+            return 2;
+        }
+        argv.RemoveAt(i);
+        argv.RemoveAt(i);
+        continue;
+    }
+    i++;
+}
+if (argv.Count < 3)
+{
+    Console.WriteLine("usage: rpf9dump ttpf|models|textures|audio|xma <source> <outdir> [--jobs N]");
+    return 2;
+}
+string mode = argv[0], src = Path.GetFullPath(argv[1]), outRoot = Path.GetFullPath(argv[2]);
 var json = new JsonSerializerOptions { WriteIndented = true };
 var sw = Stopwatch.StartNew();
 string baseName = Path.GetFileNameWithoutExtension(src);
 string outDir = Path.Combine(outRoot, baseName); Directory.CreateDirectory(outDir);
 long length = new FileInfo(src).Length;
 int ok = 0, fail = 0, skip = 0;
-// Every mode below works on all cores. Core's readers open their own read handle per call, entry and file names
-// come from offsets and indexes, and results are put back in source order, so outputs match a one-thread run.
-// ponytail: every core, no flag; add --jobs if someone needs the machine during a build.
-var par = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+// Every mode below works on all cores by default. Core's readers open their own read handle per call, entry and
+// file names come from offsets and indexes, and results are put back in source order, so outputs match a
+// one-thread run. --jobs caps that when make_game.py overlaps this with another CPU-heavy stage.
+var par = new ParallelOptions { MaxDegreeOfParallelism = jobs };
 
 if (mode == "ttpf")
 {
