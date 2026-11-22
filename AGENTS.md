@@ -34,7 +34,10 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
 
   Check its tables and the open pull requests first. If someone has claimed the item or has a pull request for it,
   stop and tell the user instead of writing it a second time.
-- Put the item ID from that issue in the pull request, and `Depends on: #N` for every pull request yours builds on.
+- Put the item ID from that issue in the pull request's title or description, and `Depends on: #N` for every pull
+  request yours builds on. The coordination tables pick the pull request up from the ID, so don't post a `done:`
+  comment for it. Comment again only for a blocker, a hand-over or a release (`blocked:`, `status:`, `releasing:`):
+  the thread fills up within hours and moves to a new issue.
 - Found work you won't do yourself (a bug, a missing method, a stale doc, a follow-up of your own pull request)?
   Post it in the coordination issue as `finding: <one line>`, followed by where it is (file and line), why it matters,
   and whether it needs game files or particular hardware. The coordinator checks it and lists it for others.
