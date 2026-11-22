@@ -179,10 +179,20 @@ def create(game_dir: str, out: str, jobs: int = 1) -> int:
 
 def load_manifest(manifest: str) -> dict:
     """The manifest's "files" table, checked entry by entry, so a damaged file is reported by name rather than
-    as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
+    as a JSONDecodeError, KeyError or TypeError traceback halfway through verify. Repeated JSON keys are rejected
+    rather than silently resolved to the last value, so a manifest cannot hide one size or hash behind another."""
+
+    def unique_keys(pairs: list[tuple[str, object]]) -> dict:
+        seen: dict = {}
+        for key, value in pairs:
+            if key in seen:
+                raise ManifestError(f"{manifest}: duplicate JSON key {key!r}; create it again")
+            seen[key] = value
+        return seen
+
     with open(manifest, encoding="utf-8") as f:
         try:
-            doc = json.load(f)
+            doc = json.load(f, object_pairs_hook=unique_keys)
         except ValueError as error:  # JSONDecodeError, or UnicodeDecodeError for a file that isn't UTF-8
             raise ManifestError(f"{manifest} is not valid JSON ({error}); create it again") from None
     files = doc.get("files") if isinstance(doc, dict) else None

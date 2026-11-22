@@ -182,6 +182,26 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("OK", out.getvalue())
 
+    def test_load_manifest_rejects_duplicate_json_keys(self):
+        digest = hashlib.sha256(self.files["alpha.bin"]).hexdigest()
+        entry = f'{{"size": {len(self.files["alpha.bin"])}, "sha256": "{digest}"}}'
+        cases = {
+            "files": f'{{"files": {{"alpha.bin": {entry}}}, "files": {{}}}}',
+            "alpha.bin": f'{{"files": {{"alpha.bin": {entry}, "alpha.bin": {entry}}}}}',
+            "sha256": f'{{"files": {{"alpha.bin": {{"size": 1, "sha256": "00", "sha256": "{digest}"}}}}}}',
+            "size": f'{{"files": {{"alpha.bin": {{"size": 1, "size": 2, "sha256": "{digest}"}}}}}}',
+        }
+        path = os.path.join(self.tmp.name, "dup.json")
+        for key, document in cases.items():
+            with self.subTest(key=key):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(document)
+                with self.assertRaises(manifest.ManifestError) as cm:
+                    manifest.load_manifest(path)
+                self.assertIn("duplicate JSON key", str(cm.exception))
+                self.assertIn(repr(key), str(cm.exception))
+                self.assertIn(path, str(cm.exception))
+
     def test_verify_detects_missing_file(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
@@ -366,6 +386,29 @@ class ManifestCliTest(unittest.TestCase):
                     self.assertEqual(result.stdout, "")
                     with open(self.out_manifest, "rb") as f:
                         self.assertEqual(f.read(), original)
+
+    def test_cli_verify_rejects_duplicate_json_keys(self):
+        digest = hashlib.sha256(b"cli test payload bytes").hexdigest()
+        entry = f'{{"size": 22, "sha256": "{digest}"}}'
+        cases = {
+            "files": f'{{"files": {{"sample.dat": {entry}}}, "files": {{}}}}',
+            "sample.dat": f'{{"files": {{"sample.dat": {entry}, "sample.dat": {entry}}}}}',
+            "sha256": f'{{"files": {{"sample.dat": {{"size": 22, "sha256": "00", "sha256": "{digest}"}}}}}}',
+            "size": f'{{"files": {{"sample.dat": {{"size": 22, "size": 1, "sha256": "{digest}"}}}}}}',
+        }
+        path = os.path.join(self.tmp.name, "dup.json")
+        for key, document in cases.items():
+            with self.subTest(key=key):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(document)
+                result = self.run_cli("verify", self.pkg, "--manifest", path, "--jobs", "1")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertIn("duplicate JSON key", result.stderr)
+                self.assertIn(repr(key), result.stderr)
+                self.assertIn("dup.json", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_cli_verify_reports_a_damaged_manifest_without_a_traceback(self):
         damaged = {
