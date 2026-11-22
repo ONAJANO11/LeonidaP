@@ -1390,6 +1390,21 @@ if(TARGET Vulkan::Headers)
       message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
     endif()
 
+    # RT-4 diagnostic: XboxBvhBuilder.dll on the Vulkan device proxy (skips unless LEONIDA_GAME_DIR is set).
+    add_executable(xbox_bvh_builder_test
+      test/xbox_bvh_builder_test.cpp
+      src/pe_loader.cpp
+      shims/registry.cpp
+      shims/xmem.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_link_libraries(xbox_bvh_builder_test PRIVATE gta6rt_d3d12_com gta6rt_d3d12_xs_rootsig psapi)
+    target_compile_definitions(xbox_bvh_builder_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(xbox_bvh_builder_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+    target_link_options(xbox_bvh_builder_test PRIVATE /OPT:NOREF)
+    add_test(NAME xbox_bvh_builder COMMAND xbox_bvh_builder_test)
+
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)
       target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_com)
