@@ -74,7 +74,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
-    X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
+    X(vkCmdSetBlendConstants) X(vkCmdSetSampleLocationsEXT) X(vkCmdDraw)                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -699,6 +699,7 @@ public:
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.set_sample_locations = vk.vkCmdSetSampleLocationsEXT;  // null unless VK_EXT_sample_locations is on
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
@@ -880,6 +881,12 @@ public:
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
+    }
+
+    // Sample counts whose sample-location grid can be 2x2 (SetSamplePositions with four pixels).
+    void set_sample_location_grid_2x2(VkSampleCountFlags counts) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.sample_location_grid_2x2 = counts;
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.

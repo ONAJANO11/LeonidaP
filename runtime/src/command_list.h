@@ -409,6 +409,12 @@ struct Draw {
     std::uint32_t first;  // first vertex or first index
     std::int32_t base_vertex;
     std::uint32_t first_instance;
+    // ID3D12GraphicsCommandList1::SetSamplePositions: 0 samples means the standard positions. Otherwise
+    // sample_positions holds x, y pairs in 1/16 pixel from the pixel centre (-8..7), sample_count per pixel, for
+    // one pixel or for the 2x2 quad (top-left, top-right, bottom-left, bottom-right).
+    std::uint32_t sample_count = 0;
+    std::uint32_t sample_pixels = 1;
+    std::vector<std::int8_t> sample_positions;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
