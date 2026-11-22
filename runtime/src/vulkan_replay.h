@@ -558,6 +558,62 @@ public:
     explicit LayoutTracker(bool separate_depth_stencil_layouts = false)
         : separate_(separate_depth_stencil_layouts) {}
 
+    LayoutTracker(const LayoutTracker& other) : separate_(other.separate_), entries_(other.entries_) {}
+    LayoutTracker& operator=(const LayoutTracker& other) {
+        if (this != &other) {
+            separate_ = other.separate_;
+            entries_ = other.entries_;
+            transaction_depth_ = 0;
+            undo_log_.clear();
+        }
+        return *this;
+    }
+    LayoutTracker(LayoutTracker&& other) : separate_(other.separate_), entries_(std::move(other.entries_)) {
+        other.transaction_depth_ = 0;
+        other.undo_log_.clear();
+    }
+    LayoutTracker& operator=(LayoutTracker&& other) {
+        if (this != &other) {
+            separate_ = other.separate_;
+            entries_ = std::move(other.entries_);
+            transaction_depth_ = 0;
+            undo_log_.clear();
+            other.transaction_depth_ = 0;
+            other.undo_log_.clear();
+        }
+        return *this;
+    }
+
+    // Scoped O(touched-subresources) rollback guard for in-place mutations via set(). Commits in O(1) without
+    // cloning untouched entries; rolls back automatically on destruction unless commit() was called.
+    class Transaction {
+    public:
+        explicit Transaction(LayoutTracker& tracker)
+            : tracker_(tracker), mark_(tracker.begin_transaction()), active_(true) {}
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+        Transaction(Transaction&&) = delete;
+        Transaction& operator=(Transaction&&) = delete;
+        ~Transaction() { rollback(); }
+
+        void commit() {
+            if (!active_) return;
+            active_ = false;
+            tracker_.commit_transaction();
+        }
+
+        void rollback() {
+            if (!active_) return;
+            active_ = false;
+            tracker_.rollback_transaction(mark_);
+        }
+
+    private:
+        LayoutTracker& tracker_;
+        std::size_t mark_ = 0;
+        bool active_ = false;
+    };
+
     bool separate_depth_stencil_layouts() const { return separate_; }
 
     void track(ResourceId id, const ResourceBinding& resource, VkImageLayout layout) {
@@ -610,11 +666,19 @@ public:
         if (it == entries_.end()) return;
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
+            if (transaction_depth_ != 0 && e.layouts[index] != layout)
+                undo_log_.push_back({id, index, e.layouts[index]});
             e.layouts[index] = layout;
         });
     }
 
 private:
+    struct UndoEntry {
+        ResourceId id;
+        std::size_t index;
+        VkImageLayout previous;
+    };
+
     struct Entry {
         std::uint32_t mips;
         std::uint32_t layers;
@@ -622,6 +686,40 @@ private:
         bool two_planes;       // depth and stencil tracked apart
         std::vector<VkImageLayout> layouts;
     };
+
+    std::size_t begin_transaction() {
+        ++transaction_depth_;
+        return undo_log_.size();
+    }
+
+    void clear_undo_log() {
+        undo_log_.clear();
+        if (undo_log_.capacity() > 4096) std::vector<UndoEntry>{}.swap(undo_log_);
+    }
+
+    void commit_transaction() {
+        if (transaction_depth_ == 0) return;
+        --transaction_depth_;
+        if (transaction_depth_ == 0) clear_undo_log();
+    }
+
+    void rollback_transaction(std::size_t mark) {
+        ResourceId cached_id = 0;
+        Entry* cached_entry = nullptr;
+        for (std::size_t i = undo_log_.size(); i > mark; --i) {
+            const UndoEntry& u = undo_log_[i - 1];
+            if (!cached_entry || u.id != cached_id) {
+                cached_id = u.id;
+                const auto found = entries_.find(cached_id);
+                cached_entry = (found != entries_.end()) ? &found->second : nullptr;
+            }
+            if (cached_entry && u.index < cached_entry->layouts.size())
+                cached_entry->layouts[u.index] = u.previous;
+        }
+        undo_log_.resize(mark);
+        if (transaction_depth_ > 0) --transaction_depth_;
+        if (transaction_depth_ == 0) clear_undo_log();
+    }
 
     template<typename F>
     static void visit(const Entry& e, const VkImageSubresourceRange& range, F&& f) {
@@ -644,6 +742,8 @@ private:
 
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
+    std::uint32_t transaction_depth_ = 0;
+    std::vector<UndoEntry> undo_log_;
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.
