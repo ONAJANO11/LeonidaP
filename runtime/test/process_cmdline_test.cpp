@@ -2,13 +2,16 @@
 // documented rules the CRT's argv parser shares) back to the __wargv the shim hands out, and __wargv must hold what
 // main.cpp passed, whatever the system code page (RT-84). The WinMain line (lpCmdLine) is the game's too, and the
 // command line and ExitProcess are served under kernelbase.dll and the API-set names as well as kernel32.dll.
+// msvcrt.dll's __getmainargs/__wgetmainargs hand out the current environment, the wide one too (RT-136).
 // No game files.
 #include <windows.h>
 #include <shellapi.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -112,9 +115,72 @@ void check_winmain(const std::wstring& program, const std::vector<std::wstring>&
         }
     }
 }
+
+// True if the null-terminated environment block `env` has an entry `name=...` (name compared case-insensitively,
+// as Windows does) and, when `value` is given, that entry's value is exactly `value`.
+template <typename C>
+bool env_has(C** env, const C* name, const C* value = nullptr) {
+    const size_t n = std::char_traits<C>::length(name);
+    for (C** e = env; e && *e; ++e) {
+        bool same = true;
+        for (size_t i = 0; same && i < n; ++i) same = (*e)[i] && towupper((*e)[i]) == towupper(name[i]);
+        if (!same || (*e)[n] != C('=')) continue;
+        if (!value) return true;
+        const C* v = *e + n + 1;
+        size_t i = 0;
+        while (v[i] && v[i] == value[i]) ++i;
+        return v[i] == value[i];
+    }
+    return false;
+}
+
+// msvcrt.dll's __getmainargs/__wgetmainargs (a MinGW title's startup) hand the game its environment as well as argv.
+// The UCRT creates the wide environment only when something first asks for it, so in a narrow-main host like gta6rt
+// _wenviron is still null when set_command_line runs: the wide startup must still get a real block (RT-136). And
+// the block is the current one, as the CRT's own __getmainargs gives: a variable set after set_command_line is in it.
+void check_mainargs_env() {
+    rt::process::set_command_line(L"game.exe", {L"-x"});
+    _putenv("LEONIDA_RT136=after");  // may move the narrow block: what set_command_line saw must not be handed out
+    using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
+    using Wide = int(__cdecl*)(int*, wchar_t***, wchar_t***, int, void*);
+    const auto narrow_fn = reinterpret_cast<Narrow>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    const auto wide_fn = reinterpret_cast<Wide>(rt::shims::find("msvcrt.dll", "__wgetmainargs"));
+    if (!narrow_fn || !wide_fn) {
+        std::fprintf(stderr, "FAIL msvcrt.dll!__getmainargs/__wgetmainargs are not shimmed\n");
+        ++failures;
+        return;
+    }
+    int argc = 0;
+    char** av = nullptr;
+    char** env = nullptr;
+    if (narrow_fn(&argc, &av, &env, 0, nullptr) != 0 || argc != 2 || !av || std::strcmp(av[1], "-x") != 0) {
+        std::fprintf(stderr, "FAIL __getmainargs: argc %d, argv[1] [%s]\n", argc, av && argc > 1 ? av[1] : "(null)");
+        ++failures;
+    }
+    if (!env_has(env, "PATH") || !env_has(env, "LEONIDA_RT136", "after")) {
+        std::fprintf(stderr, "FAIL __getmainargs: the environment is %s\n",
+                     env ? "missing PATH or a variable set after set_command_line" : "null");
+        ++failures;
+    }
+    argc = 0;
+    wchar_t** wav = nullptr;
+    wchar_t** wenv = nullptr;
+    if (wide_fn(&argc, &wav, &wenv, 0, nullptr) != 0 || argc != 2 || !wav || std::wcscmp(wav[1], L"-x") != 0) {
+        std::fwprintf(stderr, L"FAIL __wgetmainargs: argc %d, argv[1] [%ls]\n", argc,
+                      wav && argc > 1 ? wav[1] : L"(null)");
+        ++failures;
+    }
+    if (!env_has(wenv, L"PATH") || !env_has(wenv, L"LEONIDA_RT136", L"after")) {
+        std::fprintf(stderr, "FAIL __wgetmainargs: the wide environment is %s\n",
+                     wenv ? "missing PATH or a variable set after set_command_line" : "null");
+        ++failures;
+    }
+}
 }  // namespace
 
 int main() {
+    // First, before anything in this process can have asked the UCRT for the wide environment.
+    check_mainargs_env();
     round_trip({L"plain", L"with space"}, "plain and spaced arguments");
     round_trip({L"C:\\My Games\\", L"next"}, "a quoted argument ending in a backslash");
     round_trip({L"a\\\"b"}, "a backslash before a quote");

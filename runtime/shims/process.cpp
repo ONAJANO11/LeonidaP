@@ -38,8 +38,6 @@ std::wstring g_wcmdline;
 int g_argc = 0;
 char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
-char** g_env = nullptr;
-wchar_t** g_wenv = nullptr;
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
@@ -130,17 +128,33 @@ C* after_program_name(C* p) {
 char* __cdecl game_get_narrow_winmain_command_line() { return after_program_name(g_cmdline.data()); }
 wchar_t* __cdecl game_get_wide_winmain_command_line() { return after_program_name(g_wcmdline.data()); }
 
+// The environment the game's startup gets, read when it asks (RT-136). The UCRT creates each form of the environment
+// only when something first asks for it: in a narrow-main host like gta6rt, _wenviron is null until then, so a copy
+// taken in set_command_line handed a wide startup a null block. getenv_s/_wgetenv_s create the missing form from
+// the other one (the UCRT's get_or_create path, as getenv/_wgetenv), and reading the pointer at call time also gives
+// the current block after a _putenv has moved it, as the CRT's own __getmainargs does.
+char** current_environment() {
+    size_t n = 0;
+    if (!_environ) (void)getenv_s(&n, nullptr, 0, "PATH");
+    return _environ;
+}
+wchar_t** current_wide_environment() {
+    size_t n = 0;
+    if (!_wenviron) (void)_wgetenv_s(&n, nullptr, 0, L"PATH");
+    return _wenviron;
+}
+
 // msvcrt.dll: int __getmainargs(int* argc, char*** argv, char*** env, int expand, void* startinfo)
 int __cdecl game_getmainargs(int* argc, char*** argv, char*** env, int, void*) {
     *argc = g_argc;
     *argv = g_argv_ptr;
-    if (env) *env = g_env;
+    if (env) *env = current_environment();
     return 0;
 }
 int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, void*) {
     *argc = g_argc;
     *argv = g_wargv_ptr;
-    if (env) *env = g_wenv;
+    if (env) *env = current_wide_environment();
     return 0;
 }
 
@@ -179,8 +193,6 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_argc = static_cast<int>(g_args.size());
     g_argv_ptr = g_argv.data();
     g_wargv_ptr = g_wargv.data();
-    g_env = _environ;
-    g_wenv = _wenviron;
 }
 
 int run_entry(void* entry, size_t stack_bytes) {
