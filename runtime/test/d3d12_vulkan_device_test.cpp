@@ -596,6 +596,8 @@ int compare_allocation_info(ID3D12Device* ours) {
         const char* name;
         D3D12_RESOURCE_DESC desc;
         UINT64 top_mip_bytes;  // 0: the size must match the host's exactly (buffers, invalid descriptions)
+        // A driver may refuse what others allocate: then ours may still allocate it (with the checks above).
+        bool host_may_refuse = false;
     };
     D3D12_RESOURCE_DESC bad_buffer = buffer_desc(256);
     bad_buffer.Height = 2;
@@ -751,7 +753,7 @@ int compare_allocation_info(ID3D12Device* ours) {
              D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, DXGI_FORMAT_R32G32B32A32_FLOAT, rt, 1), 0, 4);
              d.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
              return d;
-         }(), 256 * 256 * 16 * 4},
+         }(), 256 * 256 * 16 * 4, true},  // the AMD drivers refuse 128-bit tiled MSAA; WARP and NVIDIA allocate it
         {"tiled 2D 4x MSAA D32F", [&] {
              D3D12_RESOURCE_DESC d = with(texture_desc(256, 256, DXGI_FORMAT_D32_FLOAT,
                                                        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, 1), 0, 4);
@@ -797,7 +799,7 @@ int compare_allocation_info(ID3D12Device* ours) {
     for (const Case& c : cases) {
         const D3D12_RESOURCE_ALLOCATION_INFO a = ours->GetResourceAllocationInfo(0, 1, &c.desc);
         const D3D12_RESOURCE_ALLOCATION_INFO b = host->GetResourceAllocationInfo(0, 1, &c.desc);
-        if (b.SizeInBytes == UINT64_MAX || !c.top_mip_bytes) {
+        if ((b.SizeInBytes == UINT64_MAX && !c.host_may_refuse) || !c.top_mip_bytes) {
             if (a.SizeInBytes != b.SizeInBytes || (b.SizeInBytes != UINT64_MAX && a.Alignment != b.Alignment))
                 mismatch(c.name, a, b);
             continue;
@@ -852,6 +854,28 @@ int compare_allocation_info(ID3D12Device* ours) {
         mismatch("no resources", empty_a, empty_b);
 
     Ref<ID3D12Device8> ours8;
+    // MULTISAMPLE_QUALITY_LEVELS with TILED_RESOURCE: the same answers as the host, except 128-bit formats at 4x,
+    // which the AMD drivers refuse and WARP and NVIDIA report (and GetResourceAllocationInfo allocates here).
+    for (const DXGI_FORMAT format : {rgba8, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
+                                     DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_D32_FLOAT,
+                                     DXGI_FORMAT_R32G32B32_FLOAT}) {
+        for (const UINT samples : {1u, 2u, 4u, 8u, 16u}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS x{format, samples,
+                                                            D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE};
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS y = x;
+            const HRESULT hx = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &x, sizeof(x));
+            const HRESULT hy = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &y, sizeof(y));
+            const bool wide = format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+            if (hx == hy && (x.NumQualityLevels == y.NumQualityLevels ||
+                             (wide && samples == 4 && x.NumQualityLevels == 1 && y.NumQualityLevels == 0)))
+                continue;
+            if (mismatches++ < 24)
+                std::fprintf(stderr, "tiled quality levels format %d %ux: ours 0x%08lx %u, host 0x%08lx %u\n",
+                             int(format), samples, static_cast<unsigned long>(hx), x.NumQualityLevels,
+                             static_cast<unsigned long>(hy), y.NumQualityLevels);
+        }
+    }
+
     if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
     const D3D12_RESOURCE_DESC mixed[] = {with(texture_desc(16, 16, rgba8, none), k4), buffer_desc(300),
                                          with(texture_desc(64, 64, rgba8, rt), 0, 4)};
