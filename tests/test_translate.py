@@ -162,6 +162,24 @@ def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
     assert ("BuiltIn FragDepth" in spvasm) == depth
     assert ("DepthReplacing" in spvasm) == depth
 
+@pytest.mark.parametrize("body", [
+    "",                                                              # straight line
+    "s_cmp_eq_u32 s20, 0\ns_cbranch_scc1 1\nv_mov_b32 v0, 1.0\n",      # a branch, as the hardware wait loop has
+], ids=["straight-line", "branch"])
+def test_pops_interlock_begins_and_ends_once(make_shader, body):
+    """A PS that reads src_pops_exiting_wave_id runs in one fragment-shader interlock: one
+    OpBeginInvocationInterlockEXT, then one OpEndInvocationInterlockEXT (SPV_EXT_fragment_shader_interlock: each
+    exactly once). Until 2026-11-22 a straight-line shader got the End only."""
+    shader = make_shader("v_mov_b32 v0, 0.5\ns_mov_b32 s20, src_pops_exiting_wave_id\n" + body +
+                         "exp mrt0 v0, v0, v0, v0 done vm\ns_endpgm\n", "ps_pops")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert "PixelInterlockOrderedEXT" in spvasm
+    assert spvasm.count("OpBeginInvocationInterlockEXT") == 1
+    assert spvasm.count("OpEndInvocationInterlockEXT") == 1
+    assert spvasm.index("OpBeginInvocationInterlockEXT") < spvasm.index("OpEndInvocationInterlockEXT")
+
+
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
     with open(path, encoding="utf-8") as fixture:

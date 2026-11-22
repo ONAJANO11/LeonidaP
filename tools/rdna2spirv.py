@@ -9713,6 +9713,10 @@ def assemble(gen):
     helpers = (gen.desc_fn or []) + (gen.fmt_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
+    if pops and not gen.blocks:
+        # Straight line: the interlock still opens at the end of the entry block, so the End in the tail closes a
+        # section that was begun (SPV_EXT_fragment_shader_interlock: each exactly once). With blocks it opens below.
+        fn.append("OpBeginInvocationInterlockEXT")
     out = hdr + dec + types + gvars + helpers + fn
     tree = (cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate and not gen.bar_rounds
             else None)
