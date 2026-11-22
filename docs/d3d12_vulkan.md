@@ -87,10 +87,7 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
 - **Unknown IIDs and slots.** `QueryInterface` must log the IID and return `E_NOINTERFACE` if it is not in the
   public chain. If the game then fails, the IID and the call site identify the Xbox-specific interface to reverse.
   Do not invent a vtable for an unknown IID: a wrong slot is worse than a clean failure.
-- **No host D3D12 or DXGI.** The PE loader currently lets unknown system DLLs bind to the host. `dxgi.dll` and
-  `d3d12.dll` must be shimmed, not resolved from System32. Host DXGI would hand the game a desktop adapter and
-  swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an
-  integration requirement, not an optimisation.
+- **No host D3D12 or DXGI.** `dxgi.dll` and `d3d12.dll` are shimmed and isolated from host System32 (`runtime/shims/dxgi.cpp` and `runtime/shims/d3d12_xs.cpp`). The loader checks `shims::owns_dll` before querying System32 so neither direct imports nor forwarders can fall back to the host; any unshimmed exports cleanly bind as `Binding::Unimplemented`. Host DXGI would hand the game a desktop adapter and swapchain that cannot see our Vulkan device, and host D3D12 would create a second, unrelated device. This is an integration requirement, not an optimisation.
 - **Trace first.** `gta6rt --trace-d3d12` emits numbered records for device entry points, Vulkan device operations,
   command-list recording and queue submission. Records contain fixed API names and outcomes only. See
   [the runtime guide](../runtime/README.md#first-boot-d3d12-trace) for collecting a trace.

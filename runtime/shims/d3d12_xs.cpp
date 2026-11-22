@@ -34,6 +34,7 @@ FARPROC host(const char* name) {
 
 using SerializeFn = decltype(&::D3D12SerializeVersionedRootSignature);
 using DeserializerFn = decltype(&::D3D12CreateRootSignatureDeserializer);
+using VersionedDeserializerFn = decltype(&::D3D12CreateVersionedRootSignatureDeserializer);
 using LegacySerializeFn = decltype(&::D3D12SerializeRootSignature);
 using CreateDeviceFn = decltype(&::D3D12CreateDevice);
 
@@ -115,6 +116,49 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
         return fn(cleared.data(), cleared.size(), iid, out);
     }
     return fn(data, size, iid, out);
+}
+
+HRESULT WINAPI create_versioned_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
+    static auto fn = reinterpret_cast<VersionedDeserializerFn>(host("D3D12CreateVersionedRootSignatureDeserializer"));
+    if (!fn) return E_NOTIMPL;
+
+    std::vector<uint8_t> cleared;
+    if (rt::d3d12_xs::copy_rts0_blob_clear_xbox_flags(data, static_cast<size_t>(size), cleared)) {
+        return fn(cleared.data(), cleared.size(), iid, out);
+    }
+    return fn(data, size, iid, out);
+}
+
+HRESULT WINAPI d3d12_create_device(IUnknown* adapter, D3D_FEATURE_LEVEL minimum_feature_level,
+                                   REFIID riid, void** out) {
+    (void)adapter;
+    (void)minimum_feature_level;
+    if (!out) return E_POINTER;
+    *out = nullptr;
+#ifdef LEONIDA_VULKAN_DEVICE
+    return rt::d3d12::create_vulkan_device_standalone(riid, out);
+#else
+    static auto fn = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
+    if (!fn) return E_NOTIMPL;
+    return fn(adapter, minimum_feature_level, riid, out);
+#endif
+}
+
+HRESULT WINAPI d3d12_get_debug_interface(REFIID riid, void** out) {
+    (void)riid;
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    return E_NOINTERFACE;
+}
+
+HRESULT WINAPI d3d12_enable_experimental_features(UINT num_features, const IID* iids,
+                                                 void* configuration_structs,
+                                                 UINT* num_configuration_structs) {
+    (void)num_features;
+    (void)iids;
+    (void)configuration_structs;
+    (void)num_configuration_structs;
+    return E_NOTIMPL;
 }
 
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
@@ -214,14 +258,32 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
+static_assert(std::is_same_v<decltype(&create_versioned_root_signature_deserializer), VersionedDeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
+static_assert(std::is_same_v<decltype(&d3d12_create_device), CreateDeviceFn>);
 
 }  // namespace
 
 SHIM_TABLE(d3d12_xs,
+    {"d3d12.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
+    {"d3d12.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
+    {"d3d12.dll", "D3D12CreateRootSignatureDeserializer",
+     reinterpret_cast<void*>(&create_root_signature_deserializer)},
+    {"d3d12.dll", "D3D12CreateVersionedRootSignatureDeserializer",
+     reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
+    {"d3d12.dll", "D3D12CreateDevice", reinterpret_cast<void*>(&d3d12_create_device)},
+    {"d3d12.dll", "D3D12GetDebugInterface", reinterpret_cast<void*>(&d3d12_get_debug_interface)},
+    {"d3d12.dll", "D3D12EnableExperimentalFeatures",
+     reinterpret_cast<void*>(&d3d12_enable_experimental_features)},
+
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
     {"d3d12_xs.dll", "D3D12SerializeRootSignature", reinterpret_cast<void*>(&serialize_root_signature_legacy)},
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
+    {"d3d12_xs.dll", "D3D12CreateVersionedRootSignatureDeserializer",
+     reinterpret_cast<void*>(&create_versioned_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12GetDebugInterface", reinterpret_cast<void*>(&d3d12_get_debug_interface)},
+    {"d3d12_xs.dll", "D3D12EnableExperimentalFeatures",
+     reinterpret_cast<void*>(&d3d12_enable_experimental_features)},
 );

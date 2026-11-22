@@ -5992,7 +5992,16 @@ HRESULT register_samplers(ID3D12Device* device, std::span<const leonida::gfx10::
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!device) return E_INVALIDARG;
+    if (!device) {
+        static std::mutex s_mutex;
+        static ID3D12Device* s_standalone = nullptr;
+        std::lock_guard lock(s_mutex);
+        if (!s_standalone) {
+            create_vulkan_device_standalone(__uuidof(ID3D12Device), reinterpret_cast<void**>(&s_standalone));
+        }
+        device = s_standalone;
+        if (!device) return DXGI_ERROR_NOT_FOUND;
+    }
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     Device* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;

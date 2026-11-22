@@ -92,6 +92,7 @@ if(WIN32)
     shims/registry.cpp
     shims/file_system.cpp
     shims/xmem.cpp
+    shims/dxgi.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -309,7 +310,15 @@ if(BUILD_TESTING)
       test/loader_test.cpp
       src/pe_loader.cpp
       shims/registry.cpp
+      shims/dxgi.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
     )
+    target_include_directories(loader_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_link_libraries(loader_test PRIVATE gta6rt_d3d12_xs_rootsig)
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
@@ -351,6 +360,7 @@ if(BUILD_TESTING)
       src/pe_loader.cpp
       shims/registry.cpp
       shims/xmem.cpp
+      shims/dxgi.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
     )
@@ -1325,8 +1335,16 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(d3d12_query_rules PROPERTIES SKIP_RETURN_CODE 77)
 
     # Vulkan-backed IDXGIFactory4 / IDXGISwapChain3 presentation over a Win32 HWND.
-    add_executable(dxgi_swapchain_test test/dxgi_swapchain_test.cpp)
-    target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com)
+    add_executable(dxgi_swapchain_test
+      test/dxgi_swapchain_test.cpp
+      shims/registry.cpp
+      shims/dxgi.cpp
+      shims/d3d12_xs.cpp
+    )
+    target_include_directories(dxgi_swapchain_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/shims
+    )
+    target_link_libraries(dxgi_swapchain_test PRIVATE gta6rt_d3d12_com gta6rt_d3d12_xs_rootsig)
     target_compile_definitions(dxgi_swapchain_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_swapchain_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain COMMAND dxgi_swapchain_test)
