@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     // (llvmpipe and other software devices), so the suite reports it as unsupported instead. 77 is the existing
     // "this device cannot run the test" code (runtime/test/shaders/check.py, scripts/run_gpu_tests.py).
     const std::vector<uint32_t> fs_code = read_spv(argv[2]);
-    bool needs_barycentric = false, needs_float64 = false;
+    bool needs_barycentric = false, needs_float64 = false, needs_stencil_export = false;
     for (std::size_t i = 5; i + 1 < fs_code.size();) {   // instructions follow the 5-word SPIR-V header
         const uint32_t words = fs_code[i] >> 16, op = fs_code[i] & 0xffffu;
         if (!words) break;
@@ -191,6 +191,8 @@ int main(int argc, char** argv) {
             needs_barycentric = true;
         if (op == 17 && fs_code[i + 1] == 10)            // OpCapability Float64 (v_add_f64 and friends)
             needs_float64 = true;
+        if (op == 17 && fs_code[i + 1] == 5013)          // OpCapability StencilExportEXT (exp mrtz stencil)
+            needs_stencil_export = true;
         i += words;
     }
     if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
@@ -202,6 +204,38 @@ int main(int argc, char** argv) {
     leonida::vk_test::ShaderFma fma;
     fma.query(gipa, inst, pd);
     if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
+    if (needs_stencil_export && !has(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME)) {
+        std::fprintf(stderr, "unsupported: %s exports stencil and the device has no %s\n",
+                     argv[2], VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+        return 77;
+    }
+    const char* stencil_out_env = std::getenv("VKH_STENCIL_OUT");
+    const bool stencil_out = stencil_out_env && *stencil_out_env && std::strcmp(stencil_out_env, "0") != 0;
+    const char* msaa_env = std::getenv("VKH_MSAA");
+    const bool msaa4 = msaa_env && std::strcmp(msaa_env, "4") == 0;
+    if (msaa4) {
+        LOADI(vkGetPhysicalDeviceImageFormatProperties);
+        VkImageFormatProperties ifp{};
+        const VkResult r = vkGetPhysicalDeviceImageFormatProperties(
+            pd, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ifp);
+        if (r != VK_SUCCESS || !(props.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) ||
+            !(ifp.sampleCounts & VK_SAMPLE_COUNT_4_BIT)) {
+            std::fprintf(stderr, "unsupported: no 4x MSAA for R8G8B8A8_UNORM\n");
+            return 77;
+        }
+    }
+    if (stencil_out) {
+        LOADI(vkGetPhysicalDeviceFormatProperties);
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+        const VkFormatFeatureFlags need =
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+        if ((fp.optimalTilingFeatures & need) != need) {
+            std::fprintf(stderr, "unsupported: no D32_SFLOAT_S8_UINT depth-stencil readback\n");
+            return 77;
+        }
+    }
     std::vector<const char*> enable;
     void* chain = nullptr;
     if (fma.supported()) {
@@ -219,6 +253,9 @@ int main(int argc, char** argv) {
     if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
         enable.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
         lock.fragmentShaderPixelInterlock = VK_TRUE; lock.pNext = chain; chain = &lock;
+    }
+    if (has(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME)) {
+        enable.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     }
     // VKH_MESH_COMPUTE=<vs.spv>: the first shader is a mesh shader translated with rdna2spirv.py --mesh-compute.
     // It is dispatched as compute over the mesh grid (1x1x1, or --mesh-group-readback's), writing its slots to an
@@ -348,10 +385,11 @@ int main(int argc, char** argv) {
         return 0u;
     };
     auto attachment = [&](VkFormat format, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                          VkImage& image, VkImageView& view) -> int {
+                          VkImage& image, VkImageView& view,
+                          VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) -> int {
         VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ii.imageType = VK_IMAGE_TYPE_2D; ii.format = format; ii.extent = {W, H, 1}; ii.mipLevels = 1; ii.arrayLayers = 1;
-        ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage;
+        ii.samples = samples; ii.tiling = VK_IMAGE_TILING_OPTIMAL; ii.usage = usage;
         CHECK(vkCreateImage(dev, &ii, nullptr, &image));
         VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, image, &mr);
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -364,47 +402,79 @@ int main(int argc, char** argv) {
         CHECK(vkCreateImageView(dev, &vi, nullptr, &view));
         return 0;
     };
-    const VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
-    VkImage img;
+    const VkFormat fmt = msaa4 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkImage img = VK_NULL_HANDLE, res_img = VK_NULL_HANDLE, ds_img = VK_NULL_HANDLE;
     VkImageView views[2]{};
-    if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                   VK_IMAGE_ASPECT_COLOR_BIT, img, views[0])) return 1;
+    if (msaa4) {
+        if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+                       img, views[0], VK_SAMPLE_COUNT_4_BIT)) return 1;
+        if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT, res_img, views[1], VK_SAMPLE_COUNT_1_BIT)) return 1;
+    } else {
+        if (attachment(fmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT, img, views[0])) return 1;
+    }
     VkAttachmentDescription attachments[2]{};
     auto& ad = attachments[0];
-    ad.format = fmt; ad.samples = VK_SAMPLE_COUNT_1_BIT; ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE; ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ad.format = fmt; ad.samples = msaa4 ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
+    ad.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    ad.storeOp = msaa4 ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
+    ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE; ad.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    ad.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ad.finalLayout = msaa4 ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     VkAttachmentReference ar{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference res_ref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
     VkAttachmentReference stencil_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-    if (group_readback) {
+    if (msaa4) {
+        auto& ra = attachments[1];
+        ra.format = fmt; ra.samples = VK_SAMPLE_COUNT_1_BIT;
+        ra.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ra.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ra.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ra.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        ra.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; ra.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        sd.pResolveAttachments = &res_ref;
+    } else if (group_readback || stencil_out) {
         LOADI(vkGetPhysicalDeviceFormatProperties);
         auto& ds = attachments[1];
-        for (auto format : {VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
-            VkFormatProperties fp;
-            vkGetPhysicalDeviceFormatProperties(pd, format, &fp);
-            if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
-                ds.format = format;
-                break;
+        if (stencil_out) {
+            ds.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        } else {
+            for (auto format : {VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(pd, format, &fp);
+                if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+                    ds.format = format;
+                    break;
+                }
             }
+            if (!ds.format) { std::fprintf(stderr, "no stencil attachment format\n"); return 1; }
         }
-        if (!ds.format) { std::fprintf(stderr, "no stencil attachment format\n"); return 1; }
-        VkImage stencil;
         VkImageAspectFlags aspects = VK_IMAGE_ASPECT_STENCIL_BIT;
         if (ds.format != VK_FORMAT_S8_UINT) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (attachment(ds.format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, aspects, stencil, views[1])) return 1;
+        const VkImageUsageFlags ds_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           (stencil_out ? VkImageUsageFlags(VK_IMAGE_USAGE_TRANSFER_SRC_BIT) : VkImageUsageFlags(0));
+        if (attachment(ds.format, ds_usage, aspects, ds_img, views[1])) return 1;
         ds.samples = VK_SAMPLE_COUNT_1_BIT;
-        ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.finalLayout = stencil_ref.layout;
+        ds.loadOp = stencil_out ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ds.storeOp = stencil_out ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ds.stencilStoreOp = stencil_out ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        ds.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ds.finalLayout = stencil_out ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : stencil_ref.layout;
         sd.pDepthStencilAttachment = &stencil_ref;
     }
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpi.attachmentCount = group_readback ? 2 : 1; rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
-    VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    rpi.attachmentCount = (group_readback || stencil_out || msaa4) ? 2 : 1;
+    rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    VkSubpassDependency copy_dep{
+        0, VK_SUBPASS_EXTERNAL,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            (stencil_out ? VkPipelineStageFlags(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT) : VkPipelineStageFlags(0)),
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            (stencil_out ? VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) : VkAccessFlags(0)),
+        VK_ACCESS_TRANSFER_READ_BIT};
     rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
     VkRenderPass rp; CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -461,7 +531,7 @@ int main(int argc, char** argv) {
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = msaa4 ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_1_BIT;
     VkPipelineColorBlendAttachmentState cba{}; cba.colorWriteMask = 0xF;
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
@@ -487,6 +557,21 @@ int main(int argc, char** argv) {
         face.failOp = face.passOp = VK_STENCIL_OP_DECREMENT_AND_WRAP;
         ds_state.back = face;
         gpi.pDepthStencilState = &ds_state;
+    } else if (stencil_out) {
+        // Capture both depth and exported stencil. Use a non-zero fixed pipeline reference (0xaa) so a shader that
+        // fails to replace the stencil reference stands out instead of looking like a cleared 0.
+        ds_state.depthTestEnable = VK_TRUE;
+        ds_state.depthWriteEnable = VK_TRUE;
+        ds_state.depthCompareOp = VK_COMPARE_OP_LESS;
+        ds_state.stencilTestEnable = VK_TRUE;
+        auto& face = ds_state.front;
+        face.compareOp = VK_COMPARE_OP_ALWAYS;
+        face.passOp = VK_STENCIL_OP_REPLACE;
+        face.failOp = face.depthFailOp = VK_STENCIL_OP_KEEP;
+        face.compareMask = face.writeMask = 0xff;
+        face.reference = 0xaa;
+        ds_state.back = face;
+        gpi.pDepthStencilState = &ds_state;
     }
     gpi.layout = pl; gpi.renderPass = rp;
     VkPipeline pipe; CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe));
@@ -503,15 +588,26 @@ int main(int argc, char** argv) {
         LOADD(vkCreateComputePipelines);
         CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &cpipe));
     }
-    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bi.size = VkDeviceSize(W) * H * 16; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VkBuffer buf; CHECK(vkCreateBuffer(dev, &bi, nullptr, &buf));
-    VkMemoryRequirements br; vkGetBufferMemoryRequirements(dev, buf, &br);
-    VkMemoryAllocateInfo bai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    bai.allocationSize = br.size;
-    bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
-    CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    auto make_staging_buf = [&](VkDeviceSize sz, VkBuffer& out_buf, VkDeviceMemory& out_mem) -> int {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = sz; bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        CHECK(vkCreateBuffer(dev, &bci, nullptr, &out_buf));
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, out_buf, &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        CHECK(vkAllocateMemory(dev, &mai, nullptr, &out_mem));
+        CHECK(vkBindBufferMemory(dev, out_buf, out_mem, 0));
+        return 0;
+    };
+    const VkDeviceSize color_bytes = VkDeviceSize(W) * H * 16;
+    VkBuffer buf = VK_NULL_HANDLE, dbuf = VK_NULL_HANDLE, sbuf = VK_NULL_HANDLE;
+    VkDeviceMemory bmem = VK_NULL_HANDLE, dmem = VK_NULL_HANDLE, smem = VK_NULL_HANDLE;
+    if (make_staging_buf(color_bytes, buf, bmem)) return 1;
+    if (stencil_out) {
+        if (make_staging_buf(VkDeviceSize(W) * H * 4, dbuf, dmem)) return 1;
+        if (make_staging_buf(VkDeviceSize(W) * H, sbuf, smem)) return 1;
+    }
     void* heap_map = nullptr;
     if (heap_env) {
         LOADD(vkGetBufferDeviceAddress);
@@ -568,7 +664,11 @@ int main(int argc, char** argv) {
     VkCommandBufferBeginInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     CHECK(vkBeginCommandBuffer(cmd, &cbi));
     VkClearValue clears[2]{};
-    for (float& c : clears[0].color.float32) c = -1;   // marks untouched pixels
+    for (float& c : clears[0].color.float32) c = msaa4 ? 0.0f : -1.0f;   // marks untouched pixels (0 for MSAA resolve)
+    if (stencil_out) {
+        clears[1].depthStencil.depth = 1.0f;
+        clears[1].depthStencil.stencil = 0;
+    }
     if (clip_shifts) {
         const float shifts[] = {float(std::atof(argv[6])), float(std::atof(argv[7]))};
         std::memcpy(pc, shifts, sizeof(shifts));
@@ -612,14 +712,42 @@ int main(int argc, char** argv) {
         vkCmdDraw(cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
-    vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    vkCmdCopyImageToBuffer(cmd, msaa4 ? res_img : img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    if (stencil_out) {
+        VkBufferImageCopy dreg{}; dreg.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}; dreg.imageExtent = {W, H, 1};
+        vkCmdCopyImageToBuffer(cmd, ds_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dbuf, 1, &dreg);
+        VkBufferImageCopy sreg{}; sreg.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}; sreg.imageExtent = {W, H, 1};
+        vkCmdCopyImageToBuffer(cmd, ds_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf, 1, &sreg);
+    }
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
-    void* p; CHECK(vkMapMemory(dev, bmem, 0, bi.size, 0, &p));
+    void* p; CHECK(vkMapMemory(dev, bmem, 0, color_bytes, 0, &p));
     std::ofstream output(argv[3], std::ios::binary);
-    output.write(static_cast<const char*>(p), std::streamsize(bi.size));
+    if (stencil_out) {
+        void *dp = nullptr, *sp = nullptr;
+        CHECK(vkMapMemory(dev, dmem, 0, VkDeviceSize(W) * H * 4, 0, &dp));
+        CHECK(vkMapMemory(dev, smem, 0, VkDeviceSize(W) * H, 0, &sp));
+        const auto* col = static_cast<const float*>(p);
+        const auto* dep = static_cast<const float*>(dp);
+        const auto* stn = static_cast<const uint8_t*>(sp);
+        std::vector<float> out(std::size_t(W) * H * 4);
+        for (std::size_t i = 0; i < std::size_t(W) * H; ++i) {
+            out[4 * i + 0] = col[4 * i + 0];
+            out[4 * i + 1] = col[4 * i + 1];
+            out[4 * i + 2] = dep[i];
+            out[4 * i + 3] = float(stn[i]);
+        }
+        output.write(reinterpret_cast<const char*>(out.data()), std::streamsize(color_bytes));
+    } else if (msaa4) {
+        const auto* bytes = static_cast<const uint8_t*>(p);
+        std::vector<float> out(std::size_t(W) * H * 4);
+        for (std::size_t i = 0; i < out.size(); ++i) out[i] = float(bytes[i]) / 255.0f;
+        output.write(reinterpret_cast<const char*>(out.data()), std::streamsize(color_bytes));
+    } else {
+        output.write(static_cast<const char*>(p), std::streamsize(color_bytes));
+    }
     output.close();
     if (!output) { std::fprintf(stderr, "failed to write %s\n", argv[3]); return 1; }
     if (const char* dump = std::getenv("VKH_HEAP_DUMP"); dump && *dump && heap_map) {

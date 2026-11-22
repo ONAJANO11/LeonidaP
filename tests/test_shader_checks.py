@@ -779,7 +779,6 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertNotIsInstance(self.run_dump(name, 0, out + self.words(name, flip=True)), check.Skip)
 
 
-
 class SamplerMipChecks(unittest.TestCase):
     """The S#/T# oracle check.py judges vk_sampler_test with, against hand-worked levels."""
 
@@ -816,6 +815,61 @@ class SamplerMipChecks(unittest.TestCase):
         swapped = b"".join(struct.pack("<4f", *check.sampler_texel(0, y, x), *check.sampler_texel(1, y, x))
                            for y in range(64) for x in range(64))
         self.assertTrue(check.sampler_mismatch(swapped, words, view).startswith("(32,0):"))
+
+
+class MrtzPixelChecks(unittest.TestCase):
+    """MRTZ stencil/depth/sample-mask pixel checks (SHADER-224): exact match, mismatch detection and SKIP on exit 77."""
+
+    def _stencil_frame(self, name):
+        out = []
+        for i in range(64 * 64):
+            x, y = i % 64, i // 64
+            mask = (0xF7584210 >> (4 * (x >> 3))) & 0xF
+            if mask & 1:
+                d = (0.25 + 0.5 * (x + 0.5) / 64.0) if name == "ps_mrtz_uncompr" else 0.0
+                s = float(((x + 3 * y + 11) if name == "ps_mrtz_uncompr" else (3 * x + y + 17)) & 0xFF)
+                out.append((1.0, 1.0, d, s))
+            else:
+                out.append((-1.0, -1.0, 1.0, 0.0))
+        return out
+
+    def _msaa_frame(self):
+        out = []
+        for i in range(64 * 64):
+            mask = (0xF7584210 >> (4 * ((i % 64) >> 3))) & 0xF
+            cov = bin(mask).count("1") / 4.0
+            out.append((cov, cov, cov, cov))
+        return out
+
+    def test_mrtz_checkers_accept_exact_and_reject_mismatches(self):
+        for name in ("ps_mrtz_uncompr", "ps_mrtz_compr"):
+            px = self._stencil_frame(name)
+            self.assertEqual(check.mrtz_stencil_problem(name, px), "")
+            bad = list(px)
+            bad[8] = (1.0, 1.0, px[8][2], (px[8][3] + 1) % 256)
+            self.assertIn("stencil/depth:", check.mrtz_stencil_problem(name, bad))
+        msaa = self._msaa_frame()
+        self.assertEqual(check.mrtz_msaa_problem(msaa), "")
+        bad_msaa = list(msaa)
+        bad_msaa[16] = (0.0, 0.0, 0.0, 0.0)   # stripe 2 expects 0.25
+        self.assertIn("msaa4:", check.mrtz_msaa_problem(bad_msaa))
+
+    def test_mrtz_skips_when_stencil_export_is_unavailable(self):
+        def harness(_tool, _vs, _fs, _raw, env=None):
+            return 77, "unsupported: ps_mrtz_uncompr.spv exports stencil and the device has no VK_EXT_shader_stencil_export\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv = Path(tmp) / "spirv"
+            spirv.mkdir()
+            (spirv / "ps_mrtz_uncompr.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                res = check.pixel_test(tmp, str(spirv), "ps_mrtz_uncompr")
+        self.assertIsInstance(res, check.Skip)
+        self.assertIn("VK_EXT_shader_stencil_export", res)
+
+    def test_mrtz_tests_registered_in_pixel_tests(self):
+        for name in check.MRTZ_TESTS:
+            self.assertIn(name, check.PIXEL_TESTS)
 
 if __name__ == "__main__":
     unittest.main()

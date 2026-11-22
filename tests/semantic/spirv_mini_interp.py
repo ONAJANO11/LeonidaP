@@ -1068,6 +1068,6 @@ def _invocation(text, inputs, push_constants, memory, step=False):
     result = {}
     for name in outputs:
         v = var_box[name][0]
-        flat = v if isinstance(v, tuple) else (v,)
+        flat = v if isinstance(v, (tuple, list)) else (v,)
         result[name] = tuple(f32_bits(x) if isinstance(x, float) else x & MASK for x in flat)
     return result

@@ -111,17 +111,22 @@ class SpirvStubsTests(unittest.TestCase):
 
 class ShaderMetaTests(unittest.TestCase):
     def test_shader_meta_graphics_fields(self):
-        # PS with flat + interpolated inputs and depth write.
+        # PS with flat + interpolated inputs and depth/stencil/sample-mask writes.
         g = rdna2spirv.Gen("ps")
         g.inputs = {"%in_0": 0, "%in_1": 1}
         g.interpolated = {"%in_1"}
         g.outputs = {"%out_0": "mrt0", "%out_2": "mrt2"}
         g.writes_depth = True
-        m = rdna2spirv.shader_meta(g, "OpCapability Shader\n")
+        g.writes_stencil = True
+        g.writes_sample_mask = True
+        m = rdna2spirv.shader_meta(g, "OpCapability Shader\nOpCapability StencilExportEXT\n")
         self.assertEqual(m["stage"], "ps")
         self.assertEqual(m["inputs"], [0, 1])
         self.assertEqual(m["outputs"], [0, 2])
         self.assertTrue(m["writes_depth"])
+        self.assertTrue(m["writes_stencil"])
+        self.assertTrue(m["writes_sample_mask"])
+        self.assertIn("shaderStencilExport", m["features"])
 
         # GS separating BuiltIn Position (sv == 1) from Location registers.
         gg = rdna2spirv.Gen("gs")
