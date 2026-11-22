@@ -43,6 +43,8 @@ public:
     std::uint32_t family = 0;
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
+    bool vertex_divisor = false;       // VK_KHR_vertex_attribute_divisor, instance-rate divisors
+    bool vertex_zero_divisor = false;  // and divisor 0
 
     Device() = default;
     Device(const Device&) = delete;
@@ -208,11 +210,31 @@ public:
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
         device_info.pEnabledFeatures = &enable;
-        const char* swapchain = "VK_KHR_swapchain";
-        if (presentation) {
-            device_info.enabledExtensionCount = 1;
-            device_info.ppEnabledExtensionNames = &swapchain;
+        std::vector<const char*> device_extensions;
+        if (presentation) device_extensions.push_back("VK_KHR_swapchain");
+        // Instance-rate divisors (D3D12 InstanceDataStepRate), where the GPU has them.
+        std::uint32_t extension_total = 0;
+        const auto enumerate_extensions =
+            instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        enumerate_extensions(physical, nullptr, &extension_total, nullptr);
+        std::vector<VkExtensionProperties> available(extension_total);
+        enumerate_extensions(physical, nullptr, &extension_total, available.data());
+        VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+        for (const auto& extension : available) {
+            if (std::strcmp(extension.extensionName, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &divisor};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            vertex_divisor = divisor.vertexAttributeInstanceRateDivisor == VK_TRUE;
+            vertex_zero_divisor = vertex_divisor && divisor.vertexAttributeInstanceRateZeroDivisor == VK_TRUE;
+            if (vertex_divisor) {
+                device_extensions.push_back(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+                divisor.pNext = enable13.pNext;
+                enable13.pNext = &divisor;
+            }
         }
+        device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
+        device_info.ppEnabledExtensionNames = device_extensions.data();
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)
             return false;
         device_proc = instance_fn<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");

@@ -52,6 +52,11 @@ struct VulkanDeviceInfo {
     // bufferDeviceAddress enabled: buffers and shader-visible heaps then live in the GPU address arena and have
     // console VAs (docs section 3.3); without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
     bool buffer_device_address = false;
+    // VK_KHR_vertex_attribute_divisor and its vertexAttributeInstanceRateDivisor feature are enabled on `device`:
+    // InstanceDataStepRate above 1 becomes a binding divisor. vertex_zero_divisor: vertexAttributeInstanceRateZeroDivisor
+    // too, for a step rate of 0 (every instance reads the first element). Without them those rates step every instance.
+    bool vertex_divisor = false;
+    bool vertex_zero_divisor = false;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;

@@ -699,6 +699,7 @@ public:
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
+        std::vector<VkVertexInputBindingDivisorDescriptionKHR> divisors;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
         for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
@@ -721,12 +722,21 @@ public:
             if (!input) continue;  // the shader does not read this element
             attributes.push_back({input->register_index, element.InputSlot, format, offset});
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
-            if (instance && element.InstanceDataStepRate > 1)
-                log_once("instance step rates above 1 are not modelled; rate", int(element.InstanceDataStepRate));
             if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
                 graphics_.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
                                     instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
+                // InstanceDataStepRate: advance every N instances (0: never). Vulkan sets it per binding, D3D12 per
+                // element; the first element read from a slot names it.
+                const UINT rate = element.InstanceDataStepRate;
+                if (instance && rate != 1) {
+                    const bool can = rate ? device_.info.vertex_divisor : device_.info.vertex_zero_divisor;
+                    if (can)
+                        divisors.push_back({element.InputSlot, rate});
+                    else
+                        log_once("instance step rate without vertex-attribute-divisor support: every instance steps; "
+                                 "rate", int(rate));
+                }
             }
         }
         for (const auto& e : stages[0].entry->input_signature) {
@@ -744,6 +754,13 @@ public:
         vertex_input.pVertexBindingDescriptions = bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(attributes.size());
         vertex_input.pVertexAttributeDescriptions = attributes.data();
+        VkPipelineVertexInputDivisorStateCreateInfoKHR divisor_state{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR};
+        if (!divisors.empty()) {
+            divisor_state.vertexBindingDivisorCount = std::uint32_t(divisors.size());
+            divisor_state.pVertexBindingDivisors = divisors.data();
+            vertex_input.pNext = &divisor_state;
+        }
 
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         switch (desc.PrimitiveTopologyType) {
@@ -1747,10 +1764,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, device_extensions.data());
     const char* swapchain = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     info.presentation = surfaces && has(device_extensions, swapchain);
-    if (info.presentation) {
-        device_info.enabledExtensionCount = 1;
-        device_info.ppEnabledExtensionNames = &swapchain;
+    std::vector<const char*> enabled_extensions;
+    if (info.presentation) enabled_extensions.push_back(swapchain);
+    // InstanceDataStepRate (VulkanDeviceInfo::vertex_divisor), where the GPU has it.
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR};
+    if (has(device_extensions, VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &divisor};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.vertex_divisor = divisor.vertexAttributeInstanceRateDivisor == VK_TRUE;
+        info.vertex_zero_divisor = info.vertex_divisor && divisor.vertexAttributeInstanceRateZeroDivisor == VK_TRUE;
+        if (info.vertex_divisor) {
+            enabled_extensions.push_back(VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+            divisor.pNext = enable13.pNext;
+            enable13.pNext = &divisor;
+        }
     }
+    device_info.enabledExtensionCount = std::uint32_t(enabled_extensions.size());
+    device_info.ppEnabledExtensionNames = enabled_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
     info.device = owned.device;

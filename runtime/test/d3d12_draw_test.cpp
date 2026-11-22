@@ -65,6 +65,7 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
+    bool step_rates_checked = false;  // the instance step-rate pass ran (vertex-attribute-divisor support)
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -74,6 +75,8 @@ int main() {
         info.queue = d.queue;
         info.queue_family = d.family;
         info.buffer_device_address = true;
+        info.vertex_divisor = d.vertex_divisor;
+        info.vertex_zero_divisor = d.vertex_zero_divisor;
         info.shader_dir = library.string();
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -239,6 +242,71 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
         std::memcpy(pixels.data(), mapped, pixels.size());
 
+        // InstanceDataStepRate: the top-left quad drawn as 4 instances in one place, COLOR read per instance from slot 1
+        // (red, blue, magenta, black). The last instance wins: with step rate 2 it reads colour 1 (blue), with step
+        // rate 1 colour 3 (black), with step rate 0 colour 0 (red). The pixel shader keeps red and blue and takes
+        // green from the tint, which is (1, 0, 1) here, over a green target. Rate 2 goes top-left, rate 1 top-right,
+        // rate 0 bottom-right; bottom-left stays green.
+        const std::uint8_t instance_colours[4][4] = {{255, 0, 0, 255}, {0, 0, 255, 255}, {255, 0, 255, 255}, {0, 0, 0, 255}};
+        std::memcpy(up + 1536, instance_colours, sizeof(instance_colours));
+        Ref<ID3D12PipelineState> step_pso[3];
+        const UINT rates[3] = {2, 1, 0};
+        for (UINT k = 0; k < 3; ++k) {
+            const D3D12_INPUT_ELEMENT_DESC stepped[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, rates[k]}};
+            pso_desc.InputLayout = {stepped, 2};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&step_pso[k].p))));
+        }
+        if (d.vertex_divisor && step_pso[0].p && step_pso[1].p && step_pso[2].p) {
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, step_pso[0].p)));
+            D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &to_target);
+            const FLOAT green[4] = {0, 1, 0, 1};
+            list->ClearRenderTargetView(rtv, green, 0, nullptr);
+            list->SetGraphicsRootSignature(root.p);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const D3D12_VERTEX_BUFFER_VIEW slots[2] = {vbv, {upload_va + 1536, sizeof(instance_colours), 4}};
+            list->IASetVertexBuffers(0, 2, slots);
+            list->IASetIndexBuffer(&ibv);
+            list->RSSetViewports(1, &viewport);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);  // tint (1, 0, 1)
+            const float right[2] = {1, 0};
+            const float* offsets[3] = {origin, right, down_right};
+            for (UINT k = 0; k < 3; ++k) {
+                list->SetPipelineState(step_pso[k].p);
+                list->SetGraphicsRoot32BitConstants(0, 2, offsets[k], 0);
+                list->DrawIndexedInstanced(6, 4, 0, 0, 0);
+            }
+            list->ResourceBarrier(1, &to_copy);
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            unsigned step_mismatches = 0;
+            const auto* step_pixels = static_cast<const std::uint8_t*>(mapped);
+            for (UINT row = 0; row < size; ++row)
+                for (UINT col = 0; col < size; ++col) {
+                    const bool top = row < size / 2, left = col < size / 2;
+                    if (!top && !left && !d.vertex_zero_divisor) continue;  // rate 0 needs the zero divisor
+                    const std::array<std::uint8_t, 4> want = top && left ? std::array<std::uint8_t, 4>{0, 0, 255, 255}
+                                                           : top         ? std::array<std::uint8_t, 4>{0, 0, 0, 255}
+                                                           : !left       ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
+                                                                         : std::array<std::uint8_t, 4>{0, 255, 0, 255};
+                    const std::uint8_t* got = step_pixels + row * 256 + col * 4;
+                    if (std::equal(want.begin(), want.end(), got)) continue;
+                    if (step_mismatches++ < 4)
+                        std::fprintf(stderr, "step-rate pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col,
+                                     row, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+                }
+            EXPECT(!step_mismatches);
+            step_rates_checked = true;
+        }
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);
@@ -247,6 +315,7 @@ int main() {
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
         pso.reset();
+        for (auto& stepped_pso : step_pso) stepped_pso.reset();
         root.reset();
         rtv_heap.reset();
         list.reset();
@@ -277,7 +346,7 @@ int main() {
         return 1;
     }
     std::printf("M1: two indexed draws and a culled triangle matched all %u pixels: input layout by semantic, root "
-                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap\n",
-                size * size);
+                "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap%s\n",
+                size * size, step_rates_checked ? "; instance step rates 2, 1 and 0 matched too" : "");
     return 0;
 }
