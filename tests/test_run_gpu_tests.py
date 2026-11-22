@@ -1,6 +1,7 @@
 """scripts/run_gpu_tests.py: how it judges the output of a compute "dump" test (no device needed)."""
 import contextlib
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -142,6 +143,44 @@ class FilterWithoutRunnableCases(unittest.TestCase):
         self.assertEqual(err, "error: --filter 'unmatched_nicofilter' matched no GPU test cases\n")
         asm.assert_not_called()
         run.assert_not_called()
+
+
+class StorageImageTestWithoutFormatFeatures(unittest.TestCase):
+    """vk_store_test exits 77 without shaderStorageImage{Read,Write}WithoutFormat: a SKIP, not a FAIL."""
+
+    def run_one(self, name, rc, msg):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def fake_run(cmd, env=None, gpu=True):
+                if os.path.basename(cmd[0]).startswith("vk_store_test"):
+                    return rc, msg
+                (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=fake_run),
+                  contextlib.redirect_stdout(output)):
+                code = rgt.run_suite(args, tmp)
+            return code, output.getvalue()
+
+    def test_unsupported_device_skips(self):
+        for name, line in (("cs_imgload", "unsupported: shaderStorageImageReadWithoutFormat"),
+                           ("cs_imgstore", "unsupported: shaderStorageImageWriteWithoutFormat=0 shaderInt64=1")):
+            with self.subTest(name=name):
+                code, out = self.run_one(name, 77, f"device: Intel(R) UHD Graphics 770\n{line}\n")
+                self.assertEqual(code, 0, out)
+                self.assertIn(f"SKIP ({line})", out)
+                self.assertIn("0/1 passed, 1 skipped", out)
+
+    def test_other_nonzero_exit_still_fails(self):
+        for name in ("cs_imgload", "cs_imgstore"):
+            with self.subTest(name=name):
+                code, out = self.run_one(name, 1, "device: X\nr32 uint (uint view): 3 bad\n")
+                self.assertEqual(code, 1, out)
+                self.assertIn("0/1 passed", out)
 
 
 class WholeWaveDump(unittest.TestCase):

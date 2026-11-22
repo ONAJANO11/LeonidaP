@@ -225,6 +225,14 @@ def unsupported_skip(msg: str) -> str:
     return f"SKIP ({m.group(0) if m else 'unsupported device'})"
 
 
+def store_test_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """(ok, detail) for vk_store_test, which exits UNSUPPORTED on a device without
+    shaderStorageImageReadWithoutFormat (load) or shaderStorageImageWriteWithoutFormat/shaderInt64 (store)."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, msg.splitlines()[-1] if msg else ""
+
+
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
     # gpu=False (the translator over the whole suite) runs without a limit.
@@ -782,10 +790,10 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, *store_test_result(rc, msg)))
         elif name == "cs_imgload":
             rc, msg = run_cmd([vk_store, spv, "load"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+            results.append((name, *store_test_result(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
