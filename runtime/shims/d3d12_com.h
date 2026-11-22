@@ -135,6 +135,9 @@ struct VulkanDeviceInfo {
     // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
     // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
     bool xdxr_acceleration_structures = false;
+    // VK_EXT_depth_clip_enable and its depthClipEnable feature are enabled on the logical device. With depthClamp
+    // as well, a PSO clamps depth to the viewport range whatever DepthClipEnable says, as D3D12 does.
+    bool depth_clip_enable = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
