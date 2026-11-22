@@ -420,6 +420,9 @@ int compare_allocation_info(ID3D12Device* ours) {
         {"8x8 array of 6", texture_desc(8, 8, rgba8, none, 4, 6), 8 * 8 * 4 * 6},
         {"32x32x8 volume", big_volume, 32 * 32 * 8 * 4},
         {"64x64 4x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 4), 64 * 64 * 4 * 4},
+        {"64x64 32x MSAA", with(texture_desc(64, 64, rgba8, rt), 0, 32), 64 * 64 * 4 * 32},
+        {"64x64 64x MSAA (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 64), 0},
+        {"64x64 zero sample count (invalid)", with(texture_desc(64, 64, rgba8, rt), 0, 0), 0},
         {"64x64 4x MSAA small", with(texture_desc(64, 64, rgba8, rt), k64, 4), 64 * 64 * 4 * 4},
         {"1024x1024 4x MSAA small", with(texture_desc(1024, 1024, rgba8, rt), k64, 4), 1024 * 1024 * 4 * 4},
         {"zero width", texture_desc(0, 16, rgba8, none), 0},
@@ -762,6 +765,95 @@ bool capture_resolve(ID3D12Device* device, DXGI_FORMAT format, UINT samples, Res
     return true;
 }
 
+
+int validate_sample_descriptions(ID3D12Device* device) {
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    int failures = 0;
+    const auto rejected = [&](const char* label, const D3D12_RESOURCE_DESC& desc) {
+        Ref<ID3D12Resource> resource;
+        const HRESULT hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                            IID_PPV_ARGS(&resource.p));
+        if (hr == E_INVALIDARG && !resource.p) return;
+        std::fprintf(stderr, "sample description %s: expected E_INVALIDARG and no resource, got HRESULT 0x%08lx\n",
+                     label, static_cast<unsigned long>(hr));
+        ++failures;
+    };
+
+    D3D12_RESOURCE_DESC buffer = buffer_desc(256);
+    buffer.SampleDesc.Count = 0;
+    rejected("buffer count 0", buffer);
+    buffer.SampleDesc.Count = 1;
+    buffer.SampleDesc.Quality = 1;
+    rejected("buffer quality 1", buffer);
+
+    D3D12_RESOURCE_DESC texture =
+        texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    texture.SampleDesc.Count = 0;
+    rejected("texture count 0", texture);
+    texture.SampleDesc.Count = 64;
+    rejected("texture count 64", texture);
+    texture.SampleDesc.Count = 4;
+    texture.SampleDesc.Quality = 1;
+    rejected("texture quality 1", texture);
+
+    D3D12_RESOURCE_DESC allocation =
+        texture_desc(8, 8, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    allocation.SampleDesc.Count = 4;
+    allocation.SampleDesc.Quality = 1;
+    const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &allocation);
+    if (info.SizeInBytes != UINT64_MAX) {
+        std::fprintf(stderr, "sample description allocation quality 1: expected invalid allocation, got %llu bytes\n",
+                     static_cast<unsigned long long>(info.SizeInBytes));
+        ++failures;
+    }
+    std::printf("Sample-description validation: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
+    return failures;
+}
+
+int compare_depth_multisample_quality_levels(ID3D12Device* ours) {
+    Ref<ID3D12Device> host;
+    if (!create_host_device(host)) return -1;
+
+    constexpr DXGI_FORMAT formats[] = {
+        DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_D16_UNORM,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    };
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
+    unsigned compared = 0, skipped = 0;
+    int mismatches = 0;
+    for (DXGI_FORMAT format : formats) {
+        for (UINT samples : sample_counts) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS host_levels{};
+            host_levels.Format = format;
+            host_levels.SampleCount = samples;
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS our_levels = host_levels;
+            const HRESULT host_hr = host->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                               &host_levels, sizeof(host_levels));
+            if (FAILED(host_hr) || host_levels.NumQualityLevels == 0) {
+                ++skipped;
+                continue;
+            }
+            ++compared;
+            const HRESULT our_hr = ours->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                             &our_levels, sizeof(our_levels));
+            if (FAILED(our_hr) || our_levels.NumQualityLevels != 1) {
+                std::fprintf(stderr,
+                             "depth MSAA quality mismatch: format %d samples %u (host %u quality levels, Vulkan "
+                             "HRESULT 0x%08lx / %u levels)\n",
+                             int(format), samples, host_levels.NumQualityLevels,
+                             static_cast<unsigned long>(our_hr), our_levels.NumQualityLevels);
+                ++mismatches;
+            }
+        }
+    }
+    std::printf("Depth/stencil MSAA quality queries: %u compared, %u host-unsupported skipped, %d mismatches\n",
+                compared, skipped, mismatches);
+    return mismatches;
+}
+
 // Compare the Vulkan-backed resolve output byte-for-byte with the host runtime for every common supported format,
 // sample count and region form. A host-unsupported combination is a deliberate skip; a mismatch in advertised
 // support or in the resulting pixels is a failure.
@@ -776,7 +868,7 @@ int compare_resolves(ID3D12Device* ours) {
         DXGI_FORMAT_R16G16B16A16_FLOAT,
         DXGI_FORMAT_R32G32B32A32_FLOAT,
     };
-    constexpr UINT sample_counts[] = {2, 4, 8, 16};
+    constexpr UINT sample_counts[] = {2, 4, 8, 16, 32};
     constexpr UINT required =
         UINT(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) | UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET) |
         UINT(D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
@@ -958,6 +1050,13 @@ int main() {
             std::printf("GetResourceTiling: no host D3D12 device with tiled resources, or no layout it accepts; "
                         "skipped\n");
         EXPECT(tiling_mismatches <= 0);
+
+        const int sample_validation_failures = validate_sample_descriptions(device.p);
+        EXPECT(sample_validation_failures == 0);
+        const int depth_quality_mismatches = compare_depth_multisample_quality_levels(device.p);
+        if (depth_quality_mismatches < 0)
+            std::printf("Depth/stencil MSAA quality queries: no host D3D12 device to compare with, skipped\n");
+        EXPECT(depth_quality_mismatches <= 0);
 
         const int resolve_mismatches = compare_resolves(device.p);
         if (resolve_mismatches < 0)

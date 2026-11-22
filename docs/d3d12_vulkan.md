@@ -664,9 +664,11 @@ The trace will enumerate them.
   "supported" is worse than a false "unsupported" at boot.
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed.
-- `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the same
-  colour-attachment, transfer and sampled usages used by render-target textures. Vulkan exposes one standard sample
-  pattern, so a supported sample count reports one quality level (quality index 0).
+- `D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS`: query `vkGetPhysicalDeviceImageFormatProperties` for the matching
+  colour or depth/stencil attachment usage, plus the transfer and sampled usages used by resource creation. Vulkan
+  exposes one standard sample pattern, so a supported sample count reports one quality level (quality index 0).
+  Only D3D12-legal sample counts (powers of two from 2 through 32) are exposed; zero, larger counts and nonzero
+  quality indices are rejected consistently by resource creation and allocation queries.
 - `D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT` (`D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT`): report the
   arena's limits, not the console's.
 - `GetResourceAllocationInfo` and `GetCopyableFootprints`: implement D3D12's rules locally; the game uses them to
