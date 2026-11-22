@@ -16,7 +16,8 @@ fs_passthru.spv; here the mesh checks run when those files are in <out dir>/spir
 ps_tex is skipped when the device lacks a feature the bindless set or the shader needs, ps_ssharp when it lacks one
 vk_sampler_test needs.
 ps_texoff (texel offsets, on vk_texture_test's texture) is skipped on a device without VK_KHR_maintenance8.
-The TEXTURE_MODES shaders run in one of vk_texture_test's own modes, which judges every pixel itself.
+The TEXTURE_MODES shaders run in one of vk_texture_test's own modes, which judges every pixel itself;
+ps_texture_sample_d16 is checked here pixel by pixel.
 """
 import collections
 import json
@@ -867,6 +868,43 @@ def texture_mode_test(tools, spirv, name):
     return "" if code == 0 and "PASSED" in out else failure(code, out, 3)
 
 
+def check_d16_texture(raw_path) -> tuple[bool, str]:
+    """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
+    data = Path(raw_path).read_bytes()
+    if len(data) != 64 * 64 * 16:
+        return False, f"expected a 64x64 RGBA32F frame, got {len(data)} bytes"
+    levels = [struct.unpack("<e", struct.pack("<e", i * 32 / 255.0))[0] for i in range(8)]
+    bad = 0
+    first = ""
+    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
+        x, y = i % 64, i // 64
+        expected = (levels[x // 8], levels[y // 8], levels[4], 1.0)
+        if pixel != expected:
+            if not bad:
+                first = f"at ({x},{y}): got {pixel}, want {expected}"
+            bad += 1
+    return (False, f"{bad}/4096 mismatches; {first}") if bad else (True, "4096/4096 RGBA pixels exact")
+
+
+def texture_sample_d16_test(tools, spirv):
+    """ps_texture_sample_d16 on vk_texture_test's 8x8 gradient, judged by check_d16_texture as
+    scripts/run_gpu_tests.py does."""
+    vs, fs = (os.path.join(spirv, name + ".spv") for name in ("vs_ids", "ps_texture_sample_d16"))
+    for path in (vs, fs):
+        if not os.path.isfile(path):
+            return f"missing {os.path.basename(path)}"
+    with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
+        raw = Path(tmp) / "pixels.raw"
+        code, out = run(os.path.join(tools, "vk_texture_test" + EXE), vs, fs, raw, "0", "0", "0", "0", "0")
+        if code == UNSUPPORTED:
+            m = re.search(r"unsupported: .*", out)
+            return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+        if code or not raw.is_file():
+            return failure(code, out, 3)
+        ok, detail = check_d16_texture(raw)
+    return "" if ok else detail
+
+
 def pixels(tools, spirv, name, fmt, vertex="vs_ids"):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -1287,6 +1325,7 @@ def main():
         results.append((name, texture_gradient_a16_test(tools, spirv, name)))
     for name in TEXTURE_MODES:
         results.append((name, texture_mode_test(tools, spirv, name)))
+    results.append(("ps_texture_sample_d16", texture_sample_d16_test(tools, spirv)))
     for name, problem in results:
         if problem is None:
             problem = "SKIP (full 64-wide compute subgroups unavailable)"
