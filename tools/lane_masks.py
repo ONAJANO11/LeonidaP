@@ -159,6 +159,81 @@ def step(state, ins):
             put(state, a[1], MASK)                      # carry/sign lane mask of v_add_co_u32, v_mad_u64_u32, etc.
 
 
+# Instructions that read a lane mask as a mask: they look at it lane by lane (cndmask selector, carry-in, EXEC
+# save), count or find lanes in it (bcnt, ff1, mbcnt, through the translator's wave ballot), compare it, or carry it
+# to another register that is still a mask (copies, parking in a VGPR lane). Their mask operands stay one bit per
+# lane. The mask operand of v_cndmask and of the carry-in ops is handled by position below.
+MASK_READERS = ("s_bcnt", "s_ff0", "s_ff1", "v_mbcnt", "s_bfm", "v_readfirstlane", "v_readlane", "v_writelane") + \
+    COPIES + NO_DESTINATION
+CARRY_IN = ("v_addc", "v_subb", "v_subbrev", "_co_ci_")
+# First operand is a source: the data a store writes (an atomic's data, which it may also return into).
+STORES = ("buffer_store", "tbuffer_store", "global_store", "flat_store", "scratch_store", "ds_write", "ds_store",
+          "image_store", "buffer_atomic", "global_atomic", "flat_atomic", "image_atomic", "s_store", "s_buffer_store")
+
+
+def reg_keys(a):
+    """The 32-bit registers operand `a` reads: ("sgpr", n), ("vgpr", n) or ("special", name)."""
+    if a["k"] in ("sgpr", "vgpr"):
+        return [(a["k"], a["r"] + i) for i in range(a.get("n", 1))]
+    if a["k"] == "special" and a.get("t") in ("exec_lo", "exec_hi", "vcc_lo", "vcc_hi"):
+        return [("special", a["t"])]
+    if a["k"] == "special" and a.get("t") in ("exec", "vcc"):
+        return [("special", a["t"] + "_lo"), ("special", a["t"] + "_hi")]
+    return []
+
+
+def reg_kind(state, key):
+    """The mask kind of one 32-bit register: MASK_LO (lanes 0-31), MASK_HI (lanes 32-63), MASK (a wave32 mask, or a
+    VGPR mixing both halves), or None."""
+    k, r = key
+    if k == "special":
+        if r.startswith("exec"):
+            return MASK_LO if r == "exec_lo" else MASK_HI
+        vk = state.get("vcc")
+        if vk not in MASK_KINDS:
+            return None
+        return MASK_LO if r == "vcc_lo" else MASK_HI
+    k = state.get(r if k == "sgpr" else ("v", r))
+    return k if k in MASK_KINDS else None
+
+
+def data_reads(ins, state):
+    """The registers that hold a lane mask but that `ins` reads as plain 32-bit data, as {key: kind} (keys as in
+    reg_keys). On hardware such a read sees the wave's bits (0xfafafafa, say); here the register holds this lane's
+    bit, so the translator has to put the wave's bits together first (#210). Mask readers (MASK_READERS, and
+    bitwise ops whose result is still a mask) are left alone, and so are instructions that write EXEC or VCC, which
+    take a value as this lane's bit."""
+    op, a = base_op(ins["op"]), ins["args"]
+    if not a or op.startswith(MASK_READERS) or "_saveexec_b" in op or "_wrexec_b" in op:
+        return {}
+    if op.startswith(("s_", "v_")) and not op.startswith("v_cmp") and a[0]["k"] == "special" and \
+            a[0].get("t", "").startswith(("exec", "vcc")):
+        return {}
+    if op.startswith(BITWISE) or (op in VECTOR_BITWISE and a[0].get("n", 1) == 1):
+        kinds = [kind(state, x) for x in a[1:]]
+        if None not in kinds and any(k in MASK_KINDS for k in kinds):
+            return {}                                   # the result is a mask too
+    if op.startswith(STORES):
+        srcs = list(a)                                  # no destination operand
+    elif op.startswith("v_") and "_co_" in op and len(a) > 2:
+        srcs = a[2:]                                    # vD, carry-out, then the sources
+    elif op.startswith("v_cmp") and len(a) == 2:
+        srcs = list(a)                                  # implicit VCC destination
+    else:
+        srcs = a[1:]
+    if op.startswith("v_cndmask") and len(srcs) > 2:
+        srcs = srcs[:2]                                 # the selector is a mask
+    if any(c in op for c in CARRY_IN) and len(srcs) > 2:
+        srcs = srcs[:-1]                                # the carry-in is a mask
+    out = {}
+    for x in srcs:
+        for key in reg_keys(x):
+            k = reg_kind(state, key)
+            if k is not None:
+                out[key] = k
+    return out
+
+
 def parked(blocks, masks):
     """The (vgpr, lane) slots some v_readlane_b32 fetches a mask from, given analyse()'s result."""
     found = set()
@@ -172,7 +247,9 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ):
+def analyse(blocks, succ, reads=None):
+    """masks, writes as described at the top. When `reads` is a dict, it also gets id(ins) -> data_reads(ins)
+    for every instruction that reads a lane mask as data."""
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -205,6 +282,10 @@ def analyse(blocks, succ):
         state = dict(entry[n] or {})
         for ins in blk:
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
+            if reads is not None:
+                dr = data_reads(ins, state)
+                if dr:
+                    reads[id(ins)] = dr
             if step(state, ins):
                 writes.add(id(ins))
     return out, writes

@@ -22,6 +22,9 @@ FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
 # The other wave64-only dump tests (#73's cs_wm_*, the cs_w64x_* cross-half tests): name -> expected out[] words.
 WAVE64_DUMPS = {n: w for n, w in check.CS_DUMPS + check.W64X_DUMPS + check.W64X_PARTIAL
                 if n not in (*check.WAVE32_DUMPS, "cs_wave64_ballot")}
+# Wave32 dump tests besides cs_store and cs_smem_soffset_imm (cs_wm_as_data32): name -> expected out[] words.
+WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS
+                if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}
 # A group smaller than a wave can't ask for full subgroups: it asks for subgroup size 64 and reads the device's range.
 PARTIAL = {n for n, _ in check.W64X_PARTIAL}
 WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n not in ("cs_store", "cs_smem_soffset_imm")}

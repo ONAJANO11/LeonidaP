@@ -150,10 +150,57 @@ def test_bfm64_and_half_kinds():
     assert got3 == {6: L.MASK}
 
 
+def reads_of(prog, wave_ins=-1):
+    """data_reads of prog[wave_ins] in a one-block program."""
+    reads = {}
+    L.analyse([prog], [[]], reads=reads)
+    return reads.get(id(prog[wave_ins]), {})
+
+
+def test_data_reads():
+    cmp = ins("v_cmp_ne_u32_e64", s(20, 2), imm(0), v(5))       # s[20:21] = a wave64 lane mask
+    # A mask read as a value: the half it is gets gathered (#210).
+    assert reads_of([cmp, ins("s_lshr_b32", s(40), s(20), imm(1))]) == {("sgpr", 20): L.MASK_LO}
+    assert reads_of([cmp, ins("s_add_u32", s(40), s(21), imm(3))]) == {("sgpr", 21): L.MASK_HI}
+    assert reads_of([cmp, ins("s_lshr_b64", s(40, 2), s(20, 2), imm(4))]) ==         {("sgpr", 20): L.MASK_LO, ("sgpr", 21): L.MASK_HI}
+    assert reads_of([cmp, ins("v_add_nc_u32_e64", v(1), s(20), imm(1))]) == {("sgpr", 20): L.MASK_LO}
+    assert reads_of([cmp, ins("s_and_b32", s(40), s(20), imm(0xFF))]) == {("sgpr", 20): L.MASK_LO}
+    # Through a copy, a VGPR (v_mov_b32 keeps it a mask) or a parked lane: read where it becomes data.
+    copy = ins("s_mov_b64", s(40, 2), s(20, 2))
+    assert reads_of([cmp, copy]) == {}
+    assert reads_of([cmp, copy, ins("v_mov_b32_e32", v(1), s(41))]) == {}
+    mov = ins("v_mov_b32_e32", v(10), s(20))
+    store = ins("buffer_store_dword", v(10), v(2), s(0, 4), imm(0))
+    assert reads_of([cmp, mov]) == {}
+    assert reads_of([cmp, mov, store]) == {("vgpr", 10): L.MASK_LO}
+    park = [cmp, ins("v_writelane_b32", v(20), s(20), imm(0)), ins("v_readlane_b32", s(44), v(20), imm(0))]
+    assert reads_of(park, 1) == {} and reads_of(park, 2) == {}
+    assert reads_of(park + [ins("s_add_u32", s(45), s(44), imm(1))]) == {("sgpr", 44): L.MASK_LO}
+    # Mask readers and mask results are left alone.
+    for use in (ins("s_bcnt1_i32_b64", s(8), s(20, 2)), ins("s_ff1_i32_b32", s(8), s(20)),
+                ins("v_mbcnt_lo_u32_b32", v(1), s(20), imm(0)), ins("s_cmp_lg_u32", s(20), imm(0)),
+                ins("s_and_b64", s(40, 2), s(20, 2), sp("exec")), ins("s_or_b32", s(40), s(20), imm(0)),
+                ins("s_and_saveexec_b64", s(40, 2), s(20, 2)), ins("s_mov_b64", sp("exec"), s(20, 2)),
+                ins("s_and_b64", sp("exec"), s(20, 2), s(2, 2)), ins("v_readfirstlane_b32", s(40), v(5))):
+        assert reads_of([cmp, use]) == {}, use["op"]
+    # v_cndmask: the selector is a mask, the values are data. Carry-in likewise.
+    assert reads_of([cmp, ins("v_cndmask_b32_e64", v(1), imm(7), s(21), s(20, 2))]) == {("sgpr", 21): L.MASK_HI}
+    assert reads_of([cmp, ins("v_add_co_ci_u32_e64", v(1), s(30), v(2), v(3), s(20, 2))]) == {}
+    # EXEC and VCC read as values, in halves.
+    assert reads_of([ins("s_add_u32", s(40), sp("exec_hi"), imm(1))]) == {("special", "exec_hi"): L.MASK_HI}
+    assert reads_of([ins("v_cmp_gt_u32_e32", sp("vcc"), imm(40), v(0)),
+                     ins("v_add_nc_u32_e64", v(1), sp("vcc_lo"), imm(1))]) == {("special", "vcc_lo"): L.MASK_LO}
+    # A wave32 mask is one register, kind MASK.
+    assert reads_of([ins("v_cmp_ne_u32_e64", s(20), imm(0), v(5)), ins("s_lshr_b32", s(40), s(20), imm(4))]) ==         {("sgpr", 20): L.MASK}
+    # Plain data is not touched.
+    assert reads_of([ins("s_load_dword", s(20), s(0, 2), imm(0)), ins("s_lshr_b32", s(40), s(20), imm(4))]) == {}
+
+
 if __name__ == "__main__":
     test_straight_line()
     test_joins()
     test_parked_masks()
     test_masks_through_a_vgpr()
     test_bfm64_and_half_kinds()
+    test_data_reads()
     print("ok")
