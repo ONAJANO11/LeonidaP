@@ -597,6 +597,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  if(MINGW)
+    # vk_pipeline_check defines wmain on Windows; MSVC and clang-cl select it themselves, MinGW needs -municode.
+    target_link_options(vk_pipeline_check PRIVATE -municode)
+  endif()
   # CPU-only: the ranking that makes these harnesses prefer a native ICD over Mesa's Dozen (#915). No GPU needed.
   add_executable(vk_device_pick_test test/vk_device_pick_test.cpp)
   target_link_libraries(vk_device_pick_test PRIVATE Vulkan::Headers)
@@ -606,6 +610,11 @@ if(TARGET Vulkan::Headers)
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
   find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(BUILD_TESTING AND Python3_FOUND AND (NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR))
+    add_test(NAME pipeline_check_paths COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_paths.py"
+             ${CMAKE_CROSSCOMPILING_EMULATOR} "$<TARGET_FILE:vk_pipeline_check>")
+  endif()
   # The generator finds d3d12.h through INCLUDE, which a Developer Prompt sets. A cross build (for example
   # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
   set(_stubs_header)

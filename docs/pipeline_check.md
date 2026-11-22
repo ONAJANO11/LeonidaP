@@ -10,6 +10,13 @@ The checker exits nonzero if a module fails to load, a pipeline fails to compile
 cache save fails. It still finishes checking the other entries and attempts the final save so the next run
 can reuse successful pipelines. Entries reported as skipped do not count as failures.
 
+If `<spirv dir>/index.json` is missing or cannot be read (including a directory of that name), the checker
+prints `error: cannot read .../index.json` and exits with code 2 before it reads or saves the pipeline cache,
+so an existing cache is never replaced. A malformed or empty index file also exits 2; an index holding `{}`
+checks 0 shaders and exits 0. On Windows the checker takes its arguments as UTF-16 (`wmain`) and opens the
+index, modules, stubs, cache and statistics file by their wide paths, so folder names outside the ANSI code
+page work without changing the system locale. Paths in messages are printed as UTF-8.
+
 ## Corpus
 
 The translated corpus is 26,503 entries: 2,236 vertex, 12,101 pixel, 2,689 compute, 9,282 mesh and

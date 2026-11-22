@@ -231,12 +231,13 @@ jobs:
       - name: Pipeline checker exit status on llvmpipe
         shell: bash
         run: |
-          dir=$(mktemp -d "$RUNNER_TEMP/pipeline-check.XXXXXX")
+          dir=$(mktemp -d "$RUNNER_TEMP/pipeline-check 地形🎮.XXXXXX")
+          cache="$dir/映像 🎮.bin"
           echo '{"ready":{"stage":"vs"},"missing":{"stage":"ps","outputs":[0]}}' > "$dir/index.json"
           python3 -I tools/spirv_stubs.py "$dir"
           cp "$dir/stubs/vs_empty.spv" "$dir/ready.spv"
           check() {
-            runtime/build/vk_pipeline_check "$dir" "$dir/cache.bin" "$@" | tee "$dir/check.log"
+            runtime/build/vk_pipeline_check "$dir" "$cache" "$@" 2>&1 | tee "$dir/check.log"
           }
 
           status=0
@@ -244,10 +245,11 @@ jobs:
           test "$status" -eq 1
           grep -Fx 'MODULE FAIL missing' "$dir/check.log"
           grep -Fx 'vs pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
-          test -s "$dir/cache.bin"
+          test -s "$cache"
 
           cp "$dir/stubs/ps_empty.spv" "$dir/missing.spv"
           check
+          grep -F 'seeded the pipeline cache with ' "$dir/check.log"
           grep -Fx 'ps pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
           grep -Fx 'vs pipelines: 1 ok, 0 failed, 0 skipped' "$dir/check.log"
 

@@ -19,6 +19,8 @@
 //                 instructions, registers, spills, scratch, waves...) as CSV rows name,stage,statistic,value. Only
 //                 the executable that runs the translated shader is written, not the partner stub's. Use without
 //                 cache.bin: a pipeline loaded from the cache may come without statistics.
+// A missing or unreadable index.json is an error (exit 2) reported before the cache is read or replaced. On Windows
+// the arguments arrive as UTF-16 (wmain) and every file is opened by its wide path; messages print paths as UTF-8.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
@@ -32,6 +34,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -270,13 +273,22 @@ struct JsonParser {
     }
 };
 
-std::map<std::string, ShaderMeta> read_index(const std::string& path, std::string& err) {
+std::map<std::string, ShaderMeta> read_index(const std::filesystem::path& path, bool& readable, std::string& err) {
     std::ifstream f(path, std::ios::binary);
-    std::string s((std::istreambuf_iterator<char>(f)), {});
+    std::error_code ec;
+    readable = false;
+    // Some streams open directories successfully and treat the first read as EOF.
+    if (!f || std::filesystem::is_directory(path, ec)) return {};
+    std::string s;
+    char block[16384];
+    while (f.read(block, sizeof block)) s.append(block, sizeof block);
+    s.append(block, static_cast<size_t>(f.gcount()));
+    readable = f.eof() && !f.bad();
+    if (!readable) return {};
     std::map<std::string, ShaderMeta> out;
     JsonParser p{s, 0};
     p.ws();
-    if (p.i >= s.size()) return out;
+    if (p.i >= s.size()) { err = "empty file (an empty index is {})"; return out; }
     if (!p.consume('{')) { err = "expected '{' at byte " + std::to_string(p.i); return out; }
     while (!p.error && p.i < s.size()) {
         if (p.consume('}')) return out;
@@ -358,9 +370,40 @@ static_assert(shader_slice(7, 2, 0) == std::pair<size_t, size_t>{2, 7});
 static_assert(shader_slice(7, 8, 3) == std::pair<size_t, size_t>{7, 7});
 static_assert(shader_slice(7, 2, std::numeric_limits<size_t>::max()) == std::pair<size_t, size_t>{2, 7});
 
+namespace fs = std::filesystem;
+
+// A path or argument as text for option matching and messages: UTF-8 on Windows, the native bytes unchanged on
+// POSIX.
+std::string text(const fs::path& p) {
+#ifdef _WIN32
+    const std::u8string s = p.u8string();
+    return std::string(s.begin(), s.end());
+#else
+    return p.native();
+#endif
+}
+
+// Retain the checker's dir + "/" + leaf convention. Names in index.json are UTF-8.
+fs::path under(const fs::path& dir, const std::string& leaf) {
+    fs::path p = dir;
+    p += "/";
+#ifdef _WIN32
+    p += fs::path(std::u8string(leaf.begin(), leaf.end()));
+#else
+    p += leaf;
+#endif
+    return p;
+}
+
 }  // namespace
 
+#ifdef _WIN32
+// wmain receives the UTF-16 command line, so folder names outside the ANSI code page arrive intact. MSVC and
+// clang-cl select the wmain entry point themselves; MinGW links with -municode (runtime/CMakeLists.txt).
+int wmain(int argc, wchar_t** argv) {
+#else
 int main(int argc, char** argv) {
+#endif
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: vk_pipeline_check <spirv dir> [cache.bin] [--jobs N] [--start I] [--count N] [--slow SEC] "
@@ -368,15 +411,17 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IOLBF, 1 << 16);   // failures reach a redirected log as they happen
-    std::string dir = argv[1], cache_path, stats_path;
+    const fs::path dir = argv[1];
+    fs::path cache_path, stats_path;
     uint32_t jobs = std::max(1u, std::thread::hardware_concurrency() / 2);
     size_t start = 0, count = 0, max_bytes = 0;
     size_t large_module_bytes = 4 * 1024 * 1024;
     double slow = 30.0;
     std::string stage_filter = "all";
     for (int i = 2; i < argc; i++) {
-        std::string a = argv[i];
-        auto val = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string("0"); };
+        const std::string a = text(argv[i]);
+        auto val = [&] { return i + 1 < argc ? text(argv[++i]) : std::string("0"); };
+        auto val_path = [&] { return i + 1 < argc ? fs::path(argv[++i]) : fs::path("0"); };
         if (a == "--jobs") jobs = std::max(1u, uint32_t(std::stoul(val())));
         else if (a == "--start") start = std::stoull(val());
         else if (a == "--count") count = std::stoull(val());
@@ -386,7 +431,7 @@ int main(int argc, char** argv) {
         else if (a == "--graphics-only") stage_filter = "graphics";
         else if (a == "--max-bytes") max_bytes = std::stoull(val());
         else if (a == "--large-module-bytes") {
-            const std::string_view value = i + 1 < argc ? argv[++i] : "";
+            const std::string value = i + 1 < argc ? text(argv[++i]) : std::string();
             const auto end = value.data() + value.size();
             const auto [ptr, ec] = std::from_chars(value.data(), end, large_module_bytes);
             if (ec != std::errc{} || ptr != end) {
@@ -394,18 +439,24 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--stats") stats_path = val();
-        else cache_path = a;
+        else if (a == "--stats") stats_path = val_path();
+        else cache_path = argv[i];
     }
     if (stage_filter != "all" && stage_filter != "cs" && stage_filter != "graphics") {
         std::fprintf(stderr, "unknown --stage '%s' (expected: all, cs, graphics)\n", stage_filter.c_str());
         return 2;
     }
 
+    const fs::path index_path = under(dir, "index.json");
+    bool index_readable = false;
     std::string index_err;
-    auto index = read_index(dir + "/index.json", index_err);
+    auto index = read_index(index_path, index_readable, index_err);
+    if (!index_readable) {  // before the cache is read or saved, so an existing cache is never replaced
+        std::fprintf(stderr, "error: cannot read %s\n", text(index_path).c_str());
+        return 2;
+    }
     if (!index_err.empty()) {
-        std::fprintf(stderr, "error: malformed JSON in %s/index.json: %s\n", dir.c_str(), index_err.c_str());
+        std::fprintf(stderr, "error: malformed JSON in %s: %s\n", text(index_path).c_str(), index_err.c_str());
         return 2;
     }
     std::fprintf(stderr, "%zu shaders in index\n", index.size());
@@ -609,7 +660,8 @@ int main(int argc, char** argv) {
     if (!cache_path.empty()) {  // resume: pipelines already in the cache compile instantly
         std::ifstream cf(cache_path, std::ios::binary);
         seed.assign(std::istreambuf_iterator<char>(cf), {});
-        if (!seed.empty()) std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), cache_path.c_str());
+        if (!seed.empty())
+            std::fprintf(stderr, "seeded the pipeline cache with %zu bytes from %s\n", seed.size(), text(cache_path).c_str());
     }
     pci.initialDataSize = seed.size(); pci.pInitialData = seed.empty() ? nullptr : seed.data();
     VkPipelineCache cache = VK_NULL_HANDLE;
@@ -629,11 +681,11 @@ int main(int argc, char** argv) {
             });
             if (auto error = write_pipeline_cache_file(cache_path, data.data(), data.size()))
                 throw std::system_error(error);
-            if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", data.size(), cache_path.c_str());
+            if (final_save) std::printf("pipeline cache: %zu bytes -> %s\n", data.size(), text(cache_path).c_str());
             return true;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "%s pipeline cache save to %s failed: %s\n",
-                         final_save ? "final" : "periodic", cache_path.c_str(), e.what());
+                         final_save ? "final" : "periodic", text(cache_path).c_str(), e.what());
             return false;
         }
     };
@@ -659,7 +711,7 @@ int main(int argc, char** argv) {
             auto it = stub_cache.find(fname);
             if (it != stub_cache.end()) return it->second;
         }
-        std::ifstream f(dir + "/stubs/" + fname, std::ios::binary);
+        std::ifstream f(under(dir, "stubs/" + fname), std::ios::binary);
         std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
         VkShaderModule mod = VK_NULL_HANDLE;
         if (!code.empty()) {
@@ -682,8 +734,12 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
+#ifdef _WIN32
+    std::FILE* stats_out = stats_path.empty() ? nullptr : _wfopen(stats_path.c_str(), L"w");
+#else
     std::FILE* stats_out = stats_path.empty() ? nullptr : std::fopen(stats_path.c_str(), "w");
-    if (!stats_path.empty() && !stats_out) { std::fprintf(stderr, "cannot write %s\n", stats_path.c_str()); return 1; }
+#endif
+    if (!stats_path.empty() && !stats_out) { std::fprintf(stderr, "cannot write %s\n", text(stats_path).c_str()); return 1; }
     if (stats_out) std::fprintf(stats_out, "name,stage,statistic,value\n");
     // --stats: one CSV row per statistic of the executable that runs the translated shader (stage bit `bit`).
     auto write_stats = [&](const std::string& name, const std::string& stage, VkShaderStageFlagBits bit, VkPipeline p) {
@@ -743,7 +799,7 @@ int main(int argc, char** argv) {
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
-            std::ifstream f(dir + "/" + name + ".spv", std::ios::binary | std::ios::ate);
+            std::ifstream f(under(dir, name + ".spv"), std::ios::binary | std::ios::ate);
             const std::streamoff file_size = f.tellg();
             if (max_bytes && std::cmp_greater(file_size, max_bytes)) {   // multi-MB ray-tracing shaders (#108)
                 {
