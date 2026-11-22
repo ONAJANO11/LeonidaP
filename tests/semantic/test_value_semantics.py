@@ -76,6 +76,19 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+# cs_fmt_xy_xyz_sel: out[0..55] the 14 loads, out[56..87] the 8 store regions (layout in the .asm header).
+EXPECTED_FMT_XY_XYZ_SEL = [
+    0x11111111, 0x22222222, 0x5A5A0008, 0x5A5A000C, 0x11111111, 0x22222222, 0x33333333, 0x5A5A001C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A002C, 0x3F000080, 0x3F800000, 0x5A5A0038, 0x5A5A003C,
+    0x3E4CCCCD, 0x00000000, 0x3F008081, 0x5A5A004C, 0x44444444, 0x00000001, 0x5A5A0058, 0x5A5A005C,
+    0x3E800000, 0x3FC00000, 0x3F800000, 0x5A5A006C, 0x33333333, 0x44444444, 0x5A5A0078, 0x5A5A007C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A008C, 0x11111111, 0x22222222, 0x33333333, 0x5A5A009C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0x5A5A00AC, 0x00000000, 0x00000000, 0x00000000, 0x5A5A00BC,
+    0x00000000, 0x00000000, 0x5A5A00C8, 0x5A5A00CC, 0x3FC00000, 0xC0000000, 0x5A5A00D8, 0x5A5A00DC,
+    0xDEADBEEF, 0x01234567, 0xA5A50288, 0xA5A5028C, 0x00000007, 0x00000008, 0x00000009, 0xA5A5029C,
+    0x3FC00000, 0xC0000000, 0x3E800000, 0xA5A502AC, 0x3FC00000, 0xC0000000, 0x00000000, 0xA5A502BC,
+    0xFFFF4000, 0xA5A502C4, 0xA5A502C8, 0xA5A502CC, 0x3FC00000, 0xC0000000, 0x3E800000, 0xA5A502DC,
+    0xA5A502E0, 0xA5A502E4, 0xA5A502E8, 0xA5A502EC, 0xA5A502F0, 0xA5A502F4, 0xA5A502F8, 0xA5A502FC]
 
 
 def _f32_bits(x):
@@ -261,6 +274,80 @@ def reference_fmt_1010102():
     return {4 * i: w for i, w in enumerate(words)}
 
 
+# GFX10 buffer formats used by cs_fmt_xy_xyz_sel: code -> (kind, component widths from bit 0)
+XY_XYZ_FORMATS = {23: ("unorm", (16, 16)), 56: ("unorm", (8, 8, 8, 8)), 62: ("uint", (32, 32)),
+                  72: ("uint", (32, 32, 32)), 74: ("float", (32, 32, 32)), 75: ("uint", (32, 32, 32, 32)),
+                  77: ("float", (32, 32, 32, 32))}
+
+
+def _f32_round(q):
+    """The correctly rounded binary32 bits of a Fraction 0 <= q <= 1 (no ties occur for x / (2^n - 1))."""
+    from fractions import Fraction
+    if q == 0:
+        return 0
+    e = 0
+    while q * Fraction(2) ** -e < 1:     # q in [2^e, 2^(e+1))
+        e -= 1
+    m = q * Fraction(2) ** (23 - e)       # 24-bit significand
+    return ((127 + e) << 23) + round(m) - (1 << 23)
+
+
+def _xy_xyz_load(mem, addr, fmt, n, sel=0xFAC, in_range=True):
+    """One buffer_load_format of n components: DST_SEL from word3 [11:0], 0 when out of range."""
+    from fractions import Fraction
+    kind, widths = XY_XYZ_FORMATS[fmt]
+    if not in_range:
+        return [0] * n
+    raw = sum(mem[addr + 4 * i] << (32 * i) for i in range((sum(widths) + 31) // 32))
+    chans, bit = [], 0
+    for w in widths:
+        v = raw >> bit & ((1 << w) - 1)
+        chans.append(_f32_round(Fraction(v, (1 << w) - 1)) if kind == "unorm" else v)
+        bit += w
+    one = 1 if kind == "uint" else 0x3F800000
+    out = []
+    for c in range(n):
+        s = sel >> (3 * c) & 7
+        out.append(chans[(s - 4) % len(widths)] if s >= 4 else {0: 0, 1: one}[s])
+    return out
+
+
+def reference_fmt_xy_xyz_sel():
+    mem = {}
+    for i, w in enumerate((0x11111111, 0x22222222, 0x33333333, 0x44444444,
+                           _f32_bits(1.5), _f32_bits(-2.0), _f32_bits(0.25), _f32_bits(8.0), 0xFFFF8000, 0x80FF3300)):
+        mem[0x200 + 4 * i] = w
+    loads = [(0x200, 62, 2, 0xFAC, True), (0x200, 72, 3, 0xFAC, True), (0x210, 74, 3, 0xFAC, True),
+             (0x220, 23, 2, 0xFAC, True), (0x224, 56, 3, 0x9C5, True), (0x200, 75, 2, 0x98F, True),
+             (0x210, 77, 3, 0xE66, True),
+             # tbuffer: the instruction's format, identity selectors
+             (0x208, 62, 2, 0xFAC, True), (0x210, 74, 3, 0xFAC, True), (0x200, 72, 3, 0xFAC, True),
+             # structured, stride 16, offset 0x200, NR 2: index 1 in range, index 2 not
+             (0x200 + 16 * 1, 74, 3, 0xFAC, 1 < 2), (0x200 + 16 * 2, 74, 3, 0xFAC, 2 < 2),
+             # raw: the 12-byte element at 0x210 must end inside NR (0x21b: no, 0x21c: yes)
+             (0x210, 74, 2, 0xFAC, 0x210 + 12 <= 0x21B), (0x210, 74, 2, 0xFAC, 0x210 + 12 <= 0x21C)]
+    out = []
+    for k, (addr, fmt, n, sel, ok) in enumerate(loads):
+        words = _xy_xyz_load(mem, addr, fmt, n, sel, ok)
+        out += words + [0x5A5A0000 | (0x10 * k + 4 * i) for i in range(len(words), 4)]
+    region = {a: 0xA5A50000 | a for a in range(0x280, 0x300, 4)}
+
+    def store(addr, words, ok=True):
+        # the whole element is written: the given components and 0 for the rest of the format's dwords
+        if ok:
+            for i, w in enumerate(words):
+                region[addr + 4 * i] = w
+    store(0x280, [0xDEADBEEF, 0x01234567])
+    store(0x290, [7, 8, 9])
+    store(0x2A0, [_f32_bits(1.5), _f32_bits(-2.0), _f32_bits(0.25)])
+    store(0x2B0, [_f32_bits(1.5), _f32_bits(-2.0), 0])
+    store(0x2C0, [round(0.25 * 0xFFFF) | round(min(2.0, 1.0) * 0xFFFF) << 16])
+    store(0x2D0 + 16 * 0, [_f32_bits(1.5), _f32_bits(-2.0), _f32_bits(0.25)], 0 < 1)
+    store(0x2D0 + 16 * 1, [_f32_bits(1.5), _f32_bits(-2.0), _f32_bits(0.25)], 1 < 1)
+    store(0x2F0, [_f32_bits(1.5), _f32_bits(-2.0), _f32_bits(0.25)], 0x2F0 + 12 <= 0x2FB)
+    return out + [region[a] for a in range(0x280, 0x300, 4)]
+
+
 def _ff1(x):
     """Index of the lowest set bit of a 32-bit value, 0xffffffff if none."""
     x &= 0xFFFFFFFF
@@ -342,6 +429,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_fmt_xy_xyz_sel(), EXPECTED_FMT_XY_XYZ_SEL)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -448,6 +536,20 @@ class TranslatorValueSemantics(unittest.TestCase):
         for address, want in EXPECTED_FMT_1010102.items():
             with self.subTest(address=address):
                 self.assertEqual(f"{memory.get(address, 0):#010x}", f"{want:#010x}")
+
+    def test_buffer_format_xy_xyz_formats_swizzle_bounds(self):
+        # cs_fmt_xy_xyz_sel: 32_32 / 32_32_32 UINT and FLOAT, UNORM, V# DST_SEL, an out-of-range structured index
+        # and the 12-byte element at num_records, for buffer/tbuffer xy/xyz loads and xy/xyz stores. The heap is
+        # 0xeeeeeeee as vk_compute_test fills it; words 88..127 must stay so.
+        spv = support.translate_fixture("cs_fmt_xy_xyz_sel", fssm=CS_BOUNDS_FSSM)
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x300, 4)}
+        outputs = support.run_fragment(
+            spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+            push_constants=[0, 0, 0x300, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual(outputs, {})
+        for i, want in enumerate(EXPECTED_FMT_XY_XYZ_SEL + [0xEEEEEEEE] * 40):
+            with self.subTest(word=i):
+                self.assertEqual(f"{memory.get(4 * i, 0):#010x}", f"{want:#010x}")
 
     def test_signed_typed_buffers(self):
         spv = support.translate_fixture("cs_fmt_sint32", fssm=CS_BOUNDS_FSSM)
