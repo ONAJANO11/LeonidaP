@@ -191,7 +191,9 @@ FMT_XY_XYZ_WORDS = [
 # Negative global_load/global_store offsets (cs_global_neg_offset.asm): 40 groups make a 0x2800-byte heap that holds
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
-                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+                                                 0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE]),
+                 # global/buffer atomics, 8/16-bit global stores and d16 loads with CPU-only checks until now
+                 ("cs_global_mem_ext", "40", [0x5, 0xC, 0x977, 0xFFF00000, 0xEDCB5678, 0xEF332211, 0x887766BE, 0xFF801234])]
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
