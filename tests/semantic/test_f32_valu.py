@@ -23,6 +23,8 @@ import spirv_mini_interp as si
 import support
 
 EXPECTED_F32_MODS = (0xC0256A01, 0x3F800000, 0x41E00000, 0x3FC00000)
+# ps_f32_cvt_mul2 (TEST-298): mul:2 on v_cvt_f32_i32/u32/ubyte0/f16, and mul:2 then clamp on v_cvt_f32_i32.
+EXPECTED_CVT_MUL2 = (0xC1200000, 0x41600000, 0x432C0000, 0x40400000)
 
 
 def f32_value(word):
@@ -62,6 +64,15 @@ def reference_f32_mods():
     return (mac, round_to_f32(ubyte), round_to_f32(u32), round_to_f32(total))
 
 
+def reference_cvt_mul2():
+    i32 = Fraction(-5) * 2                       # v_cvt_f32_i32 of -5, mul:2
+    u32 = Fraction(7) * 2                        # v_cvt_f32_u32 of 7, mul:2
+    ubyte = Fraction(0x12347856 & 0xFF) * 2      # v_cvt_f32_ubyte0 of 0x12347856 (0x56 = 86), mul:2
+    clamped = min(max(Fraction(3) * 2, Fraction(0)), Fraction(1))   # omod first, then clamp to [0, 1]
+    total = Fraction(1) * 2 + clamped            # v_cvt_f32_f16 of 0x3c00 (1.0), mul:2, plus the clamped word
+    return tuple(round_to_f32(v) for v in (i32, u32, ubyte, total))
+
+
 def reference_fused():
     """What a fused multiply-add gives for the v_mac_f32 operands: the word the test must not see."""
     v0, v1, v2 = 0xBC500C59, 0x435A2099, 0x3E3DB015
@@ -72,6 +83,9 @@ class ReferenceTests(unittest.TestCase):
     def test_constants_match_references(self):
         self.assertEqual(reference_f32_mods(), EXPECTED_F32_MODS)
 
+    def test_cvt_mul2_constants_match_references(self):
+        self.assertEqual(reference_cvt_mul2(), EXPECTED_CVT_MUL2)
+
     def test_mac_operands_tell_fused_from_unfused(self):
         self.assertNotEqual(reference_fused(), EXPECTED_F32_MODS[0])
 
@@ -80,6 +94,12 @@ class F32ValuTests(unittest.TestCase):
     def test_mac_unfused_and_conversion_output_modifiers(self):
         words = support.mrt0_words(support.translate_fixture("ps_f32_mods"))
         for i, (got, want) in enumerate(zip(words, EXPECTED_F32_MODS)):
+            with self.subTest(component="xyzw"[i]):
+                self.assertEqual(f"{got:#010x}", f"{want:#010x}")
+
+    def test_conversion_mul2_and_clamp(self):
+        words = support.mrt0_words(support.translate_fixture("ps_f32_cvt_mul2"))
+        for i, (got, want) in enumerate(zip(words, EXPECTED_CVT_MUL2)):
             with self.subTest(component="xyzw"[i]):
                 self.assertEqual(f"{got:#010x}", f"{want:#010x}")
 

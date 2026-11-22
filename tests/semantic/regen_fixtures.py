@@ -23,7 +23,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_bu
            "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
            "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
-           "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
+           "ps_f32_mods", "ps_f32_cvt_mul2", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
            "cs_oob_select", "cs_oob_tail", "cs_w32_mask_imm", "cs_w64_mask_imm",
            "cs_buf_swizzle",   # swizzled MUBUF / ADD_TID (test_buffer_swizzle.py)
            "cs_tbuffer_store",                 # tbuffer_store_format_*, words measured natively on a Radeon 680M

@@ -107,7 +107,7 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   `v_pk_lshlrev_b16`, `v_sin_f16` and `v_mul_legacy_f32`) and requires `test_ps_semantics.py` to fail for the
   matching shader.
 - `test_f32_valu.py` runs `ps_f32_mods` (`v_mac_f32` rounds the product before the add; VOP3 clamp and output
-  modifiers on `v_cvt_f32_ubyte*`/`u32`/`f16` and `v_rcp_iflag_f32`), found by `tools/f32_fuzz.py` (FUZZ-3), and
+  modifiers on `v_cvt_f32_ubyte*`/`u32`/`f16` and `v_rcp_iflag_f32`), plus `ps_f32_cvt_mul2` (`mul:2` on the integer and f16 conversions, and `mul:2` then `clamp`), found by `tools/f32_fuzz.py` (FUZZ-3), and
   tests the interpreter's float operations against GLSL.std.450 (signed zeros, undefined inputs, a single-rounding
   `Fma`).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
