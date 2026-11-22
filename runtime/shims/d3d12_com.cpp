@@ -563,7 +563,7 @@ private:
             g::Image image{};
             if (!g::decode(words, image)) return false;
             const bool volume = image.type == g::ImageType::image_3d;
-            if (volume && (words[4] & g::sliced_uav_flag)) {
+            if (g::partial_volume_uav(words, image)) {
                 // Transfer clears operate on a whole 3D mip, not a storage image view. Refuse instead of
                 // overwriting slices outside the UAV; a sliced clear needs a separate replay path.
                 stub("ClearUnorderedAccessView of a partial 3D mip");

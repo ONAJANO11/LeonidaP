@@ -146,15 +146,20 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
-// The layer's own metadata in a synthetic T#: partial volume UAVs that would otherwise share the same key
-// need distinct keys. Translated float image_load also uses this for the sampled fetch path (Vulkan only
-// applies slicing to storage descriptors). WORD4[31] is reserved on GFX10/GFX103 and distinguishes these
-// descriptors from hardware ones, where WORD7 can contain a metadata address. DEPTH and BASE_ARRAY stay
-// unchanged. D3D12 depth is at most 2048, so count - 1 and offset fit 11 bits.
-inline constexpr std::uint32_t sliced_uav_flag = 0x80000000;
-inline constexpr std::uint32_t sliced_uav_tag = 0xD7800000;
-inline constexpr std::uint32_t sliced_uav_word(std::uint32_t offset, std::uint32_t count) {
-    return sliced_uav_tag | ((count - 1) << 11) | offset;
+// Synthetic volume UAV metadata distinguishes the storage view from SRVs of the same mip, and distinct W
+// ranges from one another. Sampled fetches use it because Vulkan only applies slicing to storage views.
+// WORD4[31] is reserved on GFX10/GFX103; hardware uses WORD7 for metadata addresses. DEPTH and BASE_ARRAY
+// stay unchanged. D3D12 depth is at most 2048, so count - 1 and offset fit 11 bits.
+inline constexpr std::uint32_t volume_uav_flag = 0x80000000;
+inline constexpr std::uint32_t volume_uav_tag = 0xD7800000;
+inline constexpr std::uint32_t volume_uav_word(std::uint32_t offset, std::uint32_t count) {
+    return volume_uav_tag | ((count - 1) << 11) | offset;
+}
+inline constexpr bool partial_volume_uav(const ImageWords& words, const Image& image) {
+    const auto mip_depth = image.depth >> image.first_mip;
+    return image.type == ImageType::image_3d && (words[4] & volume_uav_flag) &&
+           (words[7] & 0xffc00000) == volume_uav_tag &&
+           words[7] != volume_uav_word(0, mip_depth ? mip_depth : 1u);
 }
 
 inline constexpr float image_min_lod(const ImageWords& words) {
@@ -567,7 +572,8 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 // MIP_FILTER_NONE samples the base level only, which Vulkan expresses as nearest mip filtering with the LOD held
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
-inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
+// A decoded GFX10 bias has absolute value at most 32. When creating a device sampler, pass its smaller limit.
+inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f) {
     static_assert(int(CompareFunction::never) == int(VK_COMPARE_OP_NEVER) &&
                   int(CompareFunction::less) == int(VK_COMPARE_OP_LESS) &&
                   int(CompareFunction::equal) == int(VK_COMPARE_OP_EQUAL) &&
@@ -587,7 +593,7 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler) {
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = sampler.lod_bias;
+    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;

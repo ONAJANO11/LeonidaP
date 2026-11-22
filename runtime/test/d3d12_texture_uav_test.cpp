@@ -241,8 +241,9 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
     }
     g::Image decoded{};
     EXPECT(g::decode(key, decoded) && decoded.first_mip == mip && decoded.mip_count == 1);
-    EXPECT(bool(key[4] & g::sliced_uav_flag) == partial);
-    EXPECT(key[7] == (partial ? g::sliced_uav_word(first, writable) : 0));
+    EXPECT(bool(key[4] & g::volume_uav_flag) == volume);
+    EXPECT(key[7] == (volume ? g::volume_uav_word(first, writable) : 0));
+    EXPECT(g::partial_volume_uav(key, decoded) == partial);
     EXPECT(!volume || (decoded.depth == shape.DepthOrArraySize && decoded.first_layer == 0 && decoded.layer_count == 1));
     EXPECT((kind != Kind::array && kind != Kind::float_array) ||
            (decoded.first_layer == first && decoded.layer_count == writable));
@@ -269,7 +270,7 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
         EXPECT(g::decode(srv_key, sampled) && sampled.type == g::ImageType::image_3d &&
                sampled.address == decoded.address && sampled.first_mip == mip && sampled.mip_count == 1 &&
                sampled.depth == decoded.depth && sampled.first_layer == 0 && sampled.layer_count == 1);
-        EXPECT(!(srv_key[4] & g::sliced_uav_flag) && srv_key[7] == 0 && srv_key != read_slot(copy));
+        EXPECT(!(srv_key[4] & g::volume_uav_flag) && srv_key[7] == 0 && srv_key != read_slot(copy));
     }
     EXPECT(flush_descriptors(device));
 
@@ -359,7 +360,7 @@ bool check_standalone(bool sliced) {
     EXPECT(g::is_image(read_slot(slot)));
     const auto view = uav(Kind::volume, 1, 1, 2);
     device->CreateUnorderedAccessView(volume.Get(), nullptr, &view, slot);
-    EXPECT(read_slot(slot)[7] == (sliced ? g::sliced_uav_word(1, 2) : 0));
+    EXPECT(read_slot(slot)[7] == (sliced ? g::volume_uav_word(1, 2) : 0));
     return true;
 }
 
@@ -467,6 +468,8 @@ bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
     EXPECT(check_case(device.Get(), compute, float_volume, texture(float_volume, 8, DXGI_FORMAT_R32_FLOAT),
                       source, copy, vk.sliced_3d_uav, 1, 1, 2));
     EXPECT(check_case(device.Get(), compute, atomic_volume, texture(atomic_volume, 8),
+                      source, copy, vk.sliced_3d_uav, 1, 0, 4));
+    EXPECT(check_case(device.Get(), compute, atomic_volume, texture(atomic_volume, 8),
                       source, copy, vk.sliced_3d_uav, 1, 1, 2));
     EXPECT(check_case(device.Get(), compute, two_d, texture(two_d, 1), source, copy, false, 1, 0, 1));
     return true;
@@ -504,6 +507,6 @@ int main(int argc, char** argv) {
         return 1;
     if (!vk.sliced_3d_uav) std::printf("SKIP: sliced 3D UAV GPU writes (feature unavailable); rejection verified\n");
     std::printf("texture UAVs: %u GPU cases (%u compared with WARP), format/range/refusal checks passed\n",
-                vk.sliced_3d_uav ? 13u : 9u, vk.sliced_3d_uav ? 10u : 8u);
+                vk.sliced_3d_uav ? 14u : 10u, vk.sliced_3d_uav ? 10u : 8u);
     return 0;
 }

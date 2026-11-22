@@ -251,6 +251,7 @@ struct DeviceState {
 
     // Cached physical-device no-attachment sample counts for D3D12_OPTIONS19.
     UINT no_output_sample_counts = 0;
+    float max_sampler_lod_bias = 0;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
@@ -585,7 +586,7 @@ struct DeviceState {
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
-        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler);
+        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -1573,6 +1574,22 @@ public:
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing);
+        if (info.conditional_rendering) {
+            const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
+            const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
+            if (properties && families) {
+                VkPhysicalDeviceProperties limits{};
+                properties(info.physical, &limits);
+                std::uint32_t count = 0;
+                families(info.physical, &count, nullptr);
+                std::vector<VkQueueFamilyProperties> queues(count);
+                families(info.physical, &count, queues.data());
+                if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                    state_.context->configure_predication(get_device, state_.memory, limits.limits.maxStorageBufferRange, info.queue_family);
+            }
+        }
         if (info.host_image_copy) load_host_image_copy(get_device);
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h).
         std::uint64_t max_storage_range = 1u << 27;  // the least Vulkan allows, if the limit cannot be read
@@ -1593,6 +1610,7 @@ public:
         // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
+        state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -3244,8 +3262,7 @@ private:
                 return;
             }
             if (new_uav) {
-                const bool storage_read = view.type == g::ImageType::image_1d_array ||
-                                          state_.numeric_class(view_format) != 0;
+                const bool storage_read = view.type == g::ImageType::image_1d_array;
                 if (sampled && !(features & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
                     log_once("texture view format does not support sampled access:", view_format);
                     return;
@@ -3264,9 +3281,10 @@ private:
             return;
         }
         g::ImageWords words = g::encode(image);
-        if (slices.count) {
-            words[4] |= g::sliced_uav_flag;
-            words[7] = g::sliced_uav_word(slices.first, slices.count);
+        if (storage && view.type == g::ImageType::image_3d) {
+            words[4] |= g::volume_uav_flag;
+            const UINT mip_depth = std::max(1u, image.depth >> image.first_mip);
+            words[7] = g::volume_uav_word(slices.first, slices.count ? slices.count : mip_depth);
         }
         if (new_uav && !state_.info.robust_image_access) {
             log_once("shader access to 1D and 3D UAVs requires robustImageAccess; type", int(view.type));
