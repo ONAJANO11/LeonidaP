@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -156,6 +159,217 @@ uint64_t __stdcall XSystemGetAppMemoryUsage() {
     return 0;
 }
 
+// XVersion: 4-part version structure from GDK XGameRuntimeTypes.h (8 bytes)
+struct XVersion {
+    union {
+        struct {
+            uint16_t major;
+            uint16_t minor;
+            uint16_t build;
+            uint16_t revision;
+        };
+        uint64_t Value;
+    };
+};
+static_assert(sizeof(XVersion) == 8, "XVersion must be 8 bytes");
+
+// XSystemAnalyticsInfo: hardware and OS version telemetry (144 bytes)
+struct XSystemAnalyticsInfo {
+    XVersion osVersion;
+    XVersion hostingOsVersion;
+    char family[64];
+    char form[64];
+};
+static_assert(sizeof(XSystemAnalyticsInfo) == 144, "XSystemAnalyticsInfo must be 144 bytes");
+
+// XSystemAnalyticsInfo XSystemGetAnalyticsInfo()
+// Returned by value per Microsoft GDK specification.
+XSystemAnalyticsInfo __stdcall XSystemGetAnalyticsInfo() {
+    XSystemAnalyticsInfo info{};
+    info.osVersion = {10, 0, 22000, 0};
+    info.hostingOsVersion = {10, 0, 22000, 0};
+    std::strncpy(info.family, "Xbox", sizeof(info.family) - 1);
+
+    const uint32_t dt = XSystemGetDeviceType();
+    if (dt == static_cast<uint32_t>(XSystemDeviceType::XboxScarlettLockhart)) {
+        std::strncpy(info.form, "Xbox Series S", sizeof(info.form) - 1);
+    } else {
+        std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+    }
+
+    char form_override[64];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_ANALYTICS_FORM", form_override, sizeof(form_override));
+    if (n > 0 && n < sizeof(form_override)) {
+        std::strncpy(info.form, form_override, sizeof(info.form) - 1);
+    }
+    return info;
+}
+
+// ---- XPackage ----
+
+constexpr size_t XPACKAGE_IDENTIFIER_MAX_LENGTH = 33;
+constexpr char kDefaultPackageIdentifier[XPACKAGE_IDENTIFIER_MAX_LENGTH] = "LeonidaPackageIdentifier00000000";
+static_assert(sizeof(kDefaultPackageIdentifier) == XPACKAGE_IDENTIFIER_MAX_LENGTH,
+              "default package identifier must match XPACKAGE_IDENTIFIER_MAX_LENGTH");
+
+// HRESULT XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, char* buffer).
+// Retrieves the package identifier string for the current process.
+HRESULT __stdcall XPackageGetCurrentProcessPackageIdentifier(size_t bufferSize, char* buffer) {
+    if (!buffer || bufferSize == 0) return E_INVALIDARG;
+
+    char id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", id, sizeof(id));
+    const char* selected = (n > 0 && n < sizeof(id)) ? id : kDefaultPackageIdentifier;
+    const size_t len = std::strlen(selected);
+
+    if (bufferSize < len + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(buffer, selected, len + 1);
+    return S_OK;
+}
+
+// XPackageMountHandle: opaque 64-bit mount handle per GDK XPackage.h
+struct XPackageMountHandle {
+    uint64_t handle;
+};
+
+static std::mutex s_mount_mutex;
+static std::atomic<uint64_t> s_next_mount_id{1};
+static std::unordered_map<uint64_t, std::string> s_active_mounts;
+
+static HRESULT resolve_mount_path(char* out, size_t out_cap) {
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_GAME_DIR", out, static_cast<DWORD>(out_cap));
+    if (n == 0 || n >= out_cap) {
+        const DWORD mod_len = GetModuleFileNameA(nullptr, out, static_cast<DWORD>(out_cap));
+        if (mod_len > 0 && mod_len < out_cap) {
+            char* slash = std::strrchr(out, '\\');
+            char* fslash = std::strrchr(out, '/');
+            char* last = slash > fslash ? slash : fslash;
+            if (last) {
+                *last = '\0';
+            } else {
+                return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+            }
+        } else {
+            return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        }
+    }
+    return S_OK;
+}
+
+// Resolves the installation path for a specific content package identifier.
+// Returns HRESULT_FROM_WIN32(ERROR_NOT_FOUND) if the package identifier is not installed.
+static HRESULT resolve_package_path(const char* packageIdentifier, char* out, size_t out_cap) {
+    if (!packageIdentifier || !out || out_cap == 0) return E_INVALIDARG;
+
+    // Check against configured process/content package identifier
+    char installed_id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", installed_id, sizeof(installed_id));
+    const char* target_id = (n > 0 && n < sizeof(installed_id)) ? installed_id : kDefaultPackageIdentifier;
+
+    if (std::strcmp(packageIdentifier, target_id) == 0) {
+        return resolve_mount_path(out, out_cap);
+    }
+
+    // Check optional installed content packages mapping: "id1=path1;id2=path2"
+    char mapping[1024] = {};
+    const DWORD map_len = GetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", mapping, sizeof(mapping));
+    if (map_len > 0 && map_len < sizeof(mapping)) {
+        char* token = mapping;
+        while (token && *token) {
+            char* sep = std::strchr(token, ';');
+            if (sep) *sep = '\0';
+            char* eq = std::strchr(token, '=');
+            if (eq) {
+                *eq = '\0';
+                if (std::strcmp(token, packageIdentifier) == 0) {
+                    const char* val = eq + 1;
+                    const size_t vlen = std::strlen(val);
+                    if (vlen + 1 > out_cap) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+                    std::memcpy(out, val, vlen + 1);
+                    return S_OK;
+                }
+            }
+            token = sep ? sep + 1 : nullptr;
+        }
+    }
+
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+// HRESULT XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount)
+// Mounts an installed content package given its identifier and yields a valid mount handle.
+// Returns ERROR_NOT_FOUND if the package identifier is not recognized/installed.
+HRESULT __stdcall XPackageMount(const char* packageIdentifier, XPackageMountHandle* mount) {
+    if (!packageIdentifier || !mount) return E_INVALIDARG;
+    mount->handle = 0;
+
+    char buf[MAX_PATH] = {};
+    const HRESULT hr = resolve_package_path(packageIdentifier, buf, sizeof(buf));
+    if (FAILED(hr)) return hr;
+
+    const uint64_t id = s_next_mount_id.fetch_add(1);
+    {
+        std::lock_guard lock(s_mount_mutex);
+        s_active_mounts[id] = buf;
+    }
+    mount->handle = id;
+    return S_OK;
+}
+
+// void XPackageCloseMountHandle(XPackageMountHandle mount)
+// Closes a previously mounted package handle.
+void __stdcall XPackageCloseMountHandle(XPackageMountHandle mount) {
+    if (mount.handle == 0) return;
+    std::lock_guard lock(s_mount_mutex);
+    s_active_mounts.erase(mount.handle);
+}
+
+// HRESULT XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize).
+// Retrieves the size of the buffer needed to store the mounted package path, including the null terminator.
+HRESULT __stdcall XPackageGetMountPathSize(XPackageMountHandle mount, size_t* pathSize) {
+    if (mount.handle == 0 || !pathSize) return E_INVALIDARG;
+
+    std::string path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        path = it->second;
+    }
+
+    *pathSize = path.size() + 1;
+    return S_OK;
+}
+
+// HRESULT XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path).
+// Retrieves the installed filesystem path for the mounted package.
+HRESULT __stdcall XPackageGetMountPath(XPackageMountHandle mount, size_t pathSize, char* path) {
+    if (mount.handle == 0 || !path || pathSize == 0) return E_INVALIDARG;
+
+    std::string mount_path;
+    {
+        std::lock_guard lock(s_mount_mutex);
+        auto it = s_active_mounts.find(mount.handle);
+        if (it == s_active_mounts.end()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        mount_path = it->second;
+    }
+
+    if (pathSize < mount_path.size() + 1) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    std::memcpy(path, mount_path.c_str(), mount_path.size() + 1);
+    return S_OK;
+}
+
+// bool XPackageIsPackagedProcess().
+// Returns true on Xbox Series console. LEONIDA_PACKAGED=0 overrides it.
+bool __stdcall XPackageIsPackagedProcess() {
+    char s[16];
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGED", s, sizeof(s));
+    if (n > 0 && n < sizeof(s)) {
+        if (std::atoi(s) == 0) return false;
+    }
+    return true;
+}
+
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
 
 }  // namespace
@@ -173,6 +387,13 @@ SHIM_TABLE(xgameruntime,
     XGR(XSystemGetConsoleId),
     XGR(XSystemGetAppMemoryUsageLimit),
     XGR(XSystemGetAppMemoryUsage),
+    XGR(XSystemGetAnalyticsInfo),
+    XGR(XPackageGetCurrentProcessPackageIdentifier),
+    XGR(XPackageMount),
+    XGR(XPackageCloseMountHandle),
+    XGR(XPackageGetMountPathSize),
+    XGR(XPackageGetMountPath),
+    XGR(XPackageIsPackagedProcess),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),
