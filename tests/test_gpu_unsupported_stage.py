@@ -53,5 +53,36 @@ class RunGpuTestsUnsupportedDetail(unittest.TestCase):
             self.assertIn(reason, harness)
 
 
+class ImageTestsOnADeviceWithoutFormatlessImageAccess(unittest.TestCase):
+    """#619: vk_store_test exits 77 when the device can't read a storage image without a format. check.py
+    skips that; the two image branches used to report it as a failure."""
+
+    def test_load_without_the_feature_skips(self):
+        msg = "device: Intel(R) Graphics (subgroup 8..32)\nunsupported: shaderStorageImageReadWithoutFormat"
+        ok, detail = run_gpu_tests.vk_store_result(77, msg)
+        self.assertIsNone(ok)
+        self.assertEqual(detail, "SKIP (unsupported: shaderStorageImageReadWithoutFormat)")
+
+    def test_store_without_the_feature_skips(self):
+        ok, detail = run_gpu_tests.vk_store_result(77, "unsupported: shaderStorageImageWriteWithoutFormat")
+        self.assertIsNone(ok)
+        self.assertIn("shaderStorageImageWriteWithoutFormat", detail)
+
+    def test_a_pass_keeps_the_last_line(self):
+        ok, detail = run_gpu_tests.vk_store_result(0, "0 bad\n0 bad\n0 bad")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "0 bad")
+
+    def test_any_other_exit_still_fails(self):
+        ok, detail = run_gpu_tests.vk_store_result(1, "FAILED vkMapMemory -> -4")
+        self.assertFalse(ok)
+        self.assertEqual(detail, "FAILED vkMapMemory -> -4")
+
+    def test_no_output_still_fails(self):
+        ok, detail = run_gpu_tests.vk_store_result(1, "")
+        self.assertFalse(ok)
+        self.assertEqual(detail, "")
+
+
 if __name__ == "__main__":
     unittest.main()
