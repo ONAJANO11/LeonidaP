@@ -174,8 +174,14 @@ GATHER_WRAP = (5090733.0, 14942181.0, 258623.0, 9702309.0)
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
+PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_persp_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32"))
+# Pixel shaders drawn with another vertex shader than vs_ids.
+PIXEL_VS = {"ps_persp_bary": "vs_persp"}
+# vs_persp's triangle (see vs_persp.asm): screen positions, clip w and attr0.xy of its three vertices.
+PERSP_SCREEN = ((5.0, 8.0), (57.0, 16.0), (21.0, 55.0))
+PERSP_W = (1.0, 2.0, 4.0)
+PERSP_ATTR = ((0.25, -0.5), (2.25, 0.75), (-1.0, 3.0))
 TEXOFF_ARGS = ("2", "92", "0", "0", "0")              # ps_texoff: T# pointer in s2, then the shader's literal S#
 TEXTURE_MIP_TEST = "ps_texture_mip0"
 TEXTURE_MIP_DEPENDENCIES = ("vs_ids", "ps_texture_sample")
@@ -446,6 +452,44 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     return f"{wrong} of 4096 pixels differ; {first}" if wrong else ""
 
 
+def bary_persp_problem(px):
+    """ps_persp_bary drawn with vs_persp: "" when every pixel matches the perspective-correct CPU reference, else what
+    differs. At a pixel centre with screen-space weights l0, l1, l2, the weights are p_k = (l_k / w_k) / sum(l_m / w_m);
+    mrt0 = (attr0.xy interpolated with p, p1, p2), and pixels outside the triangle keep the clear value (-1). Coverage
+    comes from edge functions at doubled coordinates, which are exact integers: no centre lies on an edge, so every
+    pixel is judged whatever the rasterization rule. The affine weights (l1, l2) must differ from (p1, p2) by more than
+    100 times the tolerance on every covered pixel, so a NoPerspective regression can't pass by accident."""
+    tol = 1e-5
+    (x0, y0), (x1, y1), (x2, y2) = (tuple(int(c) for c in v) for v in PERSP_SCREEN)
+    area2 = 2 * ((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))   # twice the area, in doubled coordinates
+    covered, wrong, first, gap = 0, 0, "", math.inf
+    for i, pixel in enumerate(px):
+        x, y = 2 * (i % 64) + 1, 2 * (i // 64) + 1                  # the pixel centre, doubled
+        e1 = (x - 2 * x0) * (y2 - y0) - (x2 - x0) * (y - 2 * y0)
+        e2 = (x1 - x0) * (y - 2 * y0) - (x - 2 * x0) * (y1 - y0)
+        e = (area2 - e1 - e2, e1, e2)
+        if 0 in e:
+            return f"test geometry: pixel centre ({i % 64},{i // 64}) lies on an edge"
+        if min(e) < 0:
+            want = (-1.0, -1.0, -1.0, -1.0)
+        else:
+            l = [ek / area2 for ek in e]
+            p = [lk / wk for lk, wk in zip(l, PERSP_W)]
+            p = [pk / sum(p) for pk in p]
+            want = (sum(pk * a[0] for pk, a in zip(p, PERSP_ATTR)), sum(pk * a[1] for pk, a in zip(p, PERSP_ATTR)),
+                    p[1], p[2])
+            gap = min(gap, max(abs(p[1] - l[1]), abs(p[2] - l[2])))
+            covered += 1
+        if not all(math.isfinite(v) and abs(v - w) <= tol for v, w in zip(pixel, want)):
+            if not wrong:
+                got, exp = (tuple(round(v, 6) for v in t) for t in (pixel, want))
+                first = f"at ({i % 64},{i // 64}): got {got}, want {exp}"
+            wrong += 1
+    if gap <= 100 * tol:
+        return f"test geometry: perspective and affine weights only {gap:.3g} apart"
+    return f"{wrong} pixels off the perspective-correct reference ({covered} covered); {first}" if wrong else ""
+
+
 def pixels(tools, spirv, name, fmt):
     # Draw at the shader's own wave size, as run_gpu_tests.py does (#146): a wave32 pixel shader run as wave64
     # (RADV's default on RDNA1) reads lanes it was never written for.
@@ -455,8 +499,8 @@ def pixels(tools, spirv, name, fmt):
         env = dict(env or os.environ, **PIXEL_ENV[name])
     with tempfile.TemporaryDirectory(prefix="leonida-pixels-") as tmp:
         raw = Path(tmp) / "pixels.raw"
-        code, out = run(os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
-                        os.path.join(spirv, name + ".spv"), raw, env=env)
+        vs = os.path.join(spirv, PIXEL_VS.get(name, "vs_ids") + ".spv")
+        code, out = run(os.path.join(tools, "vk_harness" + EXE), vs, os.path.join(spirv, name + ".spv"), raw, env=env)
         if code == UNSUPPORTED:   # vk_harness: the shader needs a device feature this GPU lacks
             return Skip(""), out
         if code or not raw.is_file():
@@ -577,7 +621,7 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name == "ps_texoff":
         return texoff_test(tools, spirv, name)
-    px, out = pixels(tools, spirv, name, "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
+    px, out = pixels(tools, spirv, name, "<4f" if name in ("ps_bary", "ps_persp_bary") else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I")
     if isinstance(px, Skip):   # exit 77: the device cannot run this shader (e.g. no barycentrics)
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -600,6 +644,8 @@ def pixel_test(tools, spirv, name):
             return "barycentrics contain non-finite values"
         err = max(max(abs(a / 2 - i), abs(b / 2 - j)) for a, b, i, j in px)
         return "" if err < 1e-6 else f"barycentrics off by {err:.3g}"
+    if name == "ps_persp_bary":
+        return bary_persp_problem(px)
     if name == "ps_flat":
         if any(not math.isfinite(v) for p in px for v in p[2:]):
             return "UVs contain non-finite values"
