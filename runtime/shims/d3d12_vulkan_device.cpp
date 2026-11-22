@@ -2396,6 +2396,7 @@ public:
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
+        graphics_.viewport_with_count = device_.info.multi_viewport;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -2517,8 +2518,9 @@ private:
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+        const VkDynamicState dynamic_states[] = {
+            graphics_.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT,
+            graphics_.viewport_with_count ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
@@ -2540,9 +2542,11 @@ private:
         vertex_input.pVertexBindingDescriptions = r.bindings.data();
         vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
         vertex_input.pVertexAttributeDescriptions = r.attributes.data();
+        // With multiViewport the counts are dynamic too (VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT, set per draw), and
+        // the pipeline declares 0 of each, as Vulkan requires.
         VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
+        viewport.viewportCount = graphics_.viewport_with_count ? 0 : 1;
+        viewport.scissorCount = graphics_.viewport_with_count ? 0 : 1;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
@@ -6124,6 +6128,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
+    // Viewport arrays, and the VS outputs that pick a viewport or a layer (translated pos1 misc exports).
+    info.multi_viewport = chosen_features.multiViewport && chosen12.shaderOutputViewportIndex && chosen12.shaderOutputLayer;
+    enable.multiViewport = info.multi_viewport ? VK_TRUE : VK_FALSE;
+    enable12.shaderOutputViewportIndex = info.multi_viewport ? VK_TRUE : VK_FALSE;
+    enable12.shaderOutputLayer = info.multi_viewport ? VK_TRUE : VK_FALSE;
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, and clip and cull distances in a few vertex shaders. Enabled where
     // the GPU has them; without one, vkCreateShaderModule reports the capability (VUID-...-pCode-08740).

@@ -85,6 +85,7 @@ public:
     bool validation = false;
     bool bc = false;  // textureCompressionBC enabled
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
+    bool multi_viewport = false;  // multiViewport, shaderOutputViewportIndex and shaderOutputLayer enabled
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
@@ -368,6 +369,11 @@ public:
         sampler_filter_minmax = features12.samplerFilterMinmax == VK_TRUE;
         enable12.samplerFilterMinmax = sampler_filter_minmax;
         enable12.bufferDeviceAddress = VK_TRUE;
+        // Viewport arrays and the VS outputs that pick one (d3d12_viewport_array_test), where available.
+        multi_viewport = features.features.multiViewport && features12.shaderOutputViewportIndex &&
+                         features12.shaderOutputLayer;
+        enable12.shaderOutputViewportIndex = multi_viewport ? VK_TRUE : VK_FALSE;
+        enable12.shaderOutputLayer = multi_viewport ? VK_TRUE : VK_FALSE;
 
         const float priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -382,6 +388,7 @@ public:
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
         enable.logicOp = features.features.logicOp;  // d3d12_draw_test's logic-op draw, where available
         enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 for their addresses
+        enable.multiViewport = multi_viewport ? VK_TRUE : VK_FALSE;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
