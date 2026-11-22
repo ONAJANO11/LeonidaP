@@ -1399,6 +1399,9 @@ public:
             info.pNext = &create.format_list;
         }
         const std::uint32_t samples = info.samples;
+        // Custom sample locations on a depth attachment need this (VK_EXT_sample_locations).
+        if ((format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && (device_.info.sample_locations & samples))
+            info.flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
         // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert. Nor would it
         // repack a 96-bit texture's 12-byte texels.)
@@ -2087,7 +2090,19 @@ public:
             log_once("invalid graphics pipeline sample count:", int(samples));
             return E_INVALIDARG;
         }
-        if (desc.SampleDesc.Quality != 0) {
+        // D3D12 takes quality 0 and the two pattern values (measured natively on an RX 7800 XT, a Radeon iGPU and
+        // WARP: 0, D3D12_STANDARD_MULTISAMPLE_PATTERN and D3D12_CENTER_MULTISAMPLE_PATTERN succeed, 1 is
+        // E_INVALIDARG, as NumQualityLevels is 1). The standard pattern is Vulkan's standard sample positions, so it
+        // is quality 0 here. The centre pattern puts every sample at the pixel centre, set with VK_EXT_sample_locations
+        // at each draw; without the extension at this count it is refused with a log.
+        const bool center = desc.SampleDesc.Quality == UINT(D3D12_CENTER_MULTISAMPLE_PATTERN);
+        if (center && !(device_.info.sample_locations & samples)) {
+            log_once("D3D12_CENTER_MULTISAMPLE_PATTERN needs VK_EXT_sample_locations at this count; samples",
+                     int(samples));
+            return E_NOTIMPL;
+        }
+        if (desc.SampleDesc.Quality != 0 && desc.SampleDesc.Quality != UINT(D3D12_STANDARD_MULTISAMPLE_PATTERN) &&
+            !center) {
             log_once("invalid graphics pipeline sample quality:", int(desc.SampleDesc.Quality));
             return E_INVALIDARG;
         }
@@ -2242,6 +2257,12 @@ public:
         const VkSampleMask sample_mask = desc.SampleMask;
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
+        // With VK_EXT_sample_locations, pipelines at its counts (1x included: D3D12's Tier 2 programs single-sample
+        // positions too) take their positions at each draw: the list's SetSamplePositions, the centre pattern, or
+        // the standard one (the same the driver uses without the extension). The
+        // VkPipelineSampleLocationsStateCreateInfoEXT is chained in build(), from the recipe's flag.
+        graphics_.sample_locations = (device_.info.sample_locations & samples) != 0;
+        graphics_.center_samples = center;
 
         const D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
         VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -2396,6 +2417,7 @@ public:
         recipe_.assembly = assembly;
         recipe_.raster = raster;
         recipe_.multisample = multisample;
+        graphics_.samples = samples;
         recipe_.sample_mask = sample_mask;
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
@@ -2517,11 +2539,12 @@ private:
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
+        std::vector<VkDynamicState> dynamic_states = {
             VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        if (graphics_.sample_locations) dynamic_states.push_back(VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT);
+        if (!recipe_.bindings.empty()) dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
         const Recipe& r = recipe_;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
@@ -2544,13 +2567,18 @@ private:
         viewport.viewportCount = 1;
         viewport.scissorCount = 1;
         VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
+        VkPipelineSampleLocationsStateCreateInfoEXT locations{
+            VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+        locations.sampleLocationsEnable = VK_TRUE;
+        locations.sampleLocationsInfo.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+        if (graphics_.sample_locations) multisample.pNext = &locations;
         multisample.pSampleMask = &r.sample_mask;
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-        dynamic.pDynamicStates = dynamic_states;
+        dynamic.dynamicStateCount = std::uint32_t(dynamic_states.size());
+        dynamic.pDynamicStates = dynamic_states.data();
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         info.stageCount = std::uint32_t(r.stages.size());
@@ -2990,12 +3018,26 @@ public:
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
             }
         }
+        // Which counts can take a 2x2 sample-location grid (SetSamplePositions with four pixels).
+        VkSampleCountFlags grid_2x2 = 0;
+        if (info.sample_locations && info.physical && info.get_instance_proc) {
+            const auto multisample = reinterpret_cast<PFN_vkGetPhysicalDeviceMultisamplePropertiesEXT>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMultisamplePropertiesEXT"));
+            for (std::uint32_t count = 1; multisample && count <= 64; count <<= 1) {
+                if (!(info.sample_locations & count)) continue;
+                VkMultisamplePropertiesEXT properties{VK_STRUCTURE_TYPE_MULTISAMPLE_PROPERTIES_EXT};
+                multisample(info.physical, VkSampleCountFlagBits(count), &properties);
+                if (properties.maxSampleLocationGridSize.width >= 2 && properties.maxSampleLocationGridSize.height >= 2)
+                    grid_2x2 |= count;
+            }
+        }
 
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_sample_location_grid_2x2(grid_2x2);
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -6195,6 +6237,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     info.presentation = has_swapchain && instance_has_surface;
+    // SetSamplePositions and the centre pattern, for the counts the GPU can place freely.
+    if (std::any_of(extensions.begin(), extensions.end(), [](const VkExtensionProperties& e) {
+            return std::strcmp(e.extensionName, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceSampleLocationsPropertiesEXT locations{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &locations};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        info.sample_locations = locations.sampleLocationSampleCounts;
+        device_extensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+    }
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)

@@ -703,6 +703,11 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    std::uint32_t samples = 1;            // rasterizationSamples; every attachment must have this count
+    // VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT with sampleLocationsEnable: each draw sets the list's positions, or
+    // the standard ones.
+    bool sample_locations = false;
+    bool center_samples = false;  // D3D12_CENTER_MULTISAMPLE_PATTERN: every sample at the pixel centre by default
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -753,6 +758,8 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
+    PFN_vkCmdSetSampleLocationsEXT set_sample_locations = nullptr;  // pipelines with sample_locations only
+    VkSampleCountFlags sample_location_grid_2x2 = 0;  // counts whose maxSampleLocationGridSize is at least 2x2
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
@@ -1686,6 +1693,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+    if (pipeline->sample_locations) {
+        if (!vk.set_sample_locations) return ReplayResult::unsupported;
+        // D3D12 requires the positions' count to be the PSO's; a 2x2 pattern needs a grid that large.
+        if (draw.sample_count && draw.sample_count != pipeline->samples) return ReplayResult::invalid_subresource;
+        if (draw.sample_count && draw.sample_pixels == 4 && !(vk.sample_location_grid_2x2 & pipeline->samples))
+            return ReplayResult::unsupported;
+    }
     p.graphics = *pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
@@ -1705,6 +1719,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         a.binding = *binding;
         a.id = target.resource;
         if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+        // D3D12 requires the PSO's SampleDesc on every bound target (a mismatch is undefined); Vulkan's dynamic
+        // rendering requires the counts to agree, so the list fails here instead of in the driver.
+        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
@@ -1719,6 +1736,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         a.binding = *binding;
         a.id = draw.depth.resource;
         if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
+        if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
         viewed.format = pipeline->depth_format;
@@ -1788,6 +1806,23 @@ inline bool strip_topology(VkPrimitiveTopology topology) {
     return topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
            topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
            topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+}
+
+// The standard sample locations of the Vulkan spec ("Multisampling"), which are D3D's standard patterns, for a
+// pipeline that sets its locations dynamically. Returns false for a count without a standard pattern.
+inline bool standard_sample_locations(std::uint32_t samples, VkSampleLocationEXT* out) {
+    // In 1/16 pixel from the top-left corner.
+    static constexpr std::uint8_t one[] = {8, 8};
+    static constexpr std::uint8_t two[] = {12, 12, 4, 4};
+    static constexpr std::uint8_t four[] = {6, 2, 14, 6, 2, 10, 10, 14};
+    static constexpr std::uint8_t eight[] = {9, 5, 7, 11, 13, 9, 5, 3, 3, 13, 1, 7, 11, 15, 15, 1};
+    static constexpr std::uint8_t sixteen[] = {9, 9, 7, 5, 5, 10, 12, 7, 3, 6, 10, 13, 13, 11, 11, 3,
+                                               6, 14, 8, 1, 4, 2, 2, 12, 0, 8, 15, 4, 14, 15, 1, 0};
+    const std::uint8_t* table = samples == 1 ? one : samples == 2 ? two : samples == 4 ? four
+                              : samples == 8 ? eight : samples == 16 ? sixteen : nullptr;
+    if (!table) return false;
+    for (std::uint32_t i = 0; i < samples; ++i) out[i] = {table[2 * i] / 16.0f, table[2 * i + 1] / 16.0f};
+    return true;
 }
 
 // D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
@@ -3253,6 +3288,29 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (p.graphics.sample_locations) {
+                std::array<VkSampleLocationEXT, 64> locations{};
+                VkSampleLocationsInfoEXT info{VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT};
+                info.sampleLocationsPerPixel = VkSampleCountFlagBits(p.graphics.samples);
+                if (draw->sample_count) {
+                    // D3D12 counts 1/16 pixel from the centre; Vulkan takes [0, 1) from the top-left corner.
+                    const std::uint32_t grid = draw->sample_pixels == 4 ? 2 : 1;
+                    info.sampleLocationGridSize = {grid, grid};
+                    info.sampleLocationsCount = draw->sample_count * draw->sample_pixels;
+                    for (std::uint32_t at = 0; at < info.sampleLocationsCount; ++at)
+                        locations[at] = {0.5f + draw->sample_positions[2 * at] / 16.0f,
+                                         0.5f + draw->sample_positions[2 * at + 1] / 16.0f};
+                } else {
+                    info.sampleLocationGridSize = {1, 1};
+                    info.sampleLocationsCount = p.graphics.samples;
+                    if (p.graphics.center_samples)
+                        std::fill_n(locations.begin(), p.graphics.samples, VkSampleLocationEXT{0.5f, 0.5f});
+                    else
+                        detail::standard_sample_locations(p.graphics.samples, locations.data());
+                }
+                info.pSampleLocations = locations.data();
+                vk.set_sample_locations(command_buffer, &info);
+            }
             for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
                 if (!p.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],

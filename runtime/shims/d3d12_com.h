@@ -138,6 +138,10 @@ struct VulkanDeviceInfo {
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
+    // VK_EXT_sample_locations enabled on `device`: the sample counts (its sampleLocationSampleCounts) whose
+    // multisampled pipelines take SetSamplePositions. 0: the extension is off and the positions are the standard
+    // ones whatever the list sets.
+    VkSampleCountFlags sample_locations = 0;
     // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
     // LEONIDA_SHADERS environment variable.
     std::string shader_dir;

@@ -104,6 +104,7 @@ public:
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
+    VkSampleCountFlags sample_locations = 0;  // VK_EXT_sample_locations enabled: its sampleLocationSampleCounts
 
     Device() = default;
     Device(const Device&) = delete;
@@ -473,6 +474,16 @@ public:
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+        // VK_EXT_sample_locations where present (d3d12_sample_positions_test); sample_locations has its counts.
+        for (const auto& extension : extensions) {
+            if (std::strcmp(extension.extensionName, VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) != 0) continue;
+            VkPhysicalDeviceSampleLocationsPropertiesEXT locations{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &locations};
+            instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &properties);
+            sample_locations = locations.sampleLocationSampleCounts;
+            device_extensions.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+        }
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

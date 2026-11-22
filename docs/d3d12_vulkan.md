@@ -637,7 +637,23 @@ The compute path, end to end:
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
     index's `features` list is not read yet, so a shader that needs a feature the GPU lacks is not refused up front.
-  - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
+  - **Multisampling:** `SampleDesc.Count` is `rasterizationSamples` (checked against the GPU's framebuffer
+    sample counts), and `SampleMask` the pipeline's sample mask. Quality 0 and `D3D12_STANDARD_MULTISAMPLE_PATTERN`
+    are the standard positions; `D3D12_CENTER_MULTISAMPLE_PATTERN` puts every sample at the pixel centre through
+    `VK_EXT_sample_locations` (refused without it); any other quality is `E_INVALIDARG`, as on native D3D12 (RX
+    7800 XT, a Radeon iGPU and WARP). At replay every bound render target and depth target must have the PSO's
+    count; a draw that breaks this fails the list with `invalid_subresource`. `d3d12_msaa_draw_test`.
+  - **Sample positions:** with `VK_EXT_sample_locations` (`VulkanDeviceInfo::sample_locations`, its
+    `sampleLocationSampleCounts`), a PSO at such a count, single-sampled included (Tier 2 programs 1x positions
+    too), gets `sampleLocationsEnable` and `VK_DYNAMIC_STATE_SAMPLE_LOCATIONS_EXT`. Each draw sets the list's
+    `SetSamplePositions` (1/16 pixel from the centre becomes `0.5 + p / 16`; four pixels are a 2x2 grid), the
+    centre pattern, or the standard one when the list has none. Positions for another count than the PSO's fail
+    the list (`invalid_subresource`); a 2x2 pattern where `maxSampleLocationGridSize` is smaller is `unsupported`.
+    Depth images at those counts get `VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT`. Without the
+    extension the positions are ignored and the driver's standard ones apply. `d3d12_sample_positions_test` checks
+    the standard tables against the driver's own (2x, 4x, 8x), and custom, 2x2, 1x and centre positions against
+    computed coverage.
+  - **Refused with a log:** hull, domain and geometry stages, stream output, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
