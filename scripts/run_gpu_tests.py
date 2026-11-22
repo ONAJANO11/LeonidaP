@@ -30,6 +30,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
+from check import PIXEL_VS, bary_persp_problem   # ps_persp_bary is drawn with vs_persp; the reference is in check.py
 from check import WAVE32_LANE_DUMPS, narrow_subgroup_skip   # wave32 lane-mask dumps skip below 32 lanes, as in check.py
 
 
@@ -426,7 +427,7 @@ def check_clip_half(raw_path: str, want_b: float, want_a: float) -> tuple[bool, 
 
 
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
-DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
+DRAWN_WITH = {"ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_ops.asm"}
 
@@ -831,6 +832,8 @@ def run_suite(a, work: str) -> int:
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
+            if name in PIXEL_VS:
+                vs = os.path.join(spirv_dir, PIXEL_VS[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             rc, msg = run_cmd([vk_harness, vs, spv, raw], env=env)
             if rc == 77:   # vk_harness: the device lacks a feature this shader needs (e.g. barycentrics)
@@ -873,6 +876,9 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_pixel_const(raw, const_wants[name])
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
+            elif name == "ps_persp_bary":
+                problem = bary_persp_problem(read_raw_rgba32f(raw))
+                ok, detail = not problem, problem or "perspective-correct on every covered pixel"
             elif name == "ps_bitmask_perm":
                 m = re.search(r"subgroup \d+\.\.(\d+)", msg)
                 if m and int(m.group(1)) < 32:
