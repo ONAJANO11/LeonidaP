@@ -75,14 +75,15 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkCmdDrawMeshTasksEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
 
-    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering) when the
-    // extension is not enabled, and the query functions are optional (a list that uses queries without them is
-    // unsupported). The compute and descriptor functions are needed for normalized or summed occlusion results.
+    // The Vulkan 1.3 entry points may be null on older devices, the extension ones (conditional rendering, mesh
+    // shaders) when the extension is not enabled, and the query functions are optional (a list that uses queries
+    // without them is unsupported). The compute and descriptor functions are needed for normalized or summed
+    // occlusion results.
     bool load(PFN_vkGetDeviceProcAddr get, VkDevice device) {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(get(device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
@@ -700,6 +701,7 @@ public:
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
+        replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
