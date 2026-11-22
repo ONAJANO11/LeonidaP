@@ -870,7 +870,7 @@ def run_suite(a, work: str) -> int:
             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
-        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+        elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_saveexec_ext", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
@@ -891,6 +891,8 @@ def run_suite(a, work: str) -> int:
                 "cs_movrelsd_2": [11, 33, 33, 55, 1717, 77, 1515, 1717],
                 # SHADER-90: ds_permute_b32 (cs_w32_permute.asm): scatter, unwritten lane = 0, EXEC gates the write
                 "cs_w32_permute": [218, 29, 8, 211, 0, 15, 99, 15],
+                # #1657's saveexec / wrexec kinds (cs_w32_saveexec_ext.asm header)
+                "cs_w32_saveexec_ext": [0x1000, 0xA00, 0x1A00, 0x160A, 0x1200, 0x21E, 0x100A, 0xA00],
                 # integer ops with CPU-only checks until now (cs_w32_int_ext.asm)
                 "cs_w32_int_ext": [1, 27, 1, 0x33332222, 0xC0000000, 0x4000, 18, 0x20304050],
                 # 64-bit scalar data ops and v_mad_u64_u32 (cs_w32_salu64.asm)
@@ -968,7 +970,7 @@ def run_suite(a, work: str) -> int:
             wave64 = name not in ("cs_store", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
-                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
+                                  "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos", "cs_w32_saveexec_ext",
                                   "cs_exec_const", "cs_w32_mask_imm", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
             if partial and not emulated:
