@@ -162,6 +162,47 @@ def test_mrtz_depth_only_from_an_enabled_x(make_shader, export, depth):
     assert ("BuiltIn FragDepth" in spvasm) == depth
     assert ("DepthReplacing" in spvasm) == depth
 
+
+@pytest.mark.parametrize("export,depth,stencil,smask", [
+    ("exp mrtz v2, off, off, off vm", True, False, False),          # 32_R: depth only
+    ("exp mrtz off, v3, off, off vm", False, True, False),          # 32_GR: stencil only
+    ("exp mrtz off, off, v4, off vm", False, False, True),          # 32_ABGR: sample mask only
+    ("exp mrtz v2, v3, off, off vm", True, True, False),            # 32_GR: depth + stencil
+    ("exp mrtz v2, off, v4, off vm", True, False, True),            # 32_ABGR: depth + sample mask
+    ("exp mrtz off, v3, v4, off vm", False, True, True),            # 32_ABGR: stencil + sample mask
+    ("exp mrtz v2, v3, v4, off vm", True, True, True),              # 32_ABGR: depth + stencil + sample mask
+    ("exp mrtz off, off, off, v5 vm", False, False, False),         # alpha only (unmodelled)
+    ("exp mrtz v2, v2, off, off compr vm", False, True, False),     # UINT16_ABGR: stencil only
+    ("exp mrtz off, off, v3, v3 compr vm", False, False, True),     # UINT16_ABGR: sample mask only
+    ("exp mrtz v2, v2, v3, v3 compr vm", False, True, True),        # UINT16_ABGR: stencil + sample mask
+    ("exp mrtz off, off, off, off compr vm", False, False, False),  # UINT16_ABGR: no channels enabled
+], ids=[
+    "z", "stencil", "mask", "z-stencil", "z-mask", "stencil-mask", "z-stencil-mask", "alpha",
+    "compr-stencil", "compr-mask", "compr-stencil-mask", "compr-none",
+])
+def test_mrtz_stencil_and_sample_mask(make_shader, export, depth, stencil, smask):
+    """SHADER-224: exp mrtz models depth (x, uncompressed), stencil (y[7:0] or compr y[23:16] via StencilExportEXT)
+    and sample mask (z or compr z[15:0] via SampleMask). StencilExportEXT is emitted only when stencil is written."""
+    body = "v_mov_b32 v2, 0.5\nv_mov_b32 v3, 0x5a\nv_mov_b32 v4, 0xf\nv_mov_b32 v5, 1.0\n" + export + \
+           "\nexp mrt0 v5, v5, v5, v5 done vm\ns_endpgm\n"
+    shader = make_shader(body, "ps_mrtz_all")
+    spvasm = shader.translate()
+    shader.validate(spvasm)
+    assert ("BuiltIn FragDepth" in spvasm) == depth
+    assert ("DepthReplacing" in spvasm) == depth
+    assert ("BuiltIn FragStencilRefEXT" in spvasm) == stencil
+    assert ("OpCapability StencilExportEXT" in spvasm) == stencil
+    assert ('OpExtension "SPV_EXT_shader_stencil_export"' in spvasm) == stencil
+    assert ("StencilRefReplacingEXT" in spvasm) == stencil
+    assert ("BuiltIn SampleMask" in spvasm) == smask
+    if stencil and "compr" in export:
+        assert "OpBitFieldUExtract %uint" in spvasm
+    meta = rdna2spirv.shader_meta(rdna2spirv.translate.last_gen, spvasm)
+    assert bool(meta.get("writes_depth")) == depth
+    assert bool(meta.get("writes_stencil")) == stencil
+    assert bool(meta.get("writes_sample_mask")) == smask
+    assert ("shaderStencilExport" in meta["features"]) == stencil
+
 def test_a16_sample_gradients_use_full_vgprs(make_shader):
     path = os.path.join(ROOT, "runtime", "test", "shaders", "ps_texture_grad_a16.asm")
     with open(path, encoding="utf-8") as fixture:

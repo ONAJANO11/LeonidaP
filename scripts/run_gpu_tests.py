@@ -41,6 +41,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
+from check import MRTZ_TESTS, mrtz_msaa_problem, mrtz_stencil_problem   # SHADER-224: exp mrtz stencil/sample mask
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -1086,6 +1087,27 @@ def run_suite(a, work: str) -> int:
                 results.append((name, not problem, problem or f"4096/4096 pixels exact ({covered})"))
         elif name in OTHER_HARNESS:
             results.append((name, None, f"SKIP (run by {OTHER_HARNESS[name]})"))
+        elif name in MRTZ_TESTS:
+            modes = (("stencil", {"VKH_STENCIL_OUT": "1"}), ("msaa4", {"VKH_MSAA": "4"})) if name != "ps_mrtz_smask" else (
+                ("msaa4", {"VKH_MSAA": "4"}),)
+            ok: bool | None = True
+            detail = "4096/4096 msaa4 exact" if name == "ps_mrtz_smask" else "4096/4096 stencil+depth+msaa4 exact"
+            for mode, extra in modes:
+                raw = os.path.join(raw_dir, f"{name}_{mode}.raw")
+                env = dict(gfx_env or os.environ, **extra)
+                rc, msg = run_cmd([vk_harness, vs_tri, spv, raw], env=env)
+                if rc == UNSUPPORTED:
+                    ok, detail = None, unsupported_skip(msg)
+                    break
+                if rc != 0:
+                    ok, detail = False, msg
+                    break
+                px = read_raw_rgba32f(raw)
+                problem = mrtz_stencil_problem(name, px) if mode == "stencil" else mrtz_msaa_problem(px)
+                if problem:
+                    ok, detail = False, problem
+                    break
+            results.append((name, ok, detail))
         elif name.startswith("ps_"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids

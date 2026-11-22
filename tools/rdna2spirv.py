@@ -170,6 +170,8 @@ class Gen:
         self.uses_int_sampler = False    # 2D typed sampled-image types for sampling and gathering
         self.uses_int_fetch = set()    # typed image_load dims (index into STORE_DIMS): uint/sint sampled aliases
         self.writes_depth = False
+        self.writes_stencil = False
+        self.writes_sample_mask = False
         self.uses_smul = False
         self.uses_minlod = False
         self.uses_img_offset = False
@@ -8861,19 +8863,57 @@ class Gen:
                 self.emit(f"OpStore {ptr} {sel}")
             return
         if tgt == "mrtz" and self.stage == "ps":
-            # Depth export: x is the fragment depth when it's on in an uncompressed export (RGBA = Z, stencil,
-            # sample mask, alpha; Mesa ac_shader_util.c ac_get_spi_shader_z_format). A compressed mrtz is the 16-bit
-            # stencil and sample mask format, which never holds Z (ac_nir_lower_ps_late.c emit_ps_mrtz_export), and
-            # with x off no depth is exported. Until 2026-11-22 both wrote one anyway: 0.0, or an f16 half of the
-            # stencil word under compr. Stencil, sample mask and alpha aren't modelled.
+            # MRTZ export: RGBA = (Z, stencil, sample mask, alpha) (Mesa ac_shader_util.c
+            # ac_get_spi_shader_z_format). Uncompressed (SPI_SHADER_32_R / 32_GR / 32_ABGR) passes each
+            # enabled channel in its own 32-bit VGPR: x = float depth, y[7:0] = stencil ref, z = sample mask.
+            # Compressed (compr = SPI_SHADER_UINT16_ABGR) packs 16-bit uint pairs into two VGPRs and never
+            # holds Z (Mesa ac_nir_lower_ps_late.c emit_ps_mrtz_export; confirmed with Mesa RADV/ACO on RX
+            # 6800): y carries the (x, y) word with stencil in bits [23:16], and z carries the (z, w) word
+            # with the sample mask in bits [15:0]. Alpha (w) is not modelled.
+            def is_on(opnd):
+                return opnd is not None and not (opnd["k"] == "special" and opnd["t"] == "off")
+
             x = a[1] if len(a) > 1 else None
-            if "compr" in ins["mods"] or x is None or (x["k"] == "special" and x["t"] == "off"):
+            y = a[2] if len(a) > 2 else None
+            z = a[3] if len(a) > 3 else None
+            compr = "compr" in ins["mods"]
+            do_depth = not compr and is_on(x)
+            do_stencil = is_on(y)
+            do_smask = is_on(z)
+            if not (do_depth or do_stencil or do_smask):
                 return
-            self.writes_depth = True
-            old, sel = self.tmp(), self.tmp()
-            self.emit(f"{old} = OpLoad %float %out_depth")
-            self.emit(f"{sel} = OpSelect %float {self.active_b()} {self.src_f(x)} {old}")
-            self.emit(f"OpStore %out_depth {sel}")
+            act = self.active_b()
+            if do_depth:
+                self.writes_depth = True
+                old, sel = self.tmp(), self.tmp()
+                self.emit(f"{old} = OpLoad %float %out_depth")
+                self.emit(f"{sel} = OpSelect %float {act} {self.src_f(x)} {old}")
+                self.emit(f"OpStore %out_depth {sel}")
+            if do_stencil:
+                self.writes_stencil = True
+                u = self.src_u(y)
+                s_u, s_i, old, sel = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                if compr:
+                    self.emit(f"{s_u} = OpBitFieldUExtract %uint {u} {self.cu(16)} {self.cu(8)}")
+                else:
+                    self.emit(f"{s_u} = OpBitwiseAnd %uint {u} {self.cu(0xFF)}")
+                self.emit(f"{s_i} = OpBitcast %int {s_u}")
+                self.emit(f"{old} = OpLoad %int %out_stencil")
+                self.emit(f"{sel} = OpSelect %int {act} {s_i} {old}")
+                self.emit(f"OpStore %out_stencil {sel}")
+            if do_smask:
+                self.writes_sample_mask = True
+                u = self.src_u(z)
+                if compr:
+                    m_u = self.tmp()
+                    self.emit(f"{m_u} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+                else:
+                    m_u = u
+                ptr, old, sel = self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{ptr} = OpAccessChain %_ptr_Output_uint %out_sample_mask {self.cu(0)}")
+                self.emit(f"{old} = OpLoad %uint {ptr}")
+                self.emit(f"{sel} = OpSelect %uint {act} {m_u} {old}")
+                self.emit(f"OpStore {ptr} {sel}")
             return
         comps = []
         if "compr" in ins["mods"]:
@@ -9145,6 +9185,10 @@ def assemble(gen):
         iface += ["%sg_lane"]
     if gen.writes_depth:
         iface += ["%out_depth"]
+    if gen.writes_stencil:
+        iface += ["%out_stencil"]
+    if gen.writes_sample_mask:
+        iface += ["%out_sample_mask"]
     if vs:
         if gen.uses_clip:
             iface += ["%out_clip"]
@@ -9218,6 +9262,9 @@ def assemble(gen):
     if pops:
         caps.append("FragmentShaderPixelInterlockEXT")
         exts.append("SPV_EXT_fragment_shader_interlock")
+    if gen.writes_stencil:
+        caps.append("StencilExportEXT")
+        exts.append("SPV_EXT_shader_stencil_export")
     hdr = [f"OpCapability {c}" for c in caps] + [f'OpExtension "{e}"' for e in exts] + \
           ['%glsl = OpExtInstImport "GLSL.std.450"',
            f"OpMemoryModel {'PhysicalStorageBuffer64' if psb else 'Logical'} GLSL450",
@@ -9240,6 +9287,8 @@ def assemble(gen):
             hdr.append("OpExecutionMode %main PixelInterlockOrderedEXT")
         if gen.writes_depth:
             hdr.append("OpExecutionMode %main DepthReplacing")
+        if gen.writes_stencil:
+            hdr.append("OpExecutionMode %main StencilRefReplacingEXT")
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -9380,6 +9429,9 @@ def assemble(gen):
         gen.cu(gen.clip_count)
     if gen.uses_cull:
         gen.cu(gen.cull_count)
+    if gen.writes_sample_mask:
+        gen.cu(1)
+        gen.cu(0xFFFFFFFF)
     if ms_blk:
         gen.cu(0)
         if ms_clip_member is not None:
@@ -9553,6 +9605,16 @@ def assemble(gen):
         types += ["%_ptr_Output_float = OpTypePointer Output %float"]
         dec += ["OpDecorate %out_depth BuiltIn FragDepth"]
         gvars += ["%out_depth = OpVariable %_ptr_Output_float Output"]
+    if gen.writes_stencil:
+        types += ["%_ptr_Output_int = OpTypePointer Output %int"]
+        dec += ["OpDecorate %out_stencil BuiltIn FragStencilRefEXT"]
+        gvars += ["%out_stencil = OpVariable %_ptr_Output_int Output"]
+    if gen.writes_sample_mask:
+        types += [f"%arr_smask = OpTypeArray %uint {gen.cu(1)}",
+                  "%_ptr_Out_arr_smask = OpTypePointer Output %arr_smask",
+                  "%_ptr_Output_uint = OpTypePointer Output %uint"]
+        dec += ["OpDecorate %out_sample_mask BuiltIn SampleMask"]
+        gvars += ["%out_sample_mask = OpVariable %_ptr_Out_arr_smask Output"]
     if vs:
         if gen.uses_clip or gen.uses_cull:
             types += ["%_ptr_Output_float = OpTypePointer Output %float"]
@@ -9633,6 +9695,10 @@ def assemble(gen):
                f"%ud{i} = OpLoad %uint %ud{i}p",
                f"%ud{i}s = OpAccessChain %_ptr_Function_uint %sgpr {gen.cu(i)}",
                f"OpStore %ud{i}s %ud{i}"]
+    if gen.writes_sample_mask:
+        # Start with full coverage so a lane that skips a conditional mrtz sample-mask export is not masked off.
+        fn += ["%sm_init_p = OpAccessChain %_ptr_Output_uint %out_sample_mask %c0",
+               f"OpStore %sm_init_p {gen.cu(0xFFFFFFFF)}"]
     if vs:
         fn += ["%vi = OpLoad %int %vertex_index", "%viu = OpBitcast %uint %vi",
                "%v0p = OpAccessChain %_ptr_Function_uint %vgpr %c0", "OpStore %v0p %viu"]
@@ -11291,6 +11357,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     binds = sorted({int(b) for b in re.findall(r"OpDecorate %\w+ Binding (\d+)", asm)})
     feats = {"FragmentBarycentricKHR": "fragmentShaderBarycentric",
              "FragmentShaderPixelInterlockEXT": "fragmentShaderPixelInterlock",
+             "StencilExportEXT": "shaderStencilExport",
              "MeshShadingEXT": "meshShader", "Geometry": "geometryShader", "Float64": "shaderFloat64",
              "Int64": "shaderInt64", "StorageImageWriteWithoutFormat": "shaderStorageImageWriteWithoutFormat",
              "StorageImageReadWithoutFormat": "shaderStorageImageReadWithoutFormat",
@@ -11386,6 +11453,10 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["cull_distance_count"] = g.cull_count
     if g.writes_depth:
         m["writes_depth"] = True
+    if g.writes_stencil:
+        m["writes_stencil"] = True
+    if g.writes_sample_mask:
+        m["writes_sample_mask"] = True
     if g.inputs:
         m["inputs"] = sorted(g.inputs.values())
     if getattr(g, "bary_location", None) is not None:

@@ -330,7 +330,8 @@ TEXTURE_CONSTANTS = {
 CLIP_TESTS = ("vs_clip", "vs_clip_param4", "vs_clip_undeclared")
 # One definition: a later assignment used to drop ps_texoff (and any entry added by an earlier assignment) from
 # the standalone run. Keep every pixel fixture in this tuple.
-PIXEL_TESTS = sorted((*PIXEL_BITS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
+MRTZ_TESTS = ("ps_mrtz_uncompr", "ps_mrtz_compr", "ps_mrtz_smask")
+PIXEL_TESTS = sorted((*PIXEL_BITS, *MRTZ_TESTS, "ps_bary", "ps_flat", "ps_bitmask_perm", "ps_texoff", "ps_texoff_implicit",
                       "ps_uniform_branch", "ps_wqm", "ps_scc_mask32", "ps_interp_f16_high", "ps_ij_computed",
                       "ps_mandelbrot"))
 # Pixel fixtures drawn with another vertex shader than vs_ids.
@@ -1166,6 +1167,76 @@ def mandelbrot_problem(px):
     return f"{len(wrong)} of {len(px)} iteration counts differ, e.g. pixel ({i % w}, {i // w}) {got} instead of {e}"
 
 
+def mrtz_stencil_problem(name, px):
+    """Judge VKH_STENCIL_OUT=1 readback for ps_mrtz_uncompr / ps_mrtz_compr: (color.r, color.g, depth, stencil)."""
+    if len(px) != 64 * 64:
+        return f"{len(px)} pixels, expected 4096"
+    bad = 0
+    first = ""
+    for i, (r, g, d, s) in enumerate(px):
+        if not (math.isfinite(r) and math.isfinite(g) and math.isfinite(d) and math.isfinite(s)):
+            return f"non-finite mrtz pixel at ({i % 64},{i // 64}): {(r, g, d, s)}"
+        x, y = i % 64, i // 64
+        mask = (0xF7584210 >> (4 * (x >> 3))) & 0xF
+        if mask & 1:
+            want_r, want_g = 1.0, 1.0
+            want_d = (0.25 + 0.5 * (x + 0.5) / 64.0) if name == "ps_mrtz_uncompr" else 0.0
+            want_s = float(((x + 3 * y + 11) if name == "ps_mrtz_uncompr" else (3 * x + y + 17)) & 0xFF)
+        else:
+            want_r, want_g, want_d, want_s = -1.0, -1.0, 1.0, 0.0
+        if r != want_r or g != want_g or abs(d - want_d) >= 1e-4 or s != want_s:
+            if not bad:
+                first = f"at ({x},{y}): got ({r},{g},{d:.5f},{s}), want ({want_r},{want_g},{want_d:.5f},{want_s})"
+            bad += 1
+    return "" if not bad else f"stencil/depth: {bad} of 4096 pixels differ; {first}"
+
+
+def mrtz_msaa_problem(px):
+    """Judge VKH_MSAA=4 resolved coverage for ps_mrtz_uncompr / ps_mrtz_compr / ps_mrtz_smask."""
+    if len(px) != 64 * 64:
+        return f"{len(px)} pixels, expected 4096"
+    bad = 0
+    first = ""
+    for i, (r, g, b, a) in enumerate(px):
+        if not (math.isfinite(r) and math.isfinite(g) and math.isfinite(b) and math.isfinite(a)):
+            return f"non-finite MSAA pixel at ({i % 64},{i // 64}): {(r, g, b, a)}"
+        x, y = i % 64, i // 64
+        mask = (0xF7584210 >> (4 * (x >> 3))) & 0xF
+        want = bin(mask).count("1") / 4.0
+        if abs(r - want) >= 0.01 or abs(g - want) >= 0.01 or abs(b - want) >= 0.01 or abs(a - want) >= 0.01:
+            if not bad:
+                first = f"at ({x},{y}): got ({r:.4f},{g:.4f},{b:.4f},{a:.4f}), want {want:.2f}"
+            bad += 1
+    return "" if not bad else f"msaa4: {bad} of 4096 pixels differ; {first}"
+
+
+def mrtz_test(tools, spirv, name):
+    """Run an MRTZ fixture under VKH_STENCIL_OUT=1 (when it exports stencil) and VKH_MSAA=4 (all 4 mask bits)."""
+    vs = os.path.join(spirv, "vs_ids.spv")
+    fs = os.path.join(spirv, name + ".spv")
+    sg = subgroup_size(spirv, name)
+    base_env = dict(os.environ, VKH_SUBGROUP_SIZE=str(sg)) if sg else dict(os.environ)
+    modes = (("stencil", {"VKH_STENCIL_OUT": "1"}), ("msaa4", {"VKH_MSAA": "4"})) if name != "ps_mrtz_smask" else (
+        ("msaa4", {"VKH_MSAA": "4"}),)
+    with tempfile.TemporaryDirectory(prefix="leonida-mrtz-") as tmp:
+        for mode, extra in modes:
+            raw = Path(tmp) / f"{mode}.raw"
+            code, out = run(os.path.join(tools, "vk_harness" + EXE), vs, fs, raw, env=dict(base_env, **extra))
+            if code == UNSUPPORTED:
+                m = re.search(r"unsupported: .*", out)
+                return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
+            if code or not raw.is_file():
+                return failure(code, out, 2)
+            data = raw.read_bytes()
+            if len(data) != 64 * 64 * 16:
+                return f"{mode}: vk_harness returned {len(data)} bytes"
+            px = list(struct.iter_unpack("<4f", data))
+            problem = mrtz_stencil_problem(name, px) if mode == "stencil" else mrtz_msaa_problem(px)
+            if problem:
+                return problem
+    return ""
+
+
 def pixel_test(tools, spirv, name):
     path = os.path.join(spirv, name + ".spv")
     if name == "ps_ij_computed" and (BARY_FALLBACK or F16_HALVES):
@@ -1175,6 +1246,8 @@ def pixel_test(tools, spirv, name):
         return f"missing {name}.spv"
     if name in ("ps_texoff", "ps_texoff_implicit"):
         return texoff_test(tools, spirv, name)
+    if name in MRTZ_TESTS:
+        return mrtz_test(tools, spirv, name)
     if name == "ps_interp_f16_high" and BARY_FALLBACK:
         return Skip("SKIP (per-vertex interpolants need VK_KHR_fragment_shader_barycentric)")
     fmt = "<4f" if name == "ps_bary" else "<2I2f" if name in ("ps_flat", "ps_uniform_branch", "ps_scc_mask32") else "<4I"
