@@ -8,6 +8,7 @@
 
 #include "../shims/d3d12_com.h"
 #include "../shims/dxgi_com.h"
+#include "../shims/shims.h"
 #include "vulkan_loader.h"
 
 #include <cmath>
@@ -254,6 +255,22 @@ int main() {
     IDXGIFactory4* factory = nullptr;
     if (FAILED(rt::d3d12::create_dxgi_factory(dev, IID_PPV_ARGS(&factory))) || !factory)
         return fail("create_dxgi_factory");
+
+    if (!rt::shims::owns_dll("dxgi.dll") || !rt::shims::owns_dll("d3d12.dll"))
+        return fail("rt::shims::owns_dll failed for dxgi.dll or d3d12.dll");
+
+    auto declare_removal = reinterpret_cast<HRESULT(WINAPI*)()>(rt::shims::find("dxgi.dll", "DXGIDeclareAdapterRemovalSupport"));
+    if (!declare_removal || declare_removal() != S_OK)
+        return fail("DXGIDeclareAdapterRemovalSupport");
+
+    auto create_factory2 = reinterpret_cast<HRESULT(WINAPI*)(UINT, REFIID, void**)>(
+        rt::shims::find("dxgi.dll", "CreateDXGIFactory2"));
+    if (!create_factory2 || create_factory2(0, __uuidof(IDXGIFactory4), nullptr) != DXGI_ERROR_INVALID_CALL)
+        return fail("CreateDXGIFactory2 null out argument check");
+
+    IUnknown* parent = reinterpret_cast<IUnknown*>(0x1);
+    if (factory->GetParent(__uuidof(IUnknown), reinterpret_cast<void**>(&parent)) != E_NOINTERFACE || parent != nullptr)
+        return fail("IDXGIFactory::GetParent must return E_NOINTERFACE and null *out");
 
     D3D12_COMMAND_QUEUE_DESC qd{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
     ID3D12CommandQueue* queue = nullptr;

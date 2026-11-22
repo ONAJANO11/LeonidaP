@@ -739,7 +739,12 @@ public:
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
-    HRESULT STDMETHODCALLTYPE GetParent(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** out) override {
+        (void)riid;
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
 
     // IDXGIFactory
     HRESULT STDMETHODCALLTYPE EnumAdapters(UINT index, IDXGIAdapter** out) override {

@@ -977,6 +977,89 @@ void test_unwind_registration() {
     expect_rejects("unwind data past the image", make_unwind_image({{0x1000, 0x1010, 0x1FFE}}));
 }
 
+void test_dxgi_d3d12_isolation() {
+    const char* what_own = "loader owns dxgi.dll and d3d12.dll";
+    if (!rt::shims::owns_dll("dxgi.dll") || !rt::shims::owns_dll("d3d12.dll")) {
+        return failed(what_own, "owns_dll returned false for dxgi or d3d12");
+    }
+    pass(what_own);
+
+    {
+        const char* what = "direct import of shimmed dxgi function binds as Shim";
+        auto img = write_image_as(make_import_image("dxgi.dll", "CreateDXGIFactory2"), "importer_dxgi.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(img);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "did not bind as Shim");
+            if (!*reinterpret_cast<void**>(m.base + 0x1180))
+                return failed(what, "address table null");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "direct import of shimmed d3d12 function binds as Shim";
+        auto img = write_image_as(make_import_image("d3d12.dll", "D3D12CreateDevice"), "importer_d3d12.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(img);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what, "did not bind as Shim");
+            if (!*reinterpret_cast<void**>(m.base + 0x1180))
+                return failed(what, "address table null");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "unimplemented dxgi import binds as Unimplemented and never leaks to host System32";
+        auto img = write_image_as(make_import_image("dxgi.dll", "NonExistentDxgiFunction"), "importer_dxgi_unimpl.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(img);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+                return failed(what, "did not bind as Unimplemented (leaked to host or failed)");
+            if (!*reinterpret_cast<void**>(m.base + 0x1180))
+                return failed(what, "thunk null");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "unimplemented d3d12 import binds as Unimplemented and never leaks to host System32";
+        auto img = write_image_as(make_import_image("d3d12.dll", "NonExistentD3D12Function"), "importer_d3d12_unimpl.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(img);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+                return failed(what, "did not bind as Unimplemented (leaked to host or failed)");
+            if (!*reinterpret_cast<void**>(m.base + 0x1180))
+                return failed(what, "thunk null");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        const char* what = "forwarder to unimplemented dxgi function binds as Unimplemented instead of host";
+        write_image_as(make_forwarder_image("dxgi.NonExistentDxgiFunction", 0x180000000), "prov_fwd_dxgi.dll");
+        auto img = write_image_as(make_import_image("prov_fwd_dxgi.dll", "fwd"), "importer_fwd_dxgi.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(img);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+                return failed(what, "forwarder did not bind as Unimplemented");
+            pass(what);
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+}
+
 // The folder the images go to: leonida_loader_test\<process id> in LEONIDA_TEST_DIR when that is set, otherwise in
 // the temporary directory. A folder per run, because security software can hold the previous run's images for a
 // while after they are written (so they can be neither deleted nor overwritten); the fixed parent name is what an
@@ -1067,6 +1150,7 @@ int main() {
         test_delay_descriptor_fields();
         test_forwarded_exports();
         test_unwind_registration();
+        test_dxgi_d3d12_isolation();
     } catch (const std::exception& e) {
         // A write that fails (write_image throws) ends the run with the reason, instead of terminating the process.
         failed("writing the test images", e.what());

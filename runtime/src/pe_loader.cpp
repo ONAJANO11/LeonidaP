@@ -723,14 +723,17 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
     }
 
-    HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!h) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
-    FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
-    if (!p) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-    binding = Binding::Host;
-    return reinterpret_cast<void*>(p);
+    if (!shims::owns_dll(shim_key)) {
+        HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!h) return nullptr;
+        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
+        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
+        if (!p) return nullptr;
+        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+        binding = Binding::Host;
+        return reinterpret_cast<void*>(p);
+    }
+    return nullptr;
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
@@ -758,13 +761,16 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
-    if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
-        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
-        if (p) {
-            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-            m.imports.push_back({dll, sym, Binding::Host});
-            return reinterpret_cast<void*>(p);
+    // Shimmed DLLs (e.g. dxgi.dll, d3d12.dll) must never leak to host System32.
+    if (!shims::owns_dll(key)) {
+        if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+            if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
+            FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
+            if (p) {
+                if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+                m.imports.push_back({dll, sym, Binding::Host});
+                return reinterpret_cast<void*>(p);
+            }
         }
     }
     m.imports.push_back({dll, sym, Binding::Unimplemented});
