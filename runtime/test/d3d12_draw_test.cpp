@@ -41,7 +41,12 @@ struct Vertex {
 
 int main() {
     vktest::Device d;
-    EXPECT(d.create());
+    const auto device_status = d.initialize();
+    if (device_status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
+        return 77;
+    }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
 
     // Shader programs and the index that maps their hashes to the compiled test modules.
     const auto vs_program = fssm_program({0x56530001, 0xbf810000});
@@ -71,6 +76,7 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
+    std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
     std::vector<std::uint8_t> ro_depth_less(size * 256), ro_depth_le(size * 256);
     std::vector<std::uint8_t> ro_stencil_eq1(size * 256), ro_stencil_eq2(size * 256);
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
@@ -378,6 +384,74 @@ int main() {
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
         std::memcpy(second_pixels.data(), mapped, second_pixels.size());
 
+        // Third pass: indexed triangle-strip cuts (0xFFFF for UINT16, 0xFFFFFFFF for UINT32) and negative control
+        // without a cut. Two disjoint quads (top-left and bottom-right); without the cut, bridge triangle (2, 3, 4)
+        // crosses the bottom-left quadrant from (-1, 0) through (0, 0) to (1, -1).
+        {
+            const Vertex strip_verts[8] = {
+                {-1, 1, 255, 0, 0, 255}, {0, 1, 255, 0, 0, 255}, {-1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255},
+                {1, -1, 255, 0, 0, 255}, {0, -1, 255, 0, 0, 255}, {1, 0, 255, 0, 0, 255}, {0, 0, 255, 0, 0, 255},
+            };
+            const std::uint16_t strip_idx16[9] = {0, 1, 2, 3, 0xFFFFu, 4, 5, 6, 7};
+            const std::uint32_t strip_idx32[9] = {0, 1, 2, 3, 0xFFFFFFFFu, 4, 5, 6, 7};
+            const std::uint16_t strip_nocut[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+            void* up_ptr = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &up_ptr)));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1024, strip_verts, sizeof(strip_verts));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1280, strip_idx16, sizeof(strip_idx16));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1536, strip_idx32, sizeof(strip_idx32));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1792, strip_nocut, sizeof(strip_nocut));
+            upload->Unmap(0, nullptr);
+
+            auto strip_desc = pso_desc;
+            strip_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            Ref<ID3D12PipelineState> strip16_pso, strip32_pso, strip_off_pso;
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip16_pso.p))));
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip32_pso.p))));
+            strip_desc.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&strip_desc, IID_PPV_ARGS(&strip_off_pso.p))));
+
+            const D3D12_VERTEX_BUFFER_VIEW strip_vbv{upload_va + 1024, sizeof(strip_verts), sizeof(Vertex)};
+            struct StripPass {
+                ID3D12PipelineState* pso;
+                D3D12_INDEX_BUFFER_VIEW ibv;
+                UINT index_count;
+                std::vector<std::uint8_t>* out;
+            };
+            const StripPass strip_passes[] = {
+                {strip16_pso.p, {upload_va + 1280, sizeof(strip_idx16), DXGI_FORMAT_R16_UINT}, 9, &strip16_pixels},
+                {strip32_pso.p, {upload_va + 1536, sizeof(strip_idx32), DXGI_FORMAT_R32_UINT}, 9, &strip32_pixels},
+                {strip_off_pso.p, {upload_va + 1792, sizeof(strip_nocut), DXGI_FORMAT_R16_UINT}, 8, &strip_nocut_pixels},
+            };
+            UINT64 strip_fence = 10;
+            for (const auto& sp : strip_passes) {
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, sp.pso)));
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                list->IASetVertexBuffers(0, 1, &strip_vbv);
+                list->IASetIndexBuffer(&sp.ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->DrawIndexedInstanced(sp.index_count, 1, 0, 0, 0);
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++strip_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, strip_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(strip_fence, nullptr)));
+                std::memcpy(sp.out->data(), mapped, sp.out->size());
+            }
+        }
+
         // Read-only DSV (D3D12_DSV_FLAG_READ_ONLY_DEPTH / READ_ONLY_STENCIL), depth test, and OMSetStencilRef.
         {
             D3D12_RESOURCE_DESC ds_desc = rt_desc;
@@ -407,7 +481,6 @@ int main() {
             dsv_desc.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
             device->CreateDepthStencilView(ds_target.p, &dsv_desc, dsv_slot(2));
 
-            // PSO 1: write depth (0.0 < 0.5) and stencil (REPLACE with ref 1).
             auto ds_pso_desc = pso_desc;
             ds_pso_desc.DSVFormat = ds_desc.Format;
             ds_pso_desc.DepthStencilState.DepthEnable = TRUE;
@@ -422,7 +495,6 @@ int main() {
             Ref<ID3D12PipelineState> ds_write_pso, ds_ro_less_pso, ds_ro_le_pso, ds_ro_stencil_pso;
             EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ds_pso_desc, IID_PPV_ARGS(&ds_write_pso.p))));
 
-            // PSO 2 & 3: read-only depth test (DepthWriteMask = ZERO), LESS vs LESS_EQUAL (negative control).
             auto ro_depth_desc = pso_desc;
             ro_depth_desc.DSVFormat = ds_desc.Format;
             ro_depth_desc.DepthStencilState.DepthEnable = TRUE;
@@ -432,7 +504,6 @@ int main() {
             ro_depth_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
             EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&ro_depth_desc, IID_PPV_ARGS(&ds_ro_le_pso.p))));
 
-            // PSO 4: read-only stencil EQUAL test (DepthEnable = FALSE).
             auto ro_stencil_desc = pso_desc;
             ro_stencil_desc.DSVFormat = ds_desc.Format;
             ro_stencil_desc.DepthStencilState.StencilEnable = TRUE;
@@ -447,9 +518,8 @@ int main() {
             const auto dsv0 = dsv_slot(0), dsv1 = dsv_slot(1), dsv2 = dsv_slot(2);
             const auto ds_to_read = transition(ds_target.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_READ);
             const auto ds_to_write = transition(ds_target.p, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-            UINT64 ds_fence = 10;
+            UINT64 ds_fence = 20;
 
-            // Subpass 1 & 2: read-only depth test LESS vs LESS_EQUAL.
             for (UINT pass = 0; pass < 2; ++pass) {
                 EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ds_write_pso.p)));
                 list->ResourceBarrier(1, &to_target);
@@ -468,7 +538,6 @@ int main() {
                 list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
                 list->DrawIndexedInstanced(6, 1, 0, 0, 0);
 
-                // Switch depth to read-only and draw green over both top-left and bottom-right.
                 list->ResourceBarrier(1, &ds_to_read);
                 list->SetPipelineState(pass == 0 ? ds_ro_less_pso.p : ds_ro_le_pso.p);
                 list->OMSetRenderTargets(1, &rtv, FALSE, &dsv1);
@@ -490,7 +559,6 @@ int main() {
                 std::memcpy(out.data(), mapped, out.size());
             }
 
-            // Subpass 3 & 4: read-only stencil test EQUAL with OMSetStencilRef(1) vs OMSetStencilRef(2).
             for (UINT pass = 0; pass < 2; ++pass) {
                 EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ds_ro_stencil_pso.p)));
                 list->ResourceBarrier(1, &to_target);
@@ -533,7 +601,7 @@ int main() {
         EXPECT(list->Close() == S_OK);
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-        EXPECT(SUCCEEDED(queue->Signal(fence.p, 20)) && SUCCEEDED(fence->SetEventOnCompletion(20, nullptr)));
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, 30)) && SUCCEEDED(fence->SetEventOnCompletion(30, nullptr)));
 
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
@@ -594,11 +662,31 @@ int main() {
         }
     }
     EXPECT(!mismatches);
-    // Read-only DSV passes:
-    // - ro_depth_less: top-left stays red (z=0 < 0 fails), bottom-right turns green (z=0 < 0.5 passes).
-    // - ro_depth_le (negative control): top-left flips to green (z=0 <= 0 passes).
-    // - ro_stencil_eq1: top-left red (stencil==1), bottom-right blue (stencil==0).
-    // - ro_stencil_eq2 (negative control): all 4096 pixels stay blue (ref 2 matches nothing).
+    // Strip-cut passes: 0xFFFF (UINT16) and 0xFFFFFFFF (UINT32) must produce only the top-left and bottom-right quads
+    // (pure blue in top-right and bottom-left). Negative control without cut must paint bridge pixels in bottom-left.
+    UINT nocut_bl_red = 0;
+    for (UINT row = 0; row < size; ++row) {
+        for (UINT col = 0; col < size; ++col) {
+            const bool top = row < size / 2, left = col < size / 2;
+            using Pixel = std::array<std::uint8_t, 4>;
+            const Pixel want = (top && left) || (!top && !left) ? Pixel{255, 0, 0, 255} : Pixel{0, 0, 255, 255};
+            for (const auto& buf : {strip16_pixels, strip32_pixels}) {
+                const std::uint8_t* got = buf.data() + row * 256 + col * 4;
+                if (!std::equal(want.begin(), want.end(), got) && mismatches++ < 6)
+                    std::fprintf(stderr, "strip-cut pixel (%u, %u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+            }
+            if (!top && left) {
+                const std::uint8_t* got = strip_nocut_pixels.data() + row * 256 + col * 4;
+                if (got[0] == 255 && got[2] == 0) ++nocut_bl_red;
+            }
+        }
+    }
+    EXPECT(!mismatches);
+    EXPECT(nocut_bl_red > 0);
+    std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
+                "bridge pixels in bottom-left)\n",
+                nocut_bl_red);
     UINT depth_le_flipped = 0, stencil_ref2_flipped = 0;
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
