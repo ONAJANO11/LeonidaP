@@ -498,7 +498,7 @@ int main() {
                 leonida::CommandList ir;
                 ir.execute_indirect({leonida::IndirectKind::draw, sizeof(D3D12_DRAW_ARGUMENTS), 2u,
                                      rt::d3d12::resource_id(arg_buf), 0, rt::d3d12::resource_id(count_buf),
-                                     count_offset});
+                                     count_offset, nullptr, true});
                 ir.close();
 
                 VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

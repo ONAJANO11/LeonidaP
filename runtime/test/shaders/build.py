@@ -100,6 +100,28 @@ def shader_source(name):
     return "vs_clip" if name in CLIP_CASES else name
 
 
+# Vertex shaders that call the driver's fetch program (s_swappc_b64): the input signature (ISG1) the translator turns
+# into Vulkan vertex inputs, and the layer into attributes by semantic. (semantic, register, declared mask)
+FETCH_CASES = {"vs_ma": [("POSITION", 0, 0x3)]}
+
+
+def fetch_container(elements):
+    """A DXBC container holding only an ISG1 with float inputs of semantic index 0, one per element."""
+    names, name_offsets = b"", []
+    base = 8 + 32 * len(elements)
+    for semantic, _, _ in elements:
+        name_offsets.append(base + len(names))
+        names += semantic.encode("ascii") + b"\0"
+    payload = struct.pack("<II", len(elements), 8)
+    for (semantic, register, mask), name_offset in zip(elements, name_offsets):
+        # stream, name offset, semantic index, system value 0, component type 3 (float), register, masks, padding
+        payload += struct.pack("<6I", 0, name_offset, 0, 0, 3, register) + bytes([mask, mask, 0, 0]) + struct.pack("<I", 0)
+    payload += names
+    payload += bytes(-len(payload) % 4)
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 36 + 8 + len(payload), 1, 36)
+            + b"ISG1" + struct.pack("<I", len(payload)) + payload)
+
+
 def clip_container():
     # One OSG1 element: stream 0, SV_ClipDistance0.xy, float, logical register 2.
     name = b"SV_ClipDistance\0"
@@ -138,6 +160,8 @@ def translate_tests(work, names):
             if extra:
                 program += bytes(extra[0] - len(program)) + extra[1]
             (fssm / (n + ".fssm")).write_bytes(program)
+        elif n in FETCH_CASES:
+            (work / (n + ".dxbc")).write_bytes(fetch_container(FETCH_CASES[n]))
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
             (work / (n + ".dxbc")).write_bytes(clip_container())
         else:

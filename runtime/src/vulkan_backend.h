@@ -78,7 +78,8 @@ struct VulkanDeviceFunctions {
     X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
-    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)
+    X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                                                                    \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -888,6 +889,13 @@ public:
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
+    // The indirect-draw features enabled on the device (VulkanDeviceInfo::multi_draw_indirect / draw_indirect_count).
+    void set_indirect_features(bool multi_draw, bool draw_count, std::uint32_t max_draw_count = UINT32_MAX) {
+        replay_.multi_draw_indirect = multi_draw;
+        replay_.max_draw_indirect_count = max_draw_count;
+        if (!draw_count) replay_.draw_indirect_count = replay_.draw_indexed_indirect_count = nullptr;
+    }
+
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
@@ -1019,6 +1027,16 @@ public:
         std::unique_lock lock(resource_mutex_);
         scratch_ = std::make_unique<ScratchBuffers>(get, device_, std::move(allocate));
         if (!scratch_->loaded()) scratch_.reset();
+    }
+
+    // ExecuteIndirect with multi-argument signatures (vulkan_indirect.h) needs VK_EXT_device_generated_commands.
+    // `allocate` returns device-local memory with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. Without this such a call is
+    // refused as unsupported.
+    void enable_indirect_commands(PFN_vkGetDeviceProcAddr get, const IndirectExpander::Properties& properties,
+                                  ScratchBuffers::Allocate allocate) {
+        std::unique_lock lock(resource_mutex_);
+        indirect_ = std::make_unique<IndirectExpander>(get, device_, properties, std::move(allocate));
+        if (!indirect_->loaded()) indirect_.reset();
     }
 
     // Called after that command buffer's submit: true when it was accepted, false when vkQueueSubmit failed. The
@@ -1154,6 +1172,7 @@ private:
     std::function<bool(VkCommandBuffer)> bindless_prepare_;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
+    std::unique_ptr<IndirectExpander> indirect_;  // multi-argument command signatures
     std::function<void(bool)> bindless_commit_;
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
@@ -1266,6 +1285,7 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
+            if (context_.indirect_) context_.indirect_->forget(progress_);
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
@@ -1306,6 +1326,14 @@ public:
                 if (active && scratch) scratch->retire(progress, 0);
             }
         } scratch_guard{context_.scratch_.get(), progress_, false};
+        struct IndirectGuard {  // and for the generated-commands scratch
+            IndirectExpander* indirect = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~IndirectGuard() {
+                if (active && indirect) indirect->retire(progress, 0);
+            }
+        } indirect_guard{context_.indirect_.get(), progress_, false};
         bindless_commit = context_.bindless_commit_;
         std::vector<PreparedList> prepared(lists.size());
         ReplayFunctions replay = context_.replay_;
@@ -1350,6 +1378,23 @@ public:
                     scratch_guard.active = true;
                 }
                 return context_.scratch_->get(bytes, buffer, offset);
+            };
+        }
+        if (context_.indirect_) {
+            replay.indirect_prepare = [this, &tracker_lock, &indirect_guard](const IndirectExpander::Request& request,
+                                                                             IndirectPlan& plan) {
+                if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                if (!indirect_guard.active) {
+                    context_.indirect_->collect();
+                    indirect_guard.active = true;
+                }
+                return context_.indirect_->prepare(request, plan);
+            };
+            replay.indirect_prepass = [this](VkCommandBuffer cb, const IndirectPlan& plan) {
+                context_.indirect_->emit_prepass(cb, plan);
+            };
+            replay.indirect_execute = [this](VkCommandBuffer cb, const IndirectPlan& plan) {
+                context_.indirect_->emit_execute(cb, plan);
             };
         }
         if (context_.depth24_) {
@@ -1460,6 +1505,10 @@ public:
                 context_.scratch_->retire(progress_, 0);
                 scratch_guard.active = false;
             }
+            if (indirect_guard.active) {
+                context_.indirect_->retire(progress_, 0);
+                indirect_guard.active = false;
+            }
             tracker_lock.unlock();
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
@@ -1561,6 +1610,10 @@ public:
         if (scratch_guard.active) {
             context_.scratch_->retire(progress_, submitted ? submitted_ : 0);
             scratch_guard.active = false;
+        }
+        if (indirect_guard.active) {
+            context_.indirect_->retire(progress_, submitted ? submitted_ : 0);
+            indirect_guard.active = false;
         }
         tracker_lock.unlock();
         if (bindless_commit) bindless_commit(submitted);

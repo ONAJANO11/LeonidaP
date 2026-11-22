@@ -23,9 +23,28 @@ public:
     // A device-local allocation for a chunk; null on failure.
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
-    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate)
-        : device_(device), allocate_(std::move(allocate)) {
+    // What the chunks are for. The default is transfer scratch. `usage2` (VkBufferUsageFlags2, from VK_KHR_maintenance5)
+    // replaces `usage` when non-zero, for bits the 32-bit field lacks (VK_BUFFER_USAGE_2_PREPROCESS_BUFFER_BIT_EXT);
+    // `memory_type_mask` narrows the memory types a chunk may use, and `device_address` makes address() available (the
+    // allocator must then allocate with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT).
+    struct Config {
+        VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        std::uint64_t usage2 = 0;
+        std::uint32_t memory_type_mask = ~0u;
+    };
+
+    ScratchBuffers(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, Config config = {})
+        : device_(device), allocate_(std::move(allocate)), config_(config) {
         loaded_ = vk_.load(get, device);
+        vkGetBufferDeviceAddress_ = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(get(device, "vkGetBufferDeviceAddress"));
+    }
+
+    // The device address of `offset` in a buffer get() returned; 0 without vkGetBufferDeviceAddress.
+    VkDeviceAddress address(VkBuffer buffer, VkDeviceSize offset) const {
+        if (!vkGetBufferDeviceAddress_) return 0;
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        return vkGetBufferDeviceAddress_(device_, &info) + offset;
     }
 
     ~ScratchBuffers() {
@@ -148,10 +167,14 @@ private:
     bool make_chunk(std::uint64_t size, Chunk& out) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.usage = config_.usage;
+        VkBufferUsageFlags2CreateInfo usage2{VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO};
+        usage2.usage = config_.usage2;
+        if (config_.usage2) info.pNext = &usage2;
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &out.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, out.buffer, &requirements);
+        requirements.memoryTypeBits &= config_.memory_type_mask;
         out.memory = allocate_ ? allocate_(requirements) : VK_NULL_HANDLE;
         if (!out.memory || vk_.vkBindBufferMemory(device_, out.buffer, out.memory, 0) != VK_SUCCESS) {
             destroy(out);
@@ -172,6 +195,8 @@ private:
 
     VkDevice device_;
     Allocate allocate_;
+    Config config_;
+    PFN_vkGetBufferDeviceAddress vkGetBufferDeviceAddress_ = nullptr;
     Functions vk_;
     bool loaded_ = false;
     Batch current_;               // handed out, not yet submitted

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -557,6 +558,38 @@ enum class IndirectKind : std::uint8_t {
     dispatch = 2,
 };
 
+// One argument of a command signature (D3D12_INDIRECT_ARGUMENT_DESC), with where it sits in a record and where it
+// lands. Records hold the arguments in order, tightly packed, and are `stride` bytes apart.
+enum class IndirectArgumentType : std::uint8_t {
+    draw,           // D3D12_DRAW_ARGUMENTS (16 bytes)
+    draw_indexed,   // D3D12_DRAW_INDEXED_ARGUMENTS (20 bytes)
+    dispatch,       // D3D12_DISPATCH_ARGUMENTS (12 bytes)
+    constants,      // Num32BitValuesToSet root constants into user-data dwords
+    root_view,      // a root CBV, SRV or UAV: a 64-bit GPU virtual address into two user-data dwords
+    vertex_buffer,  // D3D12_VERTEX_BUFFER_VIEW (16 bytes) for input slot `slot`
+    index_buffer,   // D3D12_INDEX_BUFFER_VIEW (16 bytes)
+};
+
+struct IndirectArgument {
+    IndirectArgumentType type = IndirectArgumentType::draw;
+    std::uint32_t offset = 0;      // byte offset of the argument in a record
+    std::uint32_t size = 0;        // bytes it takes in a record
+    std::uint32_t user_dword = 0;  // constants, root_view: first of the 32 user-data dwords it writes (s0..s31)
+    std::uint32_t dwords = 0;      // constants: Num32BitValuesToSet; root_view: 2
+    std::uint32_t slot = 0;        // vertex_buffer: the input slot
+};
+
+// A command signature as the replay needs it (ID3D12CommandSignature). A signature whose only argument is a draw or
+// dispatch is `simple`: it replays as vkCmdDraw*Indirect / vkCmdDispatchIndirect. Anything else changes state per
+// record and replays through VK_EXT_device_generated_commands (vulkan_indirect.h).
+struct IndirectSignature {
+    std::uint32_t stride = 0;
+    IndirectKind kind = IndirectKind::draw;  // what the last argument is
+    std::vector<IndirectArgument> arguments;
+    std::uint32_t arguments_size = 0;  // bytes of one record the arguments use (stride is at least this)
+    bool simple() const { return arguments.size() <= 1; }
+};
+
 struct ExecuteIndirect {
     IndirectKind kind = IndirectKind::draw;
     std::uint32_t stride = 0;
@@ -565,11 +598,24 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // The list's graphics state at the call (its count, instances and first fields are unused: the argument buffer
+    // holds them), for the draw kinds. Replay then makes the call a whole draw: it begins rendering into the targets,
+    // binds the pipeline and the dynamic state as for a Draw, and issues the indirect draw. Null: the caller has set
+    // all that up (a raw indirect call), as the unit tests of the indirect path do.
+    std::shared_ptr<const Draw> state;
+    // A draw kind without `state` is a raw call that the caller has wrapped in rendering and bound a pipeline for
+    // (the unit tests of the indirect path do); only then does replay issue it as it is. Otherwise a draw kind with
+    // no state is unsupported: a bare vkCmdDraw*Indirect outside a render pass is invalid Vulkan.
+    bool raw = false;
     // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
     // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    // Set for a signature with more than the draw or dispatch argument (null for the simple ones, and for the raw
+    // calls of the unit tests): `kind` and `stride` then repeat its values. Last, so the unit tests that fill the
+    // struct in order are unaffected.
+    std::shared_ptr<const IndirectSignature> signature;
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -824,6 +870,10 @@ public:
 
     bool execute_indirect(const ExecuteIndirect& indirect) {
         if (!indirect.argument_buffer || !indirect.stride) return false;
+        if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
+        if (indirect.signature && (indirect.signature->stride != indirect.stride ||
+                                   indirect.signature->arguments.empty() || indirect.signature->kind != indirect.kind))
+            return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }

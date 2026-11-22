@@ -53,9 +53,19 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(std::shared_ptr<const leonida::IndirectSignature> signature, REFIID riid, void** out,
                                  IUnknown* device = nullptr);
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
+// What a command list needs of a signature: kind and stride, and the full description (null for a signature of only
+// a draw or dispatch argument, which replays as a plain vkCmd*Indirect call).
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            std::shared_ptr<const leonida::IndirectSignature>* full = nullptr);
+// CreateCommandSignature's checks and layout (D3D12_COMMAND_SIGNATURE_DESC against `root_signature`, which must come
+// from a Vulkan device): E_INVALIDARG for what D3D12 refuses (an action that is not last or that comes twice, a root
+// argument without a root signature or one the root signature does not have, a stride below the arguments or not a
+// multiple of 4), E_NOTIMPL for the argument types the layer does not replay (mesh and ray dispatch, incrementing
+// constants).
+HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature,
+                                 std::shared_ptr<const leonida::IndirectSignature>& out);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -90,6 +100,21 @@ struct VulkanDeviceInfo {
     // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
     // approximated.
     bool sampler_anisotropy = false;
+    // multiDrawIndirect is enabled: ExecuteIndirect hands all its commands to one vkCmdDraw*Indirect. Without it the
+    // layer issues one call per command (a drawCount above 1 is invalid without the feature).
+    bool multi_draw_indirect = false;
+    // drawIndirectCount (Vulkan 1.2) is enabled: ExecuteIndirect with a count buffer. Without it such a call is
+    // unsupported.
+    bool draw_indirect_count = false;
+    // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
+    // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
+    bool draw_indirect_first_instance = false;
+    // VK_EXT_device_generated_commands and VK_KHR_maintenance5 are enabled (IndirectExpander::Support): ExecuteIndirect
+    // with a command signature of more than one argument. Without them such a call is unsupported.
+    bool indirect_commands = false;
+    leonida::IndirectExpander::Properties indirect_properties;
+    // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
+    std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
@@ -198,6 +223,17 @@ VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
 std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&key)[8]);
+// The device's VkPipelineCache: how many Vulkan pipelines were created through it (graphics, compute and the draw-time
+// variants of a graphics PSO), how many of those the cache answered (VkPipelineCreationFeedback's application-cache
+// hit bit), and the size of its data. `available` is false without Vulkan 1.3 feedback or without the cache; then the
+// counts stay 0. For tests.
+struct PipelineCacheStats {
+    bool available = false;
+    std::uint32_t created = 0;
+    std::uint32_t hits = 0;
+    std::size_t bytes = 0;
+};
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be
@@ -255,6 +291,7 @@ struct RootArgumentLayout {
         rt::rootsig::ParamType type;
         std::uint32_t user_offset;     // first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
+        std::uint32_t descriptor_type = 0;  // root descriptors: 2 CBV, 3 SRV, 4 UAV
     };
     std::vector<Parameter> parameters;
 };

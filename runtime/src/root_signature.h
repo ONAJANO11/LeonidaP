@@ -82,6 +82,7 @@ struct RootParameter {
     // Root descriptor:
     uint32_t descriptor_register = 0;
     uint32_t descriptor_space = 0;
+    uint32_t descriptor_type = 0;  // 2 CBV, 3 SRV, 4 UAV (D3D12_ROOT_PARAMETER_TYPE order)
     // Descriptor table:
     std::vector<DescriptorRange> ranges;
 };

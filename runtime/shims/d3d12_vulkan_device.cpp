@@ -454,6 +454,64 @@ struct DeviceState {
         }
     }
 
+    // One VkPipelineCache for every pipeline the device creates (docs/d3d12_vulkan.md section 3.6): a PSO created a
+    // second time from the same shaders and state is satisfied from it. It is made on first use; without the entry
+    // points it stays null and pipelines are created as before. With Vulkan 1.3 every creation also asks for
+    // VkPipelineCreationFeedback, which is how the layer counts the creations the cache answered.
+    std::mutex pipeline_cache_mutex;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    bool pipeline_cache_tried = false;
+    bool vulkan_1_3 = false;  // the physical device's apiVersion allows VkPipelineCreationFeedback without an extension
+    std::atomic<std::uint32_t> pipelines_created{0};
+    std::atomic<std::uint32_t> pipeline_cache_hits{0};
+
+    VkPipelineCache pipeline_cache_handle() {
+        std::lock_guard lock(pipeline_cache_mutex);
+        if (!pipeline_cache_tried) {
+            pipeline_cache_tried = true;
+            const auto& vk = context->vk;
+            VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache ||
+                vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache) != VK_SUCCESS)
+                pipeline_cache = VK_NULL_HANDLE;
+        }
+        return pipeline_cache;
+    }
+
+    void destroy_pipeline_cache() {
+        if (pipeline_cache && context) context->vk.vkDestroyPipelineCache(info.device, pipeline_cache, nullptr);
+        pipeline_cache = VK_NULL_HANDLE;
+    }
+
+    // The size of the cache's data in bytes, 0 without a cache.
+    std::size_t pipeline_cache_bytes() {
+        const VkPipelineCache cache = pipeline_cache_handle();
+        std::size_t bytes = 0;
+        if (cache && context->vk.vkGetPipelineCacheData &&
+            context->vk.vkGetPipelineCacheData(info.device, cache, &bytes, nullptr) != VK_SUCCESS)
+            bytes = 0;
+        return bytes;
+    }
+
+    // `create(cache, info)` runs vkCreate*Pipelines with the device's cache and `create_info` (a graphics or compute
+    // create-info, taken by value so the feedback struct can be chained in front of its pNext).
+    template<class Info, class Create>
+    VkResult create_pipeline(Create create, Info create_info) {
+        VkPipelineCreationFeedback total{};
+        VkPipelineCreationFeedbackCreateInfo feedback{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+        feedback.pPipelineCreationFeedback = &total;
+        if (vulkan_1_3) {
+            feedback.pNext = create_info.pNext;
+            create_info.pNext = &feedback;
+        }
+        const VkResult result = create(pipeline_cache_handle(), create_info);
+        if (result == VK_SUCCESS && vulkan_1_3 && (total.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) {
+            ++pipelines_created;
+            if (total.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ++pipeline_cache_hits;
+        }
+        return result;
+    }
+
     // The translator's output, loaded on first use.
     std::mutex library_mutex;
     bool library_tried = false;
@@ -2492,8 +2550,11 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                    return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
+                },
+                pipeline_info) != VK_SUCCESS)
             return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64.
@@ -2577,8 +2638,12 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, VK_NULL_HANDLE, 1, &info, nullptr,
-                                                          &pipeline) != VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& create) {
+                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &create,
+                                                                         nullptr, &pipeline);
+                },
+                info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
@@ -3051,6 +3116,11 @@ public:
         state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
         memory_properties(info.physical, &state_.memory);
         {
+            VkPhysicalDeviceProperties physical_properties{};
+            device_properties(info.physical, &physical_properties);
+            state_.vulkan_1_3 = physical_properties.apiVersion >= VK_API_VERSION_1_3;
+        }
+        {
             char text[4] = {};
             size_t length = 0;
             const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
@@ -3101,6 +3171,18 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
+                                              info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (info.indirect_commands && info.buffer_device_address)
+            state_.context->enable_indirect_commands(get_device, info.indirect_properties,
+                                                     [this](const VkMemoryRequirements& requirements) {
+                                                         return state_.allocate(requirements, 0,
+                                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                                                nullptr, true);
+                                                     });
+        if (!info.draw_indirect_first_instance)
+            std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
+                                 "a StartInstanceLocation other than 0 are invalid\n");
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -3318,6 +3400,7 @@ public:
             state_.context->set_bindless_release(nullptr, nullptr);
         }
         state_.staging_queue.reset();  // it uses the context
+        state_.destroy_pipeline_cache();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
@@ -3342,6 +3425,7 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    DeviceState& mutable_state() { return state_; }
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
@@ -3589,33 +3673,14 @@ public:
                                                         identity()));
     }
 
-    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature*,
-                                                     REFIID riid, void** out) override {
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* desc,
+                                                     ID3D12RootSignature* root_signature, REFIID riid,
+                                                     void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        if (!desc || desc->NumArgumentDescs == 0 || !desc->pArgumentDescs || desc->ByteStride == 0)
-            return E_INVALIDARG;
-        leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        bool found = false;
-        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
-            switch (desc->pArgumentDescs[i].Type) {
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
-                kind = leonida::IndirectKind::draw;
-                found = true;
-                break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
-                kind = leonida::IndirectKind::draw_indexed;
-                found = true;
-                break;
-            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
-                kind = leonida::IndirectKind::dispatch;
-                found = true;
-                break;
-            default: break;
-            }
-        }
-        if (!found) return E_NOTIMPL;
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        std::shared_ptr<const leonida::IndirectSignature> signature;
+        if (const HRESULT hr = build_indirect_signature(desc, root_signature, signature); FAILED(hr)) return hr;
+        return create_command_signature(std::move(signature), riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
@@ -3782,7 +3847,8 @@ public:
                     first = d;
                     break;
                 }
-            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values});
+            layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
+                                     parsed.sig.params[i].descriptor_type});
         }
         auto* signature = new RootSignature(std::move(layout));
         signature->attach_device(identity());
@@ -5884,6 +5950,20 @@ std::uint32_t bindless_hash_lookup(ID3D12Device* device, const std::uint32_t (&k
     return set ? set->table().lookup(key) : 0;
 }
 
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device) {
+    PipelineCacheStats stats{};
+    if (!device) return stats;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return stats;
+    DeviceState& state = d->mutable_state();
+    stats.available = state.vulkan_1_3 && state.pipeline_cache_handle() != VK_NULL_HANDLE;
+    stats.created = state.pipelines_created;
+    stats.hits = state.pipeline_cache_hits;
+    stats.bytes = state.pipeline_cache_bytes();
+    return stats;
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();
@@ -6255,6 +6335,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                     chosen12.descriptorBindingStorageBufferUpdateAfterBind;
     info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
+    // ExecuteIndirect: several commands per call, and a count buffer.
+    info.multi_draw_indirect = chosen_features.multiDrawIndirect == VK_TRUE;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count;
+    info.draw_indirect_first_instance = chosen_features.drawIndirectFirstInstance == VK_TRUE;
+    info.max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
     info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;
@@ -6286,6 +6372,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (!chosen_features.shaderInt64)
         std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderInt64; translated shaders (all declare Int64) will not load\n");
     enable.samplerAnisotropy = info.sampler_anisotropy;
+    enable.multiDrawIndirect = info.multi_draw_indirect;
+    enable.drawIndirectFirstInstance = chosen_features.drawIndirectFirstInstance;  // StartInstanceLocation in ExecuteIndirect
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
     info.occlusion_query_precise = chosen_features.occlusionQueryPrecise == VK_TRUE;
@@ -6317,6 +6405,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (has_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
+    }
+    // ExecuteIndirect with multi-argument command signatures (vulkan_indirect.h).
+    leonida::IndirectExpander::Support indirect_support;
+    if (chosen12.bufferDeviceAddress &&
+        indirect_support.query(vkGetPhysicalDeviceFeatures2, vkGetPhysicalDeviceProperties2, info.physical, extensions)) {
+        const void* head = *v13.next();
+        indirect_support.chain(head);
+        *v13.next() = const_cast<void*>(head);
+        info.indirect_commands = true;
+        info.indirect_properties = indirect_support.properties;
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_device_generated_commands: ExecuteIndirect with more than a draw or "
+                             "dispatch argument per command is unsupported\n");
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
@@ -6411,6 +6512,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.indirect_commands) leonida::IndirectExpander::Support::add_extensions(device_extensions);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif

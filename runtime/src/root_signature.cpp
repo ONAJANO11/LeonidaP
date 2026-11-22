@@ -323,6 +323,7 @@ static DecodeResult parse_rts0_payload(const uint8_t* data, size_t size) {
             }
         } else if (dtype == 2 || dtype == 3 || dtype == 4) {
             p.type = ParamType::Descriptor;
+            p.descriptor_type = dtype;  // 2 CBV, 3 SRV, 4 UAV
             uint32_t dflags = 0;
             const size_t need = flags_v11 ? 12 : 8;
             if (poff > size || need > size - static_cast<size_t>(poff)) {

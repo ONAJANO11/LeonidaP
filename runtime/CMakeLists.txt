@@ -1223,6 +1223,68 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_m3_frame COMMAND d3d12_m3_frame_test)
       set_tests_properties(d3d12_m3_frame PROPERTIES SKIP_RETURN_CODE 77)
 
+      # M5 (synthetic part, without mesh shaders): ExecuteIndirect draws, command lists recorded on four threads, a
+      # descriptor table of 5120 SRVs, and a PSO created twice through the device's pipeline cache. vs_m5/ps_m5_inst
+      # (indirect cells), vs_m3/ps_m5_flat (rectangles from root constants), vs_m2/ps_m5_tex (T# at a byte offset).
+      set(LEONIDA_M5_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m5_shaders)
+      set(LEONIDA_M5_FILES ${LEONIDA_M5_DIR}/spirv/index.json ${LEONIDA_M5_DIR}/fssm/vs_m5.fssm
+                           ${LEONIDA_M5_DIR}/fssm/ps_m5_inst.fssm ${LEONIDA_M5_DIR}/fssm/vs_m3.fssm
+                           ${LEONIDA_M5_DIR}/fssm/ps_m5_flat.fssm ${LEONIDA_M5_DIR}/fssm/vs_m2.fssm
+                           ${LEONIDA_M5_DIR}/fssm/ps_m5_tex.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_M5_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_M5_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_M5_DIR} vs_m5 ps_m5_inst vs_m3 ps_m5_flat vs_m2 ps_m5_tex
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m5.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_inst.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_tex.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_m5, ps_m5_inst, vs_m3, ps_m5_flat, vs_m2 and ps_m5_tex for the M5 world test"
+        VERBATIM)
+      add_executable(d3d12_m5_world_test test/d3d12_m5_world_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_FILES})
+      target_link_libraries(d3d12_m5_world_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_m5_world_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_M5_DIR="${LEONIDA_M5_DIR}")
+      target_compile_options(d3d12_m5_world_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_m5_world COMMAND d3d12_m5_world_test)
+      set_tests_properties(d3d12_m5_world PROPERTIES SKIP_RETURN_CODE 77)
+
+      # ExecuteIndirect with multi-argument command signatures (VK_EXT_device_generated_commands): root constants, vertex
+      # and index buffer views and root descriptors per record, drawn and dispatched, with a count buffer, and
+      # CreateCommandSignature compared with the host runtime. vs_ma (with a vertex-fetch input signature), ps_ma, cs_ma.
+      set(LEONIDA_MA_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/ma_shaders)
+      set(LEONIDA_MA_FILES ${LEONIDA_MA_DIR}/spirv/index.json ${LEONIDA_MA_DIR}/fssm/vs_ma.fssm
+                           ${LEONIDA_MA_DIR}/fssm/ps_ma.fssm ${LEONIDA_MA_DIR}/fssm/cs_ma.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MA_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_MA_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_MA_DIR} vs_ma ps_ma cs_ma
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_ma, ps_ma and cs_ma for the multi-argument ExecuteIndirect test"
+        VERBATIM)
+      add_executable(d3d12_indirect_multiarg_test test/d3d12_indirect_multiarg_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_MA_FILES})
+      target_link_libraries(d3d12_indirect_multiarg_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_indirect_multiarg_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MA_DIR="${LEONIDA_MA_DIR}")
+      target_compile_options(d3d12_indirect_multiarg_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_indirect_multiarg COMMAND d3d12_indirect_multiarg_test)
+      set_tests_properties(d3d12_indirect_multiarg PROPERTIES SKIP_RETURN_CODE 77)
+
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes
@@ -1280,7 +1342,7 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_buffer_uav COMMAND d3d12_buffer_uav_test)
       set_tests_properties(d3d12_buffer_uav PROPERTIES SKIP_RETURN_CODE 77)
     else()
-      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m3_frame_test, d3d12_m4_compute_test and d3d12_buffer_uav_test are not built")
+      message(STATUS "llvm-mc (set LLVM_MC) or the SDK's spirv-as/spirv-val not found: d3d12_translated_draw_test, d3d12_m2_textured_test, d3d12_m3_frame_test, d3d12_m4_compute_test, d3d12_buffer_uav_test and d3d12_m5_world_test are not built")
     endif()
     # ID3D12Resource::GetHeapProperties and ID3D12DescriptorHeap::GetDesc (node masks, resolved heap flags) against the
     # host runtime and WARP; run explicitly on a Vulkan GPU.

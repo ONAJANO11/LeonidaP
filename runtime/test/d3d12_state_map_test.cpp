@@ -460,6 +460,7 @@ int main() {
 
         static std::vector<VkDeviceSize> offsets;
         ReplayFunctions vk{};
+        vk.multi_draw_indirect = true;  // one call takes all the records
         vk.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t, std::uint32_t) {
             offsets.push_back(offset);
         };
@@ -475,15 +476,75 @@ int main() {
         };
 
         CommandList list;
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0}));
-        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4}));
-        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 8, 0, 0, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw, 16, 2, 1, 12, 2, 4, nullptr, true}));
+        CHECK(list.execute_indirect({IndirectKind::draw_indexed, 20, 2, 1, 16, 2, 8, nullptr, true}));
         CHECK(list.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 20, 0, 0}));
         CHECK(list.close());
         CHECK(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
         const std::vector<VkDeviceSize> expected{260, 264, 268, 516, 272, 520, 276, 296};
         CHECK(offsets == expected);
+
+        // Without multiDrawIndirect each record is a call of its own.
+        {
+            const std::vector<VkDeviceSize> kept = offsets;  // the later checks go on from these
+            ReplayFunctions single = vk;
+            single.multi_draw_indirect = false;
+            offsets.clear();
+            CommandList one;
+            CHECK(one.execute_indirect({IndirectKind::draw, 16, 2, 1, 4, 0, 0, nullptr, true}));
+            CHECK(one.execute_indirect({IndirectKind::draw_indexed, 20, 3, 1, 8, 0, 0, nullptr, true}));
+            CHECK(one.close());
+            CHECK(replay(one, VK_NULL_HANDLE, resolve, single) == ReplayResult::success);
+            CHECK((offsets == std::vector<VkDeviceSize>{260, 276, 264, 284, 304}));
+            offsets = kept;
+        }
+
+        // Chunking of one huge record count (found by @Vonsek in #1865): the calls are counted, not the records. With
+        // maxDrawIndirectCount 0x80000000 and MaxCommandCount UINT32_MAX there are two calls, 0x80000000 records and
+        // then the clipped 0x7fffffff, at 64-bit offsets, and the loop ends. Both draw kinds, and a limit that does not
+        // divide the count.
+        {
+            struct Call { VkDeviceSize offset; std::uint32_t count; };
+            static std::vector<Call> calls;
+            ReplayFunctions huge{};
+            detail::Prepared prepared{};
+            prepared.binding.buffer_offset = 256;
+            huge.multi_draw_indirect = true;
+            huge.max_draw_indirect_count = 0x80000000u;
+            // More calls than any correct chunking needs end the loop by throwing, so a cursor that wraps again
+            // fails the test instead of running until memory is exhausted (@Vonsek's review of #1865).
+            struct TooManyCalls {};
+            huge.draw_indirect = [](VkCommandBuffer, VkBuffer, VkDeviceSize offset, std::uint32_t count,
+                                    std::uint32_t) {
+                if (calls.size() >= 8) throw TooManyCalls{};
+                calls.push_back({offset, count});
+            };
+            const auto emit_bounded = [&](const ExecuteIndirect& command) {
+                try {
+                    detail::emit_indirect(huge, VK_NULL_HANDLE, prepared, command);
+                    return true;
+                } catch (const TooManyCalls&) {
+                    return false;
+                }
+            };
+            huge.draw_indexed_indirect = huge.draw_indirect;
+            for (const IndirectKind kind : {IndirectKind::draw, IndirectKind::draw_indexed}) {
+                calls.clear();
+                ExecuteIndirect command{kind, 20, UINT32_MAX, 1, 4, 0, 0, nullptr, true};
+                CHECK(emit_bounded(command));
+                CHECK(calls.size() == 2);
+                CHECK(calls[0].offset == 260 && calls[0].count == 0x80000000u);
+                CHECK(calls[1].offset == 260 + 0x80000000ull * 20 && calls[1].count == 0x7fffffffu);
+            }
+            calls.clear();
+            huge.max_draw_indirect_count = 1000;
+            ExecuteIndirect uneven{IndirectKind::draw, 16, 2500, 1, 0, 0, 0, nullptr, true};
+            CHECK(emit_bounded(uneven));
+            CHECK(calls.size() == 3 && calls[0].count == 1000 && calls[1].count == 1000 && calls[2].count == 500);
+            CHECK(calls[2].offset == 256 + 2000ull * 16);
+        }
 
         // Reject invalid spans before invoking Vulkan, including after adding the backing-buffer base.
         const auto rejected = [&](const ExecuteIndirect& command) {
