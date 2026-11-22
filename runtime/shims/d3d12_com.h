@@ -106,6 +106,11 @@ struct VulkanDeviceInfo {
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
     bool shader_fma = false;
+    // VK_EXT_shader_image_atomic_int64 and its shaderImageInt64Atomics feature are enabled on `device` (with
+    // shaderInt64): set 0 gets the r64ui storage bindings, R32G32_UINT/SINT/TYPELESS UAV textures get an R64_UINT
+    // view there for the translator's 64-bit image atomics, and D3D12_OPTIONS9 reports
+    // AtomicInt64OnTypedResourceSupported.
+    bool shader_image_int64_atomics = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
     // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts

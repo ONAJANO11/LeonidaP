@@ -368,6 +368,28 @@ STORE_WORDS = {
     "cs_resinfo": ({**dict(enumerate([16, 4, 1, 5, 8, 2, 1, 5, 2, 1, 1, 5, 4, 1, 0xABCD])), 16: 2, 17: 5, 18: 5},
                    {}, {}),
 }
+# D3D-251: vk_store_test "words64" is "words" with an 8x8 r64 uint image (set 0 binding 26, texel i = 8y + x) filled
+# with the fourth fill below and a 4x4x4 one (binding 27, texel i = 16z + 4y + x) filled with the fifth, printed after
+# the three r32 images as 64-bit words. Per fixture: the words it changes in the uint, sint, volume, wide and wide3d
+# images, as derived in the .asm header.
+STORE64_IMAGES = STORE_IMAGES + ("wide", "wide3d")
+STORE64_FILL = STORE_FILL + (lambda i: (i + 1) << 32 | (0xFFFFFFF0 + i) & 0xFFFFFFFF,
+                             lambda i: (0x100 + i) << 32 | (0xFFFFFF00 + i))
+STORE64_WORDS = {
+    # 64-bit image atomics: the data pair afterwards (low dword in the uint image, high in the sint image) of 2D cases
+    # 0..15 and of 3D cases 0..5 at 16..21; the 2D texels 0..16 and the six 3D texels afterwards
+    "cs_imgatomic64": (
+        {**{c: 0xFFFFFFF0 + c for c in range(15)}, 15: 7,
+         16: 0xFFFFFF39, 17: 0xFFFFFF13, 18: 0xFFFFFF2C, 19: 0xFFFFFF06, 20: 0xFFFFFF1E, 21: 0xFFFF},
+        {**{c: c + 1 for c in range(15)}, 15: 0,
+         16: 0x139, 17: 0x113, 18: 0x12C, 19: 0x106, 20: 0x11E, 21: 0xFFFF0000},
+        {},
+        {0: 0x2_00000010, 1: 0xFFFFFFFF, 2: 0xFFFFFFFF_FFFFFFF0, 5: 0x7FFFFFFF_00000000, 7: 0x7_FFFFFFFF,
+         8: 0xA_00000000, 9: 0xA_0000FFF9, 10: 0xF000000B_FFFFFFFF, 11: 0xFFFFFFF3_00000004,
+         12: 0x12345678_9ABCDEF0, 13: 0xDEADBEEF_CAFEF00D, 15: 0x11_00000006, 16: 0x11_00000040},
+        {57: 0x13B_00000039, 19: 0x112_FFFFFFFF, 6: 0xFEEDFACE_DEADBEEF, 30: 0x01234567_89ABCDEF,
+         39: 0xFFFF0127_FFFF00D8}),
+}
 # TEST-184: image_get_lod on vk_texture_test's textures. Per fixture, its draws: S# word 1 (MIN_LOD [11:0], MAX_LOD
 # [23:12], 4.8 fixed point), whether the two-mip texture is drawn, and mrt0, as derived in the .asm header:
 # ps_get_lod = (clamped LOD, calculated LOD, calculated LOD at 4u, clamped LOD at 4u) on the two-mip texture,
@@ -968,32 +990,44 @@ def texoff_test(tools, spirv, name):
         return texoff_problem(raw.read_bytes(), out)[0]
 
 
+def store_images(name):
+    """(images, fills, changes) of a STORE_WORDS or STORE64_WORDS fixture."""
+    if name in STORE64_WORDS:
+        return STORE64_IMAGES, STORE64_FILL, STORE64_WORDS[name]
+    return STORE_IMAGES, STORE_FILL, STORE_WORDS[name]
+
+
 def store_words(name):
-    """The 64 words STORE_WORDS[name] expects in each of STORE_IMAGES: its changes over the tool's fill."""
-    return tuple([changed.get(i, fill(i)) for i in range(64)] for changed, fill in zip(STORE_WORDS[name], STORE_FILL))
+    """The 64 words the fixture expects in each of its images: its changes over the tool's fill."""
+    _, fills, changes = store_images(name)
+    return tuple([changed.get(i, fill(i)) for i in range(64)] for changed, fill in zip(changes, fills))
 
 
 def store_words_problem(output, name):
-    """Judge what vk_store_test printed in "words" mode: "" when every image holds store_words(name)."""
-    for image, want in zip(STORE_IMAGES, store_words(name)):
-        m = re.search(rf"^{image} words:((?: 0x[0-9a-f]{{8}}){{64}})$", output, re.MULTILINE)
+    """Judge what vk_store_test printed in "words" or "words64" mode: "" when every image holds store_words(name).
+    The r64 images (wide, wide3d) are printed as 16 hex digits a word, the others as 8."""
+    for image, want in zip(store_images(name)[0], store_words(name)):
+        digits = 16 if image.startswith("wide") else 8
+        m = re.search(rf"^{image} words:((?: 0x[0-9a-f]{{{digits}}}){{64}})$", output, re.MULTILINE)
         if not m:
             return f"vk_store_test printed no {image} words"
         got = [int(word, 16) for word in m.group(1).split()]
         bad = [i for i in range(64) if got[i] != want[i]]
         if bad:
             i = bad[0]
-            return (f"{len(bad)} of 64 {image} words differ; first word {i}: got {got[i]:#010x}, "
-                    f"expected {want[i]:#010x}")
+            return (f"{len(bad)} of 64 {image} words differ; first word {i}: got {got[i]:#0{digits + 2}x}, "
+                    f"expected {want[i]:#0{digits + 2}x}")
     return ""
 
 
 def store_words_test(tools, spirv, name):
-    """A STORE_WORDS fixture through vk_store_test's "words" mode (it binds the images and prints them)."""
+    """A STORE_WORDS fixture through vk_store_test's "words" mode, or a STORE64_WORDS one through "words64" (it binds
+    the images and prints them)."""
     shader = os.path.join(spirv, name + ".spv")
     if not os.path.isfile(shader):
         return f"missing {name}.spv"
-    code, out = run(os.path.join(tools, "vk_store_test" + EXE), shader, "words")
+    code, out = run(os.path.join(tools, "vk_store_test" + EXE), shader,
+                    "words64" if name in STORE64_WORDS else "words")
     if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature its images need
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
@@ -1313,7 +1347,7 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
-    for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
+    for name in [*STORE_WORDS, *STORE64_WORDS]:   # TEST-184 and D3D-251: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
         results.append((name, get_lod_test(tools, spirv, name)))

@@ -104,6 +104,9 @@ public:
     // instance, so a vsync swapchain can switch to IMMEDIATE or FIFO_RELAXED per present.
     bool swapchain_maintenance1 = false;
     bool shader_fma = false;       // VK_KHR_shader_fma and shaderFmaFloat32 enabled (OpFmaKHR, rdna2spirv.py --fma khr)
+    // VK_EXT_shader_image_atomic_int64 and shaderImageInt64Atomics enabled (with shaderInt64 and the bindless
+    // features): the 64-bit image atomics of translated shaders (set 0 bindings 26/27, D3D-251).
+    bool shader_image_int64_atomics = false;
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
@@ -447,6 +450,22 @@ public:
             }
         }
 #endif
+        // VK_EXT_shader_image_atomic_int64 where the device has it (and the features its bindings live with).
+        VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+        if (features.features.shaderInt64 && bindless &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &image_int64};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            shader_image_int64_atomics = image_int64.shaderImageInt64Atomics == VK_TRUE;
+            if (shader_image_int64_atomics) {
+                image_int64.sparseImageInt64Atomics = VK_FALSE;
+                image_int64.pNext = enable13.pNext;
+                enable13.pNext = &image_int64;
+            }
+        }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -489,6 +508,7 @@ public:
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+        if (shader_image_int64_atomics) device_extensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

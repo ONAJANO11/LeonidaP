@@ -33,19 +33,20 @@ WAVE32_WORDS = {n: w for n, w in check.CS_DUMPS if n in check.WAVE32_DUMPS and n
 TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + len(check.W64X_PARTIAL) + 4
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
-         + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
+         + len(check.STORE_WORDS) + len(check.STORE64_WORDS) + len(check.GET_LOD_TESTS)
          + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
 def words_output(name, flip=None):
-    """What vk_store_test prints in "words" mode when the shader left check.store_words(name) in the three images;
-    flip = (image, word index) changes one word."""
+    """What vk_store_test prints in "words" (or "words64") mode when the shader left check.store_words(name) in its
+    images; flip = (image, word index) changes one word."""
     lines = ["device: fake"]
-    for image, words in zip(check.STORE_IMAGES, check.store_words(name)):
+    for image, words in zip(check.store_images(name)[0], check.store_words(name)):
         words = [w ^ 1 if flip == (image, i) else w for i, w in enumerate(words)]
-        lines.append(f"{image} words: " + " ".join(f"{w:#010x}" for w in words))
+        width = 18 if image.startswith("wide") else 10
+        lines.append(f"{image} words: " + " ".join(f"{w:#0{width}x}" for w in words))
     return "\n".join(lines) + "\n"
 
 
@@ -135,8 +136,8 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "2x3x4 workgroup Y/Z: 0 mismatches\n"
             if name in ("cs_imgstore", "cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):   # vk_store_test checks
                 return 0, "0 bad\n0 bad\n0 bad\n"
-            if name in check.STORE_WORDS:     # vk_store_test "words": the three images, judged by check.py
-                self.assertEqual(args, ("words",))
+            if name in check.STORE_WORDS or name in check.STORE64_WORDS:   # vk_store_test "words" / "words64"
+                self.assertEqual(args, ("words64" if name in check.STORE64_WORDS else "words",))
                 return 0, words_output(name)
             return 0, "0 mismatches\n"
 
@@ -144,7 +145,7 @@ class Wave64Checks(unittest.TestCase):
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
-            for name in (*WAVE64_DUMPS, *check.STORE_WORDS):
+            for name in (*WAVE64_DUMPS, *check.STORE_WORDS, *check.STORE64_WORDS):
                 (spirv / f"{name}.spv").touch()
             if not missing_ballot:
                 (spirv / "cs_wave64_ballot.spv").touch()
@@ -560,6 +561,39 @@ class StoreWordsChecks(unittest.TestCase):
             self.assertNotIsInstance(failure, check.Skip)
             self.assertIn("exit 1", failure)
             self.assertEqual(check.store_words_test("tools", tmp, "cs_resinfo"), "missing cs_resinfo.spv")
+
+    def test_64_bit_fixture_words(self):
+        """D3D-251: cs_imgatomic64 through "words64", with the two r64 images printed as 16-digit words."""
+        uint, sint, volume, wide, wide3d = check.store_words("cs_imgatomic64")
+        self.assertEqual(uint[:16], [0xFFFFFFF0 + c for c in range(15)] + [7])
+        self.assertEqual(sint[:16], [c + 1 for c in range(15)] + [0])
+        self.assertEqual(uint[16:22], [0xFFFFFF39, 0xFFFFFF13, 0xFFFFFF2C, 0xFFFFFF06, 0xFFFFFF1E, 0xFFFF])
+        self.assertEqual(volume, [200 + i for i in range(64)])
+        self.assertEqual(wide[16], 0x11_00000000 + 64)              # 64 threads each added 1
+        self.assertEqual((wide[3], wide[4], wide[6], wide[14]), (0x4_FFFFFFF3, 0x5_FFFFFFF4, 0x7_FFFFFFF6, 0xF_FFFFFFFE))
+        self.assertEqual(wide[17:], [(i + 1) << 32 | (0xFFFFFFF0 + i) & 0xFFFFFFFF for i in range(17, 64)])
+        self.assertEqual({i for i, w in enumerate(wide3d) if w != (0x100 + i) << 32 | (0xFFFFFF00 + i)},
+                         {57, 19, 6, 30, 39})
+        name = "cs_imgatomic64"
+        self.assertEqual(check.store_words_problem(words_output(name), name), "")
+        for image in check.STORE64_IMAGES:
+            for index in (0, 20, 63):
+                problem = check.store_words_problem(words_output(name, flip=(image, index)), name)
+                self.assertIn(f"1 of 64 {image} words differ; first word {index}:", problem)
+        full = words_output(name)
+        self.assertIn("printed no wide3d words", check.store_words_problem(full.rsplit("wide3d", 1)[0], name))
+        short = full.replace(" 0x0000000200000010", "", 1)            # 63 words in the wide line
+        self.assertIn("printed no wide words", check.store_words_problem(short, name))
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / (name + ".spv")).touch()
+            with patch.object(check, "run", return_value=(0, words_output(name))) as run:
+                self.assertEqual(check.store_words_test("tools", tmp, name), "")
+            self.assertEqual(run.call_args.args[2:], ("words64",))
+            answer = 77, "unsupported: shaderImageInt64Atomics (VK_EXT_shader_image_atomic_int64)\n"
+            with patch.object(check, "run", return_value=answer):
+                skip = check.store_words_test("tools", tmp, name)
+            self.assertIsInstance(skip, check.Skip)
+            self.assertIn("shaderImageInt64Atomics", skip)
 
 
 class GetLodChecks(unittest.TestCase):

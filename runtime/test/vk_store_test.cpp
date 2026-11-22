@@ -1,6 +1,6 @@
 // Headless Vulkan test for translated typed image stores and loads (runtime/test/shaders/cs_imgstore.asm and
 // cs_imgload.asm).
-// Usage: vk_store_test cs.spv [load|load-d16|words]
+// Usage: vk_store_test cs.spv [load|load-d16|words|words64]
 // The shader builds three T#s (word1 FORMAT = 56 rgba8 unorm, 20 r32 uint, 21 r32 sint) and stores to three 8x8
 // images. The translator picks the float / uint / sint view (set 0, bindings 8 / 9 / 10 for 2D) from the FORMAT
 // field, and the bindless index from the descriptor hash table (binding 2). As in the runtime, each image has its
@@ -15,12 +15,18 @@
 // bound for these shaders in every mode: the uint image as an r32ui storage image at set 0 binding 4 and the volume
 // at binding 7, where 2D and 3D image atomics address their image, and at index 4 of the sampled array a 16x4 rgba8
 // image with all five mip levels (never read, only queried), behind the T# the runtime writes for such an image.
+// "words64" (cs_imgatomic64.asm, D3D-251): "words", plus an 8x8 and a 4x4x4 r64 uint image at set 0 bindings 26 and
+// 27, where 64-bit image atomics address their image (VK_EXT_shader_image_atomic_int64; without it the tool exits
+// 77). They are filled with (i + 1) << 32 | (0xfffffff0 + i) mod 2^32 and (0x100 + i) << 32 | (0xffffff00 + i), and
+// printed after the other three as 64-bit words ("wide" and "wide3d").
+// LEONIDA_VK_VALIDATION=1 runs every mode under VK_LAYER_KHRONOS_validation; an error then fails the run.
 #include "vulkan_loader.h"
 #include "vk_device_pick.h"
 #include "vk_shader_fma.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -28,6 +34,14 @@
 #include <vector>
 
 static PFN_vkGetInstanceProcAddr gipa;
+static unsigned validation_errors = 0;
+static VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+                                                    VkDebugUtilsMessageTypeFlagsEXT,
+                                                    const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ++validation_errors;
+    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+    return VK_FALSE;
+}
 #define CHECK(x)                                                                         \
     do {                                                                                 \
         VkResult r_ = (x);                                                               \
@@ -56,8 +70,8 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
     }
 }
 
-int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words]\n"); return 2; }
+static int run(int argc, char** argv) {
+    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|words64]\n"); return 2; }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -67,7 +81,35 @@ int main(int argc, char** argv) {
     app.apiVersion = VK_API_VERSION_1_2;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)  // getenv: read once, at startup
+#endif
+    const char* validation_env = std::getenv("LEONIDA_VK_VALIDATION");
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    const bool validation = validation_env && std::strcmp(validation_env, "0") != 0;
+    const char* layer = "VK_LAYER_KHRONOS_validation";
+    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    VkDebugUtilsMessengerCreateInfoEXT messenger_info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    messenger_info.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    messenger_info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+    messenger_info.pfnUserCallback = on_validation;
+    if (validation) {
+        ici.pNext = &messenger_info;
+        ici.enabledLayerCount = 1; ici.ppEnabledLayerNames = &layer;
+        ici.enabledExtensionCount = 1; ici.ppEnabledExtensionNames = &debug_utils;
+    }
     CHECK(vkCreateInstance(&ici, nullptr, &inst));
+    if (validation) {
+        LOADI(vkCreateDebugUtilsMessengerEXT);
+        VkDebugUtilsMessengerEXT messenger;
+        if (!vkCreateDebugUtilsMessengerEXT) { std::fprintf(stderr, "no VK_EXT_debug_utils\n"); return 1; }
+        CHECK(vkCreateDebugUtilsMessengerEXT(inst, &messenger_info, nullptr, &messenger));
+        std::fprintf(stderr, "validation on\n");
+    }
     LOADI(vkEnumeratePhysicalDevices); LOADI(vkGetPhysicalDeviceProperties); LOADI(vkCreateDevice);
     LOADI(vkGetPhysicalDeviceQueueFamilyProperties); LOADI(vkGetDeviceProcAddr);
     LOADI(vkGetPhysicalDeviceMemoryProperties); LOADI(vkGetPhysicalDeviceFeatures);
@@ -113,7 +155,9 @@ int main(int argc, char** argv) {
     const bool packed_load = argc > 2 && !std::strcmp(argv[2], "load-d16");
     const bool load_mode = packed_load || (argc > 2 && !std::strcmp(argv[2], "load"));
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
-    const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
+    // "words64": the same, with the two r64 uint images of the 64-bit image atomics.
+    const bool wide_mode = argc > 2 && !std::strcmp(argv[2], "words64");
+    const bool words_mode = wide_mode || (argc > 2 && !std::strcmp(argv[2], "words"));
     const bool filled = load_mode || words_mode;
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
@@ -135,14 +179,40 @@ int main(int argc, char** argv) {
     }
     f2.features.shaderInt64 = VK_TRUE;
     f2.pNext = &f12;
+    std::vector<const char*> extensions;
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    if (wide_mode) {
+        LOADI(vkEnumerateDeviceExtensionProperties); LOADI(vkGetPhysicalDeviceFeatures2);
+        uint32_t en = 0;
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> available(en);
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, available.data());
+        bool listed = false;
+        for (const auto& e : available)
+            listed = listed || !std::strcmp(e.extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+        if (listed) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &image_int64};
+            vkGetPhysicalDeviceFeatures2(pd, &query);
+        }
+        if (!image_int64.shaderImageInt64Atomics) {
+            std::printf("unsupported: shaderImageInt64Atomics (VK_EXT_shader_image_atomic_int64)\n");
+            return 77;
+        }
+        image_int64.sparseImageInt64Atomics = VK_FALSE;
+        image_int64.pNext = f12.pNext;
+        f12.pNext = &image_int64;
+        extensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
+    }
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr)
     fma.query(gipa, inst, pd);
     if (!fma.accepts(code.data(), code.size(), argv[1])) return 77;
     fma.link_after(&f2);
-    const char* fma_extension = fma.extension();
+    if (fma.supported()) extensions.push_back(fma.extension());
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pNext = &f2;
-    if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
+    dci.enabledExtensionCount = uint32_t(extensions.size());
+    dci.ppEnabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
@@ -202,6 +272,14 @@ int main(int argc, char** argv) {
         uint32_t t[8] = {0x5000, fmts[1] << 20, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55};
         table_insert(table, t, 1);
     }
+    // words64: the r64 images of the 64-bit atomics, index 1 of the 2D and of the 3D arrays, behind T#s of the same
+    // pattern with FORMAT 62 (32_32_UINT): k = 6 for the 8x8 image and k = 7 for the 4x4x4 one.
+    if (wide_mode) {
+        uint32_t t[8] = {0x6000, 62u << 20, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66};
+        table_insert(table, t, 1);
+        uint32_t v[8] = {0x7000, 62u << 20, 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
+        table_insert(table, v, 1);
+    }
     VkBuffer tb; void* tbp;
     CHECK(make_buffer(table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &tb, &tbp));
     std::memcpy(tbp, table.data(), table.size() * 4);
@@ -259,6 +337,32 @@ int main(int argc, char** argv) {
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         CHECK(vkCreateImageView(dev, &vi, nullptr, &vol_view));
     }
+    // words64: the 8x8 and the 4x4x4 r64 uint images (wide[0], wide[1]), their fills and read-backs.
+    VkImage wide64[2]{}; VkImageView wide64_view[2]{};
+    VkBuffer wide64_fill[2]{}, wide64_rb[2]{}; void* wide64_fillp[2]{}; void* wide64_rbp[2]{};
+    const VkExtent3D wide64_extent[2] = {{W, W, 1}, {VOL, VOL, VOL}};
+    for (int k = 0; wide_mode && k < 2; k++) {
+        VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ii.imageType = k ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D; ii.format = VK_FORMAT_R64_UINT;
+        ii.extent = wide64_extent[k]; ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT;
+        ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        CHECK(vkCreateImage(dev, &ii, nullptr, &wide64[k]));
+        VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, wide64[k], &mr);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkDeviceMemory m; CHECK(vkAllocateMemory(dev, &mai, nullptr, &m));
+        CHECK(vkBindImageMemory(dev, wide64[k], m, 0));
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = wide64[k]; vi.viewType = k ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = VK_FORMAT_R64_UINT; vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        CHECK(vkCreateImageView(dev, &vi, nullptr, &wide64_view[k]));
+        CHECK(make_buffer(64 * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &wide64_fill[k], &wide64_fillp[k]));
+        CHECK(make_buffer(64 * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &wide64_rb[k], &wide64_rbp[k]));
+        for (uint64_t i = 0; i < 64; i++)
+            static_cast<uint64_t*>(wide64_fillp[k])[i] = k ? (0x100 + i) << 32 | (0xffffff00u + i)
+                                                           : (i + 1) << 32 | ((0xfffffff0u + i) & 0xffffffffu);
+    }
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     VkSampler sampler; CHECK(vkCreateSampler(dev, &sci, nullptr, &sampler));
     // Set 0: binding 0 = sampled images, 1 = samplers, 2 = hash table, 8/9/10 = float/uint/sint 2D storage image arrays.
@@ -266,23 +370,27 @@ int main(int argc, char** argv) {
     // index 4. Binding 0 holds each image's view in its own format (typed image_load reads the uint and sint ones
     // through integer aliases); every element of a storage array holds the image of its class, so all of them are
     // valid descriptors. Bindings 4 and 7 = the 2D and 3D r32ui storage images of the image atomics: the uint image
-    // and the volume, in every element.
+    // and the volume, in every element. words64 also has bindings 26 and 27, the 2D and 3D r64ui storage images of
+    // the 64-bit atomics, with its r64 images in every element.
     constexpr uint32_t N = 5;
-    VkDescriptorSetLayoutBinding b[8]{};
+    const uint32_t binding_count = wide_mode ? 10 : 8;
+    VkDescriptorSetLayoutBinding b[10]{};
     b[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     for (int k = 0; k < 3; k++) b[3 + k] = {uint32_t(8 + k), VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[6] = {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     b[7] = {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[8] = {26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    b[9] = {27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, N, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 8; dli.pBindings = b;
+    dli.bindingCount = binding_count; dli.pBindings = b;
     VkDescriptorSetLayout dsl; CHECK(vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl));
     VkDescriptorPoolSize ps[4] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, N},
         {VK_DESCRIPTOR_TYPE_SAMPLER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * N},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7 * N},
     };
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = ps;
@@ -298,8 +406,8 @@ int main(int argc, char** argv) {
                                     {VK_NULL_HANDLE, wide_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorImageInfo smpi{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkDescriptorImageInfo dii[3][N];
-    VkDescriptorImageInfo r32ui[N], r32ui_3d[N];
-    VkWriteDescriptorSet wr[8]{};
+    VkDescriptorImageInfo r32ui[N], r32ui_3d[N], r64ui[2][N];
+    VkWriteDescriptorSet wr[10]{};
     for (auto& w : wr) { w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w.dstSet = ds; w.descriptorCount = 1; }
     wr[0].dstBinding = 0; wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; wr[0].pImageInfo = sii;
     wr[0].descriptorCount = N;
@@ -316,7 +424,12 @@ int main(int argc, char** argv) {
     for (uint32_t e = 0; e < N; e++) r32ui_3d[e] = {VK_NULL_HANDLE, vol_view, VK_IMAGE_LAYOUT_GENERAL};
     wr[7].dstBinding = 7; wr[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[7].pImageInfo = r32ui_3d; wr[7].descriptorCount = N;
-    vkUpdateDescriptorSets(dev, 8, wr, 0, nullptr);
+    for (int k = 0; wide_mode && k < 2; k++) {
+        for (uint32_t e = 0; e < N; e++) r64ui[k][e] = {VK_NULL_HANDLE, wide64_view[k], VK_IMAGE_LAYOUT_GENERAL};
+        wr[8 + k].dstBinding = 26 + k; wr[8 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        wr[8 + k].pImageInfo = r64ui[k]; wr[8 + k].descriptorCount = N;
+    }
+    vkUpdateDescriptorSets(dev, binding_count, wr, 0, nullptr);
 
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
@@ -417,6 +530,24 @@ int main(int argc, char** argv) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
                              nullptr, 0, nullptr, 2, ib + 1);
     }
+    // words64: the r64 images get their fills, then GENERAL for the dispatch.
+    VkImageMemoryBarrier wide64_ib[2]{};
+    for (int k = 0; wide_mode && k < 2; k++) {
+        wide64_ib[k] = vol_ib;
+        wide64_ib[k].image = wide64[k]; wide64_ib[k].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        wide64_ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        wide64_ib[k].srcAccessMask = 0; wide64_ib[k].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &wide64_ib[k]);
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = vol_layers; bic.imageExtent = wide64_extent[k];
+        vkCmdCopyBufferToImage(cmd, wide64_fill[k], wide64[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        wide64_ib[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; wide64_ib[k].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        wide64_ib[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        wide64_ib[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &wide64_ib[k]);
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[36] = {};
@@ -442,6 +573,16 @@ int main(int argc, char** argv) {
         bic.imageSubresource = vol_layers; bic.imageExtent = {VOL, VOL, VOL};
         vkCmdCopyImageToBuffer(cmd, vol, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vol_rb, 1, &bic);
     }
+    for (int k = 0; wide_mode && k < 2; k++) {
+        wide64_ib[k].oldLayout = VK_IMAGE_LAYOUT_GENERAL; wide64_ib[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        wide64_ib[k].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        wide64_ib[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &wide64_ib[k]);
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = vol_layers; bic.imageExtent = wide64_extent[k];
+        vkCmdCopyImageToBuffer(cmd, wide64[k], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, wide64_rb[k], 1, &bic);
+    }
     CHECK(vkEndCommandBuffer(cmd));
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
@@ -454,6 +595,13 @@ int main(int argc, char** argv) {
         for (int k = 0; k < 3; k++) {
             std::printf("%s words:", names[k]);
             for (uint32_t i = 0; i < W * W; i++) std::printf(" 0x%08x", static_cast<const uint32_t*>(words[k])[i]);
+            std::printf("\n");
+        }
+        const char* wide_names[2] = {"wide", "wide3d"};
+        for (int k = 0; wide_mode && k < 2; k++) {
+            std::printf("%s words:", wide_names[k]);
+            for (uint32_t i = 0; i < 64; i++)
+                std::printf(" 0x%016llx", static_cast<unsigned long long>(static_cast<const uint64_t*>(wide64_rbp[k])[i]));
             std::printf("\n");
         }
         return 0;
@@ -476,4 +624,13 @@ int main(int argc, char** argv) {
     std::printf("r32 uint (uint view): %u bad, texel(5,3) = %u\n", bad[1], static_cast<const uint32_t*>(rbp[1])[3 * W + 5]);
     std::printf("r32 sint (sint view): %u bad, texel(5,3) = %d\n", bad[2], static_cast<const int32_t*>(rbp[2])[3 * W + 5]);
     return (bad[0] || bad[1] || bad[2]) ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    const int result = run(argc, argv);
+    if (validation_errors) {
+        std::printf("%u validation errors\n", validation_errors);
+        return result ? result : 1;
+    }
+    return result;
 }

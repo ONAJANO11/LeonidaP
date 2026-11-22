@@ -706,7 +706,7 @@ int main(int argc, char** argv) {
 #endif
 
     // Scan selected shaders to request only the optional extensions they actually use.
-    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
+    bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false, want_img64 = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -715,6 +715,7 @@ int main(int argc, char** argv) {
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderImageInt64Atomics") want_img64 = true;   // 64-bit image atomics (bindings 26/27)
         }
     }
 
@@ -794,6 +795,10 @@ int main(int argc, char** argv) {
     const bool ext_fma = false;
     (void)want_fma;
 #endif
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT img64{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    const bool ext_img64 = link(&img64, reinterpret_cast<VkBaseOutStructure*>(&img64),
+                                VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME, want_img64);
     const bool ext_exe = link(&exe, reinterpret_cast<VkBaseOutStructure*>(&exe),
                               VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, !stats_path.empty());
     if (!stats_path.empty() && !ext_exe) {
@@ -816,6 +821,7 @@ int main(int argc, char** argv) {
         mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
     }
+    if (ext_img64) img64.sparseImageInt64Atomics = VK_FALSE;
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = 0; qci.queueCount = 1; qci.pQueuePriorities = &prio;
@@ -890,6 +896,8 @@ int main(int argc, char** argv) {
                 return "no shaderStorageImageWriteWithoutFormat";
             if (feat == "shaderStorageImageReadWithoutFormat" && !f2.features.shaderStorageImageReadWithoutFormat)
                 return "no shaderStorageImageReadWithoutFormat";
+            if (feat == "shaderImageInt64Atomics" && !(ext_img64 && img64.shaderImageInt64Atomics))
+                return "no VK_EXT_shader_image_atomic_int64 (shaderImageInt64Atomics)";
         }
         return {};
     };
@@ -904,6 +912,9 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    if (ext_img64 && img64.shaderImageInt64Atomics) {   // the r64ui arrays of the 64-bit image atomics
+        add(26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    }
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;

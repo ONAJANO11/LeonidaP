@@ -222,6 +222,8 @@ class Gen:
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
+        self.uses_storage64 = False     # 64-bit image atomics on a 2D r64ui storage image (binding 26)
+        self.uses_storage64_3d = False  # ... on a 3D one (binding 27)
         self.uses_heap = False
         self.uses_codebase = False
         self.uses_long = False
@@ -4367,7 +4369,8 @@ class Gen:
                 self.emit(f"{z} = OpIEqual %bool {x} {self.cu(0)}")
                 self.emit(f"{r} = OpSelect %uint {z} {self.cu(0xFFFFFFFF)} {d}")
             self.dst(a[0], r)
-        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") or op in self.IMG_ATOMICS:
+        elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap",
+                    "image_atomic_swap") or op in self.IMG_ATOMICS:
             self.image_misc(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
@@ -7785,6 +7788,93 @@ class Gen:
                    "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
                    "image_atomic_sub": ("OpAtomicISub", 0)}
 
+    # 64-bit image atomic -> (SPIR-V op, value that leaves memory unchanged for inactive lanes; None: they skip it)
+    IMG_ATOMICS64 = {"image_atomic_umin": ("OpAtomicUMin", (1 << 64) - 1), "image_atomic_umax": ("OpAtomicUMax", 0),
+                     "image_atomic_smin": ("OpAtomicSMin", (1 << 63) - 1), "image_atomic_smax": ("OpAtomicSMax", 1 << 63),
+                     "image_atomic_or": ("OpAtomicOr", 0), "image_atomic_xor": ("OpAtomicXor", 0),
+                     "image_atomic_and": ("OpAtomicAnd", (1 << 64) - 1), "image_atomic_add": ("OpAtomicIAdd", 0),
+                     "image_atomic_sub": ("OpAtomicISub", 0), "image_atomic_swap": ("OpAtomicExchange", None),
+                     "image_atomic_cmpswap": ("OpAtomicCompareExchange", None)}
+
+    def image_atomic_64(self, op, a, mods, dim, addr, idx):
+        """A 64-bit image atomic (D3D-251), or False for any other image instruction. RDNA2 MIMG atomics take their
+        data size from DMASK: 0x1 is 32 bits and 0x3 is 64 (for cmpswap, which carries the comparand too, 0x3 and
+        0xf); the opcodes are the same (LLVM SIISelLowering lowerImage, `DMask = Is64Bit ? 0x3 : 0x1`, and 0xf / 0x3
+        for the X2 cmpswap; llvm-mc -mcpu=gfx1013 accepts only those masks). The data is a VGPR pair, low dword
+        first, as is the pre-op value glc returns; cmpswap's comparand is the next pair. The texel is a 64-bit
+        element of an R32G32_UINT/SINT resource (R the low dword), here an R64ui storage image: binding 26 for 2D
+        and 27 for 3D at the T#'s index (StorageViews::r64ui), needing Int64ImageEXT and Int64Atomics
+        (VK_EXT_shader_image_atomic_int64). A lane that EXEC turns off leaves memory alone, as for 32 bits. inc and
+        dec (a wrap at DATA, not OpAtomicIIncrement/IDecrement) stay Unsupported, as they are for 32 bits."""
+        if op not in self.IMG_ATOMICS64:
+            return False
+        cmp = op == "image_atomic_cmpswap"
+        dm = next((m for m in mods if m.startswith("dmask:")), None)
+        if dm is None or int(dm.split(":")[1], 0) != (0xF if cmp else 0x3):
+            return False
+        vdata = a[0]
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != (4 if cmp else 2):
+            raise Unsupported(op + " 64-bit data registers")
+        three = dim == "dim:SQ_RSRC_IMG_3D"
+        nc = 3 if three else 2
+        if len(addr) < nc:
+            raise Unsupported(op + " coords")
+        coords = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:nc]]
+        iv, ip = self.tmp(), self.tmp()
+        self.emit(f"{iv} = OpCompositeConstruct {'%v3int' if three else '%v2int'} {' '.join(coords)}")
+        if three:
+            self.uses_storage64_3d = True
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg64_3 %simages64_3d {idx}")
+        else:
+            self.uses_storage64 = True
+            self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg64 %simages64 {idx}")
+        self.uses_psb = True        # %ulong and the Int64 capability come with the PSB declarations
+
+        def join(r):
+            lo, hi = self.load_reg("vgpr", r), self.load_reg("vgpr", r + 1)
+            l64, h64, sh, v = (self.tmp() for _ in range(4))
+            self.emit(f"{l64} = OpUConvert %ulong {lo}")
+            self.emit(f"{h64} = OpUConvert %ulong {hi}")
+            self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
+            self.emit(f"{v} = OpBitwiseOr %ulong {sh} {l64}")
+            return v
+
+        def returned(old):
+            if "glc" not in mods:
+                return
+            lo, sh, hi = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{lo} = OpUConvert %uint {old}")
+            self.emit(f"{sh} = OpShiftRightLogical %ulong {old} %c64_32")
+            self.emit(f"{hi} = OpUConvert %uint {sh}")
+            self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, lo)
+            self.dst({"k": "vgpr", "r": vdata["r"] + 1, "n": 1}, hi)
+
+        val = join(vdata["r"])
+        spv, neutral = self.IMG_ATOMICS64[op]
+        tp, old = self.tmp(), self.tmp()
+        if neutral is None:
+            cmpv = join(vdata["r"] + 2) if cmp else None
+            act = self.active_b()
+            do, end = self.tmp() + "_do", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {end} None")
+            self.emit(f"OpBranchConditional {act} {do} {end}")
+            self.emit(f"{do} = OpLabel")               # inactive lanes don't touch memory
+            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_ulong {ip} {iv} {self.cu(0)}")
+            if cmp:
+                self.emit(f"{old} = {spv} %ulong {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
+            else:
+                self.emit(f"{old} = {spv} %ulong {tp} {self.cu(1)} {self.cu(0)} {val}")
+            returned(old)
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{end} = OpLabel")
+            return True
+        safe = self.tmp()
+        self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_ulong {ip} {iv} {self.cu(0)}")
+        self.emit(f"{safe} = OpSelect %ulong {self.active_b()} {val} {self.cl(neutral)}")
+        self.emit(f"{old} = {spv} %ulong {tp} {self.cu(1)} {self.cu(0)} {safe}")
+        returned(old)
+        return True
+
     # image_store views: dim -> (index, SPIR-V Dim, arrayed, coordinate count). Bindings 8 + 3 * index + class,
     # class 0 = float, 1 = uint, 2 = sint (Vulkan needs the shader's component type to match the image format).
     STORE_DIMS = {"dim:SQ_RSRC_IMG_2D": (0, "2D", 0, 2), "dim:SQ_RSRC_IMG_2D_ARRAY": (1, "2D", 1, 3),
@@ -7997,7 +8087,8 @@ class Gen:
         """Query sampled image dimensions, load mip texels and handle storage image operations."""
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
         array_query = op == "image_get_resinfo" and dim == "dim:SQ_RSRC_IMG_2D_ARRAY"
-        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op == "image_atomic_cmpswap")
+        is3d_atomic = dim == "dim:SQ_RSRC_IMG_3D" and (op in self.IMG_ATOMICS or op in ("image_atomic_cmpswap",
+                                                                                          "image_atomic_swap"))
         if op == "image_store":
             self.image_store(a, mods, dim)
             return
@@ -8028,6 +8119,10 @@ class Gen:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
         vdata, addr = a[0], self.addr_regs(a[1])
         idx = self.desc_lookup_sgpr(a[2], 8)
+        if self.image_atomic_64(op, a, mods, dim, addr, idx):
+            return
+        if op == "image_atomic_swap":
+            raise Unsupported("image_atomic_swap (32-bit)")
         if is3d_atomic:
             # 3D r32ui storage image atomics (binding 7).
             self.uses_storage3d = True
@@ -9140,7 +9235,8 @@ def assemble(gen):
     if tex:
         iface += ["%images", "%samplers", "%desc_map"] + (["%images_arr"] if gen.uses_tex_array else []) + \
                  (["%simages"] if gen.uses_storage else []) + (["%images_1d"] if gen.uses_tex_1d else []) + \
-                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else [])
+                 (["%images_3d"] if gen.uses_tex_3d else []) + (["%simages3d"] if gen.uses_storage3d else []) + \
+                 (["%simages64"] if gen.uses_storage64 else []) + (["%simages64_3d"] if gen.uses_storage64_3d else [])
     if sg:
         iface += ["%sg_lane"]
     if gen.writes_depth:
@@ -9191,6 +9287,9 @@ def assemble(gen):
         caps.append("Float64")
     if gen.uses_fma_khr:
         caps.append("FMAKHR")
+    storage64 = tex and (gen.uses_storage64 or gen.uses_storage64_3d)
+    if storage64:
+        caps += ["Int64Atomics", "Int64ImageEXT"]       # shaderImageInt64Atomics (VK_EXT_shader_image_atomic_int64)
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
         if 3 in gen.uses_store_views:
@@ -9211,6 +9310,8 @@ def assemble(gen):
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
+    if storage64:
+        exts.append("SPV_EXT_shader_image_int64")
     if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms and not msc:
@@ -9368,6 +9469,20 @@ def assemble(gen):
                       "%_ptr_UC_simg = OpTypePointer UniformConstant %simg2d_u",
                       "%_ptr_Image_uint = OpTypePointer Image %uint", "%v4uint = OpTypeVector %uint 4"]
             dec += ["OpDecorate %simages DescriptorSet 0", "OpDecorate %simages Binding 4"]
+        if storage64:
+            # 64-bit image atomics: R64ui storage images, binding 26 for 2D and 27 for 3D (image_atomic_64).
+            types += ["%_ptr_Image_ulong = OpTypePointer Image %ulong"]
+        if gen.uses_storage64:
+            types += ["%simg2d_u64 = OpTypeImage %ulong 2D 0 0 0 2 R64ui", "%rt_simg64 = OpTypeRuntimeArray %simg2d_u64",
+                      "%_ptr_UC_rt_simg64 = OpTypePointer UniformConstant %rt_simg64",
+                      "%_ptr_UC_simg64 = OpTypePointer UniformConstant %simg2d_u64"]
+            dec += ["OpDecorate %simages64 DescriptorSet 0", "OpDecorate %simages64 Binding 26"]
+        if gen.uses_storage64_3d:
+            types += ["%simg3d_u64 = OpTypeImage %ulong 3D 0 0 0 2 R64ui",
+                      "%rt_simg64_3 = OpTypeRuntimeArray %simg3d_u64",
+                      "%_ptr_UC_rt_simg64_3 = OpTypePointer UniformConstant %rt_simg64_3",
+                      "%_ptr_UC_simg64_3 = OpTypePointer UniformConstant %simg3d_u64"]
+            dec += ["OpDecorate %simages64_3d DescriptorSet 0", "OpDecorate %simages64_3d Binding 27"]
     if sg:
         types += ["%_ptr_Input_uint = OpTypePointer Input %uint"]
         dec += ["OpDecorate %sg_lane BuiltIn SubgroupLocalInvocationId"]
@@ -9590,6 +9705,10 @@ def assemble(gen):
             gvars += ["%images_3d = OpVariable %_ptr_UC_rt_img3 UniformConstant"]
         if gen.uses_storage3d:
             gvars += ["%simages3d = OpVariable %_ptr_UC_rt_simg3 UniformConstant"]
+        if gen.uses_storage64:
+            gvars += ["%simages64 = OpVariable %_ptr_UC_rt_simg64 UniformConstant"]
+        if gen.uses_storage64_3d:
+            gvars += ["%simages64_3d = OpVariable %_ptr_UC_rt_simg64_3 UniformConstant"]
     if vs:
         gvars.append("%vertex_index = OpVariable %_ptr_Input_int Input")
         gvars.append("%instance_index = OpVariable %_ptr_Input_int Input")
@@ -11299,7 +11418,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
-             "FMAKHR": "shaderFmaFloat32"}     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             "FMAKHR": "shaderFmaFloat32",     # VkPhysicalDeviceShaderFmaFeaturesKHR (VK_KHR_shader_fma)
+             # VK_EXT_shader_image_atomic_int64; Int64Atomics only comes with it (rdna2spirv.py image_atomic_64)
+             "Int64ImageEXT": "shaderImageInt64Atomics", "Int64Atomics": "shaderImageInt64Atomics"}
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),

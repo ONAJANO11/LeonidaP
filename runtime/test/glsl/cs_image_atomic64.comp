@@ -1,0 +1,39 @@
+#version 460
+// Compute shader for d3d12_image_atomic64_test (D3D-251): 64-bit atomics on an R32G32_UINT/SINT UAV texture through
+// the R64_UINT storage view the layer puts in set 0 binding 26 (the 2D r64ui array of the translator's 64-bit image
+// atomics), at the bindless index of the UAV's T#. Thread i works on texel i of a 4x4 texture: add for row 0, unsigned
+// max for row 1, compare-exchange against the clear value for row 2 and exchange for row 3. The value each atomic
+// returns goes to the output buffer.
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_image_int64 : require
+
+layout(local_size_x = 16) in;
+
+layout(push_constant) uniform Params {
+    uint index;    // the UAV's bindless index
+    uint seed_lo;  // the value ClearUnorderedAccessViewUint left in every texel: R, the low dword
+    uint seed_hi;  // and G, the high dword
+} pc;
+
+layout(set = 0, binding = 26, r64ui) uniform u64image2D wide_images[];
+
+layout(set = 1, binding = 0, std430) writeonly buffer Returned {
+    uint64_t returned[];
+};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const ivec2 xy = ivec2(i % 4u, i / 4u);
+    const uint64_t seed = (uint64_t(pc.seed_hi) << 32) | uint64_t(pc.seed_lo);
+    uint64_t old;
+    if (xy.y == 0)
+        old = imageAtomicAdd(wide_images[pc.index], xy, (uint64_t(1) << 32) | uint64_t(0x10u + i));
+    else if (xy.y == 1)
+        old = imageAtomicMax(wide_images[pc.index], xy, uint64_t(5u + i) << 32);
+    else if (xy.y == 2)
+        old = imageAtomicCompSwap(wide_images[pc.index], xy, seed, (uint64_t(0xdeadbeefu) << 32) | uint64_t(i));
+    else
+        old = imageAtomicExchange(wide_images[pc.index], xy, uint64_t(i) * 0x0101010101010101ul);
+    returned[i] = old;
+}

@@ -969,6 +969,27 @@ if(TARGET Vulkan::Headers)
         LEONIDA_TEST_CS_R9G9B9E5_UAV_SPV="${LEONIDA_TEST_CS_R9G9B9E5_UAV}")
     endif()
 
+    # 64-bit typed atomics: D3D12_OPTIONS9, R32G32 UAV textures and their R64_UINT view in set 0 binding 26 (D3D-251).
+    add_executable(d3d12_image_atomic64_test test/d3d12_image_atomic64_test.cpp)
+    target_link_libraries(d3d12_image_atomic64_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_image_atomic64_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_image_atomic64_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_image_atomic64 COMMAND d3d12_image_atomic64_test)
+    set_tests_properties(d3d12_image_atomic64 PROPERTIES SKIP_RETURN_CODE 77)
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_TEST_CS_IMAGE_ATOMIC64 ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_image_atomic64.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_TEST_CS_IMAGE_ATOMIC64}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_TEST_CS_IMAGE_ATOMIC64}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_image_atomic64.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_image_atomic64.comp
+        COMMENT "Compiling cs_image_atomic64.comp"
+        VERBATIM)
+      target_sources(d3d12_image_atomic64_test PRIVATE ${LEONIDA_TEST_CS_IMAGE_ATOMIC64})
+      target_compile_definitions(d3d12_image_atomic64_test PRIVATE
+        LEONIDA_TEST_CS_IMAGE_ATOMIC64_SPV="${LEONIDA_TEST_CS_IMAGE_ATOMIC64}")
+    endif()
+
     # Debug markers as VK_EXT_debug_utils labels, and private data on every object (D3D-24).
     add_executable(d3d12_debug_markers_test test/d3d12_debug_markers_test.cpp)
     target_link_libraries(d3d12_debug_markers_test PRIVATE gta6rt_d3d12_com)

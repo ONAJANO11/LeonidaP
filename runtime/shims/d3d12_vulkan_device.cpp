@@ -318,12 +318,14 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
 // attachment_usable: the GPU can render to `format`. A UAV texture then also gets COLOR_ATTACHMENT usage, because
 // ClearUnorderedAccessView* with rectangles clears through an attachment (vkCmdClearAttachments).
+// r64_view: the image also gets R64_UINT views (DeviceState::r64_storage_view), so a typed one is made mutable with
+// its own format and R64_UINT in its list; a TYPELESS one is mutable already and allows every 64-bit format.
 struct TextureCreateInfo {
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
-    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable, bool r64_view) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -350,6 +352,13 @@ struct TextureCreateInfo {
             // R32_UINT owns storage and attachment usages; E5B9G9R9 views restrict usage to SAMPLED_BIT.
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
             view_formats = {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32};
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = view_formats.data();
+            info.pNext = &format_list;
+        }
+        if (r64_view && !format.typeless) {
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            view_formats = {format.format, VK_FORMAT_R64_UINT};
             format_list.viewFormatCount = 2;
             format_list.pViewFormats = view_formats.data();
             info.pNext = &format_list;
@@ -490,6 +499,19 @@ struct DeviceState {
         VkFormatProperties properties{};
         format_properties(info.physical, format, &properties);
         return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+    }
+
+    // D3D-251: SM 6.6's 64-bit typed atomics work on R32G32_UINT / R32G32_SINT UAVs (the host runtime makes such 2D
+    // and 3D UAVs of the UINT, SINT and TYPELESS formats). The translator does them on an R64ui storage image (set 0
+    // bindings 26/27), so with VK_EXT_shader_image_atomic_int64 such a UAV texture also gets an R64_UINT view: the
+    // same 64-bit compatibility class, R in the low dword and G in the high one.
+    bool r64_storage_view(const D3D12_RESOURCE_DESC& desc) const {
+        return info.shader_image_int64_atomics && bindless && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+               desc.SampleDesc.Count <= 1 &&
+               (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
+               (desc.Format == DXGI_FORMAT_R32G32_UINT || desc.Format == DXGI_FORMAT_R32G32_SINT ||
+                desc.Format == DXGI_FORMAT_R32G32_TYPELESS);
     }
 
     bool storage_usable(VkFormat format) const {
@@ -676,6 +698,7 @@ struct DeviceState {
         std::uint32_t index;
         VkImageView sampled;
         VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
+        VkImageView storage64;  // its R64_UINT view for the 64-bit image atomics (r64_storage_view); or null
         std::uint64_t address;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
@@ -721,14 +744,17 @@ struct DeviceState {
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
+        if (entry.storage64) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage64);
     }
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    // r64_view: the image was made for R64_UINT views (r64_storage_view); an R32G32_UINT/SINT storage view of it
+    // then also gets one, in the r64ui binding of its dimension.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false) {
+                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false, bool r64_view = false) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -807,7 +833,7 @@ struct DeviceState {
                                : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
-        ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
+        ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
         if (storage) {
@@ -827,6 +853,21 @@ struct DeviceState {
             const int numeric = numeric_class(storage_format);
             (numeric == 1 ? views.as_uint : numeric == 2 ? views.as_sint : views.as_float) = entry.storage;
             if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
+            const bool pair = storage_format == VK_FORMAT_R32G32_UINT || storage_format == VK_FORMAT_R32G32_SINT;
+            if (r64_view && pair && leonida::bindless::r64ui_binding(dimension) != leonida::bindless::no_binding) {
+                // Only a storage view: R64_UINT has no sampled or attachment use to inherit from the image.
+                VkImageViewCreateInfo wide_info = storage_info;
+                VkImageViewUsageCreateInfo wide_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+                wide_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+                wide_info.pNext = &wide_usage;
+                wide_info.format = VK_FORMAT_R64_UINT;
+                if (vk.vkCreateImageView(info.device, &wide_info, nullptr, &entry.storage64) != VK_SUCCESS) {
+                    vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+                    vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+                    return false;
+                }
+                views.r64ui = entry.storage64;
+            }
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
         entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
@@ -834,6 +875,7 @@ struct DeviceState {
             log_once("a bindless image array is full; dimension", int(dimension));
             vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+            if (entry.storage64) vk.vkDestroyImageView(info.device, entry.storage64, nullptr);
             return false;
         }
         if (existing != image_entries.end()) {
@@ -1243,6 +1285,7 @@ public:
                std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
     }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
+    bool r64_view() const { return r64_view_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -1390,7 +1433,8 @@ public:
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        r64_view_ = device_.r64_storage_view(desc_);
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), r64_view_);
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -1404,11 +1448,16 @@ public:
                     if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
                         view_formats_.push_back(pair);
             }
+            if (r64_view_ && std::find(view_formats_.begin(), view_formats_.end(), VK_FORMAT_R64_UINT) ==
+                                 view_formats_.end())
+                view_formats_.push_back(VK_FORMAT_R64_UINT);  // the 64-bit image atomics' view (TextureCreateInfo)
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            if (info.pNext != &create.format_list) {  // TextureCreateInfo may have chained it already
+                create.format_list.pNext = info.pNext;
+                info.pNext = &create.format_list;
+            }
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
@@ -1786,6 +1835,7 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     bool r9g9b9e5_as_r32_uint_ = false;
+    bool r64_view_ = false;  // made for R64_UINT storage views too (DeviceState::r64_storage_view)
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -3186,6 +3236,7 @@ public:
         leonida::BindlessFeatures features{};
         features.update_after_bind = true;  // VulkanDeviceInfo::bindless promises it
         features.partially_bound = state_.info.bindless_partially_bound;
+        features.int64_image_atomics = state_.info.shader_image_int64_atomics;  // bindings 26/27 (D3D-251)
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
@@ -4881,7 +4932,11 @@ public:
             *opts = {};
             opts->MeshShaderPipelineStatsSupported = FALSE;
             opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
-            opts->AtomicInt64OnTypedResourceSupported = FALSE;
+            // 64-bit typed atomics (SM 6.6, on R32G32_UINT/SINT UAVs): the translator's 64-bit image atomics on the
+            // R64_UINT views of set 0's r64ui bindings, where the device enabled VK_EXT_shader_image_atomic_int64
+            // (D3D-251). The host runtime answers TRUE on an RTX 3060 (NVIDIA 32.0.16.1714), as it does for the
+            // group-shared one, which stays FALSE: the translator has no 64-bit LDS add, min, max or compare-swap.
+            opts->AtomicInt64OnTypedResourceSupported = state_.info.shader_image_int64_atomics && state_.bindless;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;
             opts->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
             opts->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
@@ -4891,6 +4946,8 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS11)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS11*>(data);
             *opts = {};
+            // TRUE on the same host, but it also covers raw buffers, whose 64-bit add, min, max and compare-swap
+            // (global/buffer_atomic_*_x2) the translator does not do.
             opts->AtomicInt64OnDescriptorHeapResourceSupported = FALSE;
             return d3d12_trace::result(method, S_OK);
         }
@@ -5146,7 +5203,9 @@ public:
                 // Image atomics go through the r32ui storage view, which an R32_UINT UAV view gets
                 // (StorageViews::r32ui). Today that is 2D UAVs only: the translator's image atomics cover 2D and 3D,
                 // the bindless set has r32ui slots for those two, and the layer creates no 3D UAV views yet. There
-                // is no image_atomic_swap, so no exchange.
+                // is no 32-bit image_atomic_swap, so no exchange. The 64-bit atomics of R32G32_UINT/SINT views
+                // (D3D12_OPTIONS9) set none of these bits, as on the host (RTX 3060, NVIDIA 32.0.16.1714: Support2
+                // 0x3c0 and 0x2c0).
                 if (vk_fmt == VK_FORMAT_R32_UINT && (optimal & VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT)) {
                     s2 |= D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_ADD | D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_BITWISE_OPS |
                           D3D12_FORMAT_SUPPORT2_UAV_ATOMIC_COMPARE_STORE_OR_COMPARE_EXCHANGE |
@@ -5398,7 +5457,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format),
+                                       state_.r64_storage_view(resolved));
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
@@ -5451,7 +5511,7 @@ private:
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.r9g9b9e5_as_r32_uint());
+                                                  resource.r9g9b9e5_as_r32_uint(), resource.r64_view());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
@@ -6344,6 +6404,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         }
     }
 #endif
+    // VK_EXT_shader_image_atomic_int64: the translator's 64-bit image atomics (Int64ImageEXT, an R64ui storage image
+    // at set 0 bindings 26/27) and D3D12_OPTIONS9.AtomicInt64OnTypedResourceSupported (D3D-251). Needs shaderInt64
+    // and the bindless set those bindings live in.
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_int64{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    if (chosen_features.shaderInt64 && info.bindless &&
+        std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &image_int64};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.shader_image_int64_atomics = image_int64.shaderImageInt64Atomics == VK_TRUE;
+        if (info.shader_image_int64_atomics) {
+            image_int64.sparseImageInt64Atomics = VK_FALSE;
+            image_int64.pNext = enable13.pNext;
+            enable13.pNext = &image_int64;
+        }
+    }
     // What graphics PSOs may ask for: different blend state per render target, wireframe, a depth-bias clamp and
     // SRC1 blend factors. Enabled where the GPU has them; a PSO that needs a missing one is refused.
     enable.independentBlend = chosen_features.independentBlend;
@@ -6414,6 +6492,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
+    if (info.shader_image_int64_atomics) device_extensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

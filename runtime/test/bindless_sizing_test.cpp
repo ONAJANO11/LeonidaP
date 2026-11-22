@@ -72,7 +72,7 @@ std::uint32_t storage(const BindlessFeatures& f, ImageDimension dimension) {
     return f.counts[bindless::storage_binding(dimension, 0)];
 }
 
-// Every storage array of a dimension, the r32ui one included, holds the same indices.
+// Every storage array of a dimension, the r32ui one and (when enabled) the r64ui one included, holds the same indices.
 bool storage_consistent(const BindlessFeatures& f) {
     for (std::uint32_t d = 0; d < 4; ++d) {
         const auto dimension = ImageDimension(d);
@@ -82,6 +82,9 @@ bool storage_consistent(const BindlessFeatures& f) {
             if (f.counts[bindless::storage_binding(dimension, c)] != held) return false;
         if (bindless::r32ui_binding(dimension) != bindless::no_binding &&
             f.counts[bindless::r32ui_binding(dimension)] != held)
+            return false;
+        if (f.int64_image_atomics && bindless::r64ui_binding(dimension) != bindless::no_binding &&
+            f.counts[bindless::r64ui_binding(dimension)] != held)
             return false;
     }
     return true;
@@ -201,6 +204,40 @@ int main() {
         f = with_ms(true);
         EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
         EXPECT(totals(f).all <= 6159 || (count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024));
+    }
+
+    // D3D-251: with shaderImageInt64Atomics the r64ui bindings (26 for 2D, 27 for 3D) are in the layout, sized like
+    // the other storage arrays of their dimension, and count against the storage limits; without it they are not.
+    {
+        BindlessFeatures off{};
+        EXPECT(!bindless::binding_enabled(26, off) && !bindless::binding_enabled(27, off));
+        EXPECT(bindless::r64ui_binding(D::dim_2d) == 26 && bindless::r64ui_binding(D::dim_3d) == 27 &&
+               bindless::r64ui_binding(D::dim_2d_array) == bindless::no_binding &&
+               bindless::r64ui_binding(D::dim_1d) == bindless::no_binding);
+        const bindless::SetLayout off_layout(off);
+        for (std::uint32_t i = 0; i < off_layout.info.bindingCount; ++i) EXPECT(off_layout.entries[i].binding < 26);
+
+        const Device d = uniform(1048576, 1048576);
+        BindlessFeatures f = with_ms(true);
+        f.int64_image_atomics = true;
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(bindless::binding_enabled(26, f) && bindless::binding_enabled(27, f));
+        EXPECT(f.counts[26] == bindless::max_storage_indices && f.counts[27] == 256 && storage_consistent(f));
+        const bindless::SetLayout layout(f);
+        EXPECT(layout.entries[layout.info.bindingCount - 1].binding == 27);
+
+        // At a storage limit the two arrays take room from the others, which shrink to fit beside them.
+        Device tight = uniform(1048576, 1048576);
+        tight.v12.maxPerStageDescriptorUpdateAfterBindStorageImages = 3584;
+        BindlessFeatures without = with_ms(true), with = with_ms(true);
+        with.int64_image_atomics = true;
+        bindless::size_bindings(without, tight.limits, tight.v11, tight.v12);
+        bindless::size_bindings(with, tight.limits, tight.v11, tight.v12);
+        EXPECT(totals(with).storage <= 3584 && storage_consistent(with));
+        EXPECT(storage(with, D::dim_2d) < storage(without, D::dim_2d));
+        std::printf("r64ui bindings: %u (2D) and %u (3D) storage indices; at a 3584 storage limit 2D holds %u with "
+                    "them and %u without\n", f.counts[26], f.counts[27], storage(with, D::dim_2d),
+                    storage(without, D::dim_2d));
     }
 
     // The default features are today's counts, which the device-less users (vk_image_fuzz) still get.
