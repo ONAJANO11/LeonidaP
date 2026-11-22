@@ -17,6 +17,8 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_add/sub/mul_f16,    low halves in, D.lo out, D's high half kept; neg/abs in the VOP3 form apply to the low
   v_fmac_f16              half that is read. v_fmac_f16: D.lo = S0.lo * S1.lo + D.lo. The ps_f16_vop2 words were
                           measured on an RX 6800 (gfx1030), wave32 and wave64 (see its .asm header).
+  v_cvt_f16_f32         VOP3 clamp applies to the f16 result; the omod doesn't (it acts only with f16 denormals
+                          flushed, and the translator keeps them: SHADER-297). See ps_outmods_f16.asm.
   s_buffer_load_dwordx2 with destination vcc: dword 0 -> vcc_lo, dword 1 -> vcc_hi.
   v_interp_mov_f32      reads the flat (provoking-vertex) input attribute; the translator must declare it Flat.
   v_perm_b32            byte i = BYTE_PERMUTE({S0, S1}, S2 byte i) over 8 bytes, S1 = bytes 0-3: selector 0-7 picks
@@ -65,6 +67,7 @@ EXPECTED_OPS7 = [0x00FF8077, 0xFF0000FF, 0x89ABCDEF, 0x00070003]
 EXPECTED_OPS8 = [0x80000000, 0xBFFFFFFF, 0x000F100E, 0x0F0F0F1F]
 EXPECTED_VCC_X2 = [0x11223344, 0x55667788, 0x00000000, 0x00000000]
 EXPECTED_F16_VOP2 = [0xAAAA4000, 0xAAAAC000, 0xAAAA3A00, 0x42003F00]        # hardware-measured
+EXPECTED_CVT_F16_OUT_MODS = [0xAAAA3C00, 0xAAAA3600, 0x7C000200, 0x3C003600]
 EXPECTED_FLAT = [0x00000101, 0x00000102, 0x3F000000, 0x3E800000]
 EXPECTED_SCC_MINMAX = [0x00030205, 0x00030207, 0x00030209, 0x00030203]
 EXPECTED_FMA_LITERAL = [0x41B80000, 0x41800000, 0x40E00000, 0x41A40000]
@@ -218,6 +221,18 @@ def reference_f16_vop2():
             0x42000000 | _half(a * b + acc)]
 
 
+def reference_cvt_f16_out_mods():
+    def cvt(x, clamp=False):     # the omod is ignored; clamp to [0, 1], round to nearest even (65520 and up: inf)
+        x = min(max(x, 0.0), 1.0) if clamp else x
+        try:
+            return _half(x)
+        except OverflowError:
+            return 0xFC00 if x < 0 else 0x7C00
+
+    return [0xAAAA0000 | cvt(1.5, clamp=True), 0xAAAA0000 | cvt(0.375),
+            cvt(2.0 ** -15) | cvt(65520.0) << 16, cvt(0.375, clamp=True) | cvt(2.0, clamp=True) << 16]
+
+
 def reference_vcc_x2():
     return [0x11223344, 0x55667788, 0, 0]
 
@@ -334,6 +349,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_ops8(), EXPECTED_OPS8)
         self.assertEqual(reference_vcc_x2(), EXPECTED_VCC_X2)
         self.assertEqual(reference_f16_vop2(), EXPECTED_F16_VOP2)
+        self.assertEqual(reference_cvt_f16_out_mods(), EXPECTED_CVT_F16_OUT_MODS)
         self.assertEqual(reference_flat(), EXPECTED_FLAT)
         self.assertEqual(reference_scc_minmax(), EXPECTED_SCC_MINMAX)
         self.assertEqual(reference_fma_literal(), EXPECTED_FMA_LITERAL)
@@ -393,6 +409,10 @@ class TranslatorValueSemantics(unittest.TestCase):
         # Low halves in (the high halves hold other values), low half out, the destination's high half kept;
         # v_fmac_f16 accumulates into the low half of its destination.
         self.check("ps_f16_vop2", EXPECTED_F16_VOP2)
+
+    def test_cvt_f16_f32_clamp_without_omod(self):
+        # clamp acts (1.5 and 2.0 give 1.0), mul:2 / mul:4 / div:2 don't (0.375 stays, 2^-15 stays a denormal)
+        self.check("ps_outmods_f16", EXPECTED_CVT_F16_OUT_MODS)
 
     def test_mad_u32_u16_i32_i16_wrap_and_sign_extend(self):
         # The u16 product plus S2 wraps at 32 bits; i16 sign-extends both halves (also the op_sel-selected high
