@@ -37,7 +37,7 @@ from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: tex
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
 from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shaders as compute + a generated VS
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
-                   vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
+                   wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem, mandelbrot_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
@@ -1157,10 +1157,7 @@ def run_suite(a, work: str) -> int:
                 results.append((name, None, str(skip)))
                 continue
             if name in const_wants:
-                if name == "ps_vcmpx_forms" and (skip := vcmpx_forms_narrow_skip(msg)):
-                    ok, detail = None, str(skip)
-                else:
-                    ok, detail = check_pixel_const(raw, const_wants[name])
+                ok, detail = check_pixel_const(raw, const_wants[name])
             elif name == "ps_bary":
                 ok, detail = check_bary(raw)
             elif name == "ps_bitmask_perm":
