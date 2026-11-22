@@ -2,7 +2,9 @@
 // Windows Vulkan driver, vkCmdFillBuffer after PredicateReducer::capture's compute dispatch is suppressed inside
 // an active conditional rendering scope (D3D-148). Check that emit() suspends conditional rendering for the
 // entire ResolveQueryData loop (not only before helper dispatches) and restores it afterward. Cases 5 and 6 check
-// how a resolve inside a pipeline-statistics query is replayed (D3D-162). No GPU or game data.
+// how a resolve inside a pipeline-statistics query is replayed (D3D-162). Cases 7 to 9 check overlapping queries:
+// statistics over statistics, binary inside ordinary, and the composite sum-and-normalize binary resolve (D3D-252).
+// No GPU or game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -132,6 +134,14 @@ int main() {
         if (g_trace->cond_active) ++g_trace->binary_while_cond;
         g_trace->events.push_back("binary");
     };
+    vk.sum_occlusion = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer,
+                          VkDeviceSize) {
+        g_trace->events.push_back(query_event("sum_occlusion", pool, first) + "+" + std::to_string(count));
+    };
+    vk.sum_binary_occlusion = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count,
+                                 VkBuffer, VkDeviceSize) {
+        g_trace->events.push_back(query_event("sum_binary_occlusion", pool, first) + "+" + std::to_string(count));
+    };
 
     // 1. Binary occlusion resolve with leading and trailing un-ended queries under a predicate:
     //    conditional rendering must end before the leading fill_buffer and resume after the trailing fill_buffer.
@@ -244,6 +254,122 @@ int main() {
         expect(trace.events == want, "split list: segments end before and begin after the helper dispatch");
         expect(statistics_heap.occlusion.count(0) && statistics_heap.occlusion[0].count == 2,
                "split list: the heap keeps the query's segments for later resolves");
+    }
+
+    // 7. D3D-252, overlapping pipeline-statistics queries: the segments follow every Begin and End, so each logical
+    //    query keeps a contiguous range — the intersection interval is shared — and each resolve sums its range.
+    //    A resolve may only name an ended query, so the second resolve follows the second End.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record overlap begin 0");
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record overlap begin 1");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record overlap end 0");
+        expect(list.resolve_queries({6, d3d12_query::pipeline_statistics, 0, 1, 1, 0}), "record overlap resolve 0");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record overlap end 1");
+        expect(list.resolve_queries({6, d3d12_query::pipeline_statistics, 1, 1, 1, 0}), "record overlap resolve 1");
+        expect(list.close(), "close overlap statistics list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare overlap statistics list");
+        expect(prepared.statistics_segment_count == 4, "overlap statistics: four physical segments");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, {}, 0, true, segments, 4) == ReplayResult::success,
+               "plan overlap statistics list");
+        expect(queries.needs_statistics_sum, "overlap statistics: the sum helper is needed");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        queries.commit();
+        const std::vector<std::string> want{"begin_query 9:4",      "end_query 9:4",       "begin_query 9:5",
+                                            "end_query 9:5",        "begin_query 9:6",     "end_query 9:6",
+                                            "sum_statistics 9:4+2", "begin_query 9:7",     "end_query 9:7",
+                                            "sum_statistics 9:5+3"};
+        expect(trace.events == want, "overlap statistics: one open segment per event, resolves sum the ranges");
+        expect(statistics_heap.occlusion.count(0) && statistics_heap.occlusion[0].count == 2 &&
+                   statistics_heap.occlusion.count(1) && statistics_heap.occlusion[1].count == 3,
+               "overlap statistics: both heaps keep their segment ranges");
+    }
+
+    // 8. D3D-252, a binary occlusion query open inside an ordinary one: both are virtualized into the same physical
+    //    pool. The ordinary resolve sums three segments; the binary resolve normalizes its one segment to 0/1.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({1, d3d12_query::occlusion, 0}), "record kind overlap begin ordinary");
+        expect(list.begin_query({1, d3d12_query::binary_occlusion, 1}), "record kind overlap begin binary");
+        expect(list.end_query({1, d3d12_query::binary_occlusion, 1}), "record kind overlap end binary");
+        expect(list.end_query({1, d3d12_query::occlusion, 0}), "record kind overlap end ordinary");
+        expect(list.resolve_queries({1, d3d12_query::occlusion, 0, 1, 1, 0}), "record kind overlap resolve ordinary");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 16}), "record kind overlap resolve binary");
+        expect(list.close(), "close kind overlap list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare kind overlap list");
+        expect(prepared.segment_count == 3, "kind overlap: three physical segments");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, segments, 0, true, {}, 0) == ReplayResult::success,
+               "plan kind overlap list");
+        expect(queries.needs_sum && queries.needs_binary && !queries.needs_sum_binary,
+               "kind overlap: sum for the ordinary resolve, normalize for the single-segment binary");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        queries.commit();
+        const std::vector<std::string> want{"begin_query 9:0",         "end_query 9:0",       "begin_query 9:1",
+                                            "end_query 9:1",           "begin_query 9:2",     "end_query 9:2",
+                                            "sum_occlusion 9:0+3",     "binary"};
+        expect(trace.events == want, "kind overlap: shared physical segments, sum and normalize resolves");
+        expect(heap.occlusion.count(0) && heap.occlusion[0].count == 3 && heap.occlusion.count(1) &&
+                   heap.occlusion[1].count == 1,
+               "kind overlap: both kinds keep their segment ranges in the heap");
+    }
+
+    // 9. D3D-252, a binary query overlapping the ordinary one with two segments: the resolve sums the segments and
+    //    then normalizes the total (the composite helper), not one 0/1 per segment.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({1, d3d12_query::occlusion, 0}), "record composite begin ordinary");
+        expect(list.begin_query({1, d3d12_query::binary_occlusion, 1}), "record composite begin binary");
+        expect(list.end_query({1, d3d12_query::occlusion, 0}), "record composite end ordinary");
+        expect(list.end_query({1, d3d12_query::binary_occlusion, 1}), "record composite end binary");
+        expect(list.resolve_queries({1, d3d12_query::binary_occlusion, 1, 1, 1, 16}), "record composite resolve binary");
+        expect(list.close(), "close composite list");
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "prepare composite list");
+        expect(prepared.segment_count == 3, "composite: three physical segments");
+        auto segments = std::make_shared<OcclusionSegmentPool>();
+        segments->pool = handle<VkQueryPool>(9);
+        segments->destroy = mock_destroy_pool;
+        QueryReplay queries;
+        expect(queries.plan(prepared, segments, 0, true, {}, 0) == ReplayResult::success, "plan composite list");
+        expect(queries.needs_sum_binary, "composite: the sum-and-normalize helper is needed");
+        emit(prepared, VK_NULL_HANDLE, vk);
+        queries.commit();
+        const std::vector<std::string> want{"begin_query 9:0",           "end_query 9:0",       "begin_query 9:1",
+                                            "end_query 9:1",             "begin_query 9:2",     "end_query 9:2",
+                                            "sum_binary_occlusion 9:1+2"};
+        expect(trace.events == want, "composite: the binary resolve sums its segments and normalizes once");
+    }
+
+    // 10. D3D-252, the single-list replay() helper: it has no segment pool, and running overlapping statistics
+    //     queries whole would keep two Vulkan queries of one type active, so the list is refused outright.
+    {
+        Trace trace;
+        g_trace = &trace;
+        CommandList list;
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record helper begin 0");
+        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 1}), "record helper begin 1");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record helper end 0");
+        expect(list.end_query({6, d3d12_query::pipeline_statistics, 1}), "record helper end 1");
+        expect(list.close(), "close helper list");
+        expect(replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::unsupported,
+               "no segment pool: overlapping statistics queries are refused instead of run whole");
+        expect(trace.events.empty(), "no segment pool: nothing was emitted for the refused list");
     }
 
     if (failures) return 1;
