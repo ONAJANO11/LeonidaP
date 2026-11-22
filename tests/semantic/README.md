@@ -23,7 +23,9 @@ What they check (`tools/rdna2spirv.py`, pixel shaders plus one compute shader):
   written by hand and recomputed by plain-Python references checked against each other. `cs_fmt_1010102` runs
   as compute too and asserts 16 dwords: 10:10:10:2 words read through formats 50 and 44 (from the V# and from
   tbuffer's own format) and stored in both. `ps_scc_minmax` asserts SCC after `s_min`/`s_max` `_i32`/`_u32`:
-  0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way.
+  0 on a tie, and 1 on a pair (-1 against 1) that only the right signedness orders that way. `ps_salu64_bfe`,
+  `ps_salu64_bitset` and `ps_salu64_brev_flbit` assert both words of `s_bfe_u64`/`s_bfe_i64`, `s_bitset0/1_b64`,
+  `s_brev_b64` and the `s_flbit_i32_b64`/`_i64` counts on SGPR pairs that hold data, not lane masks.
   `RawBufferTailBounds` runs one-thread compute programs written in the test around one `buffer_load` and
   asserts the words and the exact addresses loaded for the raw-buffer rule measured on an RX 6800 (per-dword
   `num_records` check on the exact byte offset); `MeasuredBoundsShaders` runs the four GPU tests of the SMEM and

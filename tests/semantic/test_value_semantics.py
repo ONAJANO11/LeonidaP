@@ -40,6 +40,11 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
     into EXEC or VCC
+  s_bfe_u64 / s_bfe_i64 D.u64 = (S0.u64 >> S1[5:0]) & ((1 << S1[22:16]) - 1); i64 sign-extends the field from its
+                          top bit. s_bitset0/1_b64: D.u64[S0[5:0]] = 0 / 1. s_brev_b64: D.u64[63:0] = S0.u64[0:63].
+                          s_flbit_i32_b64: zeros from bit 63 to the first 1; s_flbit_i32_i64: bits from bit 63 to
+                          the first one that differs from the sign bit; -1 if none. The pairs hold 64-bit data
+                          written by s_mov_b32, not lane masks.
 
 The appended cases for ps_ops5/ps_ops6 also pin the op_sel source-half selection for packed shifts, which the
 GPU-checked ps_ops4 does not exercise. cs_bounds (compute) pins the buffer num_records bounds checks: an
@@ -76,6 +81,9 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_SALU64_BFE = [0x389ABCDE, 0x0000002C, 0x1D2C389A, 0xFFFFFFFE]
+EXPECTED_SALU64_BITSET = [0x76543210, 0xDEDCBA98, 0x76543210, 0xFEDCBA9C]
+EXPECTED_SALU64_BREV_FLBIT = [0xB00F0000, 0x1E6A2C48, 0x0000002F, 0x0000002C]
 
 
 def _f32_bits(x):
@@ -293,6 +301,46 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+M64 = (1 << 64) - 1
+
+
+def _halves(x):
+    return [x & 0xFFFFFFFF, (x >> 32) & 0xFFFFFFFF]
+
+
+def _bfe64(x, ctl, signed):
+    off, width = ctl & 63, (ctl >> 16) & 0x7F
+    field = (x >> off) & ((1 << width) - 1)
+    if signed and width and field >> (width - 1):
+        field -= 1 << width
+    return field & M64
+
+
+def _flbit64(x):
+    """Zeros from bit 63 down to the first 1 of a 64-bit value, 0xffffffff if none."""
+    return 64 - x.bit_length() if x else 0xFFFFFFFF
+
+
+def reference_salu64_bfe():
+    # ps_salu64_bfe: S0 = 0xf0e1d2c3_89abcdef; u64 with offset 4 / width 40, i64 with offset 20 / width 36.
+    x = 0xF0E1D2C389ABCDEF
+    return _halves(_bfe64(x, 0x00280004, False)) + _halves(_bfe64(x, 0x00240014, True))
+
+
+def reference_salu64_bitset():
+    # ps_salu64_bitset: both pairs 0xfedcba98_76543210; bitset0 at 0x7d & 63 = 61, bitset1 at 98 & 63 = 34.
+    x = 0xFEDCBA9876543210
+    return _halves(x & ~(1 << (0x7D & 63)) & M64) + _halves(x | (1 << (98 & 63)))
+
+
+def reference_salu64_brev_flbit():
+    # ps_salu64_brev_flbit: brev of 0x0000f00d_12345678; flbit_b64 of 0x12345; flbit_i64 of 0xffffffff_fff0abcd,
+    # which is negative, so it counts the leading zeros of its complement.
+    brev = int(f"{0x0000F00D12345678:064b}"[::-1], 2)
+    y = 0xFFFFFFFFFFF0ABCD
+    return _halves(brev) + [_flbit64(0x00012345), _flbit64(~y & M64 if y >> 63 else y)]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -342,6 +390,9 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_salu64_bfe(), EXPECTED_SALU64_BFE)
+        self.assertEqual(reference_salu64_bitset(), EXPECTED_SALU64_BITSET)
+        self.assertEqual(reference_salu64_brev_flbit(), EXPECTED_SALU64_BREV_FLBIT)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -477,6 +528,20 @@ class TranslatorValueSemantics(unittest.TestCase):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+    def test_s_bfe_u64_i64_on_a_data_pair(self):
+        # Fields that cross bit 32 of the source: the u64 field reaches into the high word (0x2c), the i64 field's
+        # top bit is 1, so the high word is the field's bits 35:32 sign-extended (0xfffffffe).
+        self.check("ps_salu64_bfe", EXPECTED_SALU64_BFE)
+
+    def test_s_bitset0_bitset1_b64_index_the_high_word(self):
+        # Bit indices 61 and 34 land in the high word; indexing with & 31 would change the low word instead.
+        self.check("ps_salu64_bitset", EXPECTED_SALU64_BITSET)
+
+    def test_s_brev_b64_and_s_flbit_i32_64(self):
+        # brev swaps the words as well as reversing them; both flbit counts run past the zero (or all-ones) high
+        # word into the low word (47 and 44).
+        self.check("ps_salu64_brev_flbit", EXPECTED_SALU64_BREV_FLBIT)
 
 
 class ReadLog(dict):

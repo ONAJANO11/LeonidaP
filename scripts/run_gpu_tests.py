@@ -1140,6 +1140,10 @@ def run_suite(a, work: str) -> int:
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
+                # 64-bit SALU data ops on SGPR pairs that are not lane masks (derivations in the .asm headers)
+                "ps_salu64_bfe": (0x389ABCDE, 0x0000002C, 0x1D2C389A, 0xFFFFFFFE),
+                "ps_salu64_bitset": (0x76543210, 0xDEDCBA98, 0x76543210, 0xFEDCBA9C),
+                "ps_salu64_brev_flbit": (0xB00F0000, 0x1E6A2C48, 47, 44),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
