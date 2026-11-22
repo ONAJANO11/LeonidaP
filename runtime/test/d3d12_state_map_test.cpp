@@ -258,6 +258,60 @@ int main() {
     CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
     CHECK(upload.buffer_image_copies.size() == 1);
 
+    // Block-compressed texture to texture between mips of a 24x24 BC1 texture (mips 24, 12, 6, 3, 1). The host
+    // copies whole blocks; where one vkCmdCopyImage extent cannot reach the edge of both mips, the copy is staged.
+    {
+        ResourceBinding bc1 = color;
+        bc1.format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        bc1.width = bc1.height = 24;
+        bc1.depth = 1;
+        bc1.mip_levels = 5;
+        bc1.array_layers = 1;
+        const auto bc_copy = [&](std::uint32_t dst_mip, std::uint32_t x, std::uint32_t y, std::uint32_t src_mip,
+                                 bool has_box, CopyBox box, bool can_stage, detail::Prepared& p) {
+            p = {};
+            p.binding = p.source = bc1;
+            CopyTexture c{};
+            c.dst = {1, false, dst_mip, 0, 0, 0, 0, 0};
+            c.src = {1, false, src_mip, 0, 0, 0, 0, 0};
+            c.x = x;
+            c.y = y;
+            c.has_box = has_box;
+            c.box = box;
+            return detail::prepare_texture_copy(c, p, can_stage);
+        };
+        const auto extent_is = [](const VkExtent3D& e, std::uint32_t w, std::uint32_t h) {
+            return e.width == w && e.height == h && e.depth == 1;
+        };
+        detail::Prepared p{};
+        // Both edges reachable with one extent: a direct copy, nothing staged.
+        CHECK(bc_copy(1, 0, 0, 0, true, {0, 0, 0, 12, 12, 1}, true, p) == ReplayResult::success);
+        CHECK(p.image_copies.size() == 1 && p.staging_size == 0 && extent_is(p.image_copies[0].extent, 12, 12));
+        // A 4x4 box into the 3x3 mip 3: refused without staging, else one 8-byte block read 4x4 and written 3x3.
+        CHECK(bc_copy(3, 0, 0, 0, true, {0, 0, 0, 4, 4, 1}, false, p) == ReplayResult::invalid_copy);
+        CHECK(bc_copy(3, 0, 0, 0, true, {0, 0, 0, 4, 4, 1}, true, p) == ReplayResult::success);
+        CHECK(p.image_copies.empty() && p.staging_size == 8);
+        CHECK(p.staged[0].bufferRowLength == 4 && p.staged[0].bufferImageHeight == 4);
+        CHECK(p.staged[0].imageSubresource.mipLevel == 0 && extent_is(p.staged[0].imageExtent, 4, 4));
+        CHECK(p.staged[1].imageSubresource.mipLevel == 3 && extent_is(p.staged[1].imageExtent, 3, 3));
+        CHECK(p.staged[1].bufferOffset == 0 && p.staged[1].bufferRowLength == 4);
+        // The 6x6 mip 2 into the 12x12 mip 1: 2x2 blocks, read to the 6x6 edge, written as 8x8.
+        CHECK(bc_copy(1, 0, 0, 2, false, {}, true, p) == ReplayResult::success);
+        CHECK(p.staging_size == 4 * 8 && extent_is(p.staged[0].imageExtent, 6, 6) &&
+              extent_is(p.staged[1].imageExtent, 8, 8));
+        // The 3x3 mip 3 into the 6x6 mip 2 at 4,4: read 3x3, written 2x2 at (4, 4).
+        CHECK(bc_copy(2, 4, 4, 3, false, {}, true, p) == ReplayResult::success);
+        CHECK(extent_is(p.staged[0].imageExtent, 3, 3) && extent_is(p.staged[1].imageExtent, 2, 2));
+        CHECK(p.staged[1].imageOffset.x == 4 && p.staged[1].imageOffset.y == 4);
+        // The box 4..8 of the 6x6 mip 2 (its edge inside the block) into the 3x3 mip 3: read 2x2 at (4, 4).
+        CHECK(bc_copy(3, 0, 0, 2, true, {4, 4, 0, 8, 8, 1}, true, p) == ReplayResult::success);
+        CHECK(p.staged[0].imageOffset.x == 4 && extent_is(p.staged[0].imageExtent, 2, 2) &&
+              extent_is(p.staged[1].imageExtent, 3, 3));
+        // What does not fit the destination's padded mip is refused, staged or not.
+        CHECK(bc_copy(3, 0, 0, 0, true, {0, 0, 0, 16, 16, 1}, true, p) == ReplayResult::invalid_copy);
+        CHECK(bc_copy(0, 16, 16, 1, false, {}, true, p) == ReplayResult::invalid_copy);
+    }
+
     ResourceBinding depth_stencil = color;
     depth_stencil.aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     depth_stencil.mip_levels = 2;

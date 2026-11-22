@@ -615,6 +615,11 @@ struct ReplayFunctions {
     std::function<VkImageView(const ResourceBinding&, const VkImageSubresourceRange&)> image_view;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
+    // Returns a buffer of at least `size` bytes with TRANSFER_SRC and TRANSFER_DST usage, used by nothing else,
+    // caller-owned and alive until execution completes; VK_NULL_HANDLE when none can be had. Optional: it stages
+    // block-compressed texture copies that vkCmdCopyImage cannot express (prepare_texture_copy), which are refused
+    // without it.
+    std::function<VkBuffer(VkDeviceSize)> staging_buffer;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
 };
 
@@ -644,6 +649,11 @@ struct Prepared {
     std::vector<VkBufferCopy> buffer_copies;
     std::vector<VkBufferImageCopy> buffer_image_copies;  // one direction, given by which side is an image
     std::vector<VkImageCopy> image_copies;
+    // A texture copy staged through a buffer: staged[0] reads the source into it, staged[1] writes it into the
+    // destination. staging_size is set by prepare_texture_copy, staging by prepare from ReplayFunctions::staging_buffer.
+    VkDeviceSize staging_size = 0;
+    VkBuffer staging = VK_NULL_HANDLE;
+    std::array<VkBufferImageCopy, 2> staged{};
     VkImageResolve resolve{};  // resolves
     std::vector<VkImageSubresourceRange> discards;  // DiscardResource: the subresources to discard
     VkBuffer write_buffer = VK_NULL_HANDLE;          // WriteBufferImmediate: where the address lands
@@ -927,7 +937,9 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
 
 // CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
 // Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
-inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
+// can_stage: a block-compressed texture-to-texture copy that one vkCmdCopyImage cannot express may be staged through
+// a buffer (Prepared::staging_size); without it such a copy is refused.
+inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p, bool can_stage = false) {
     if (!copy.dst.footprint && !copy.src.footprint) {
         VkImageSubresourceRange dst{}, src{};
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
@@ -951,21 +963,49 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
         if (block > 1) {
             // D3D12 copies whole blocks: the box is rounded up to blocks and must fit the destination's padded mip.
             // Vulkan takes an extent that is a block multiple or reaches the edge of each image separately, so the
-            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is refused.
+            // extent is cut where it reaches an edge, and a copy that cannot satisfy both images is staged (below).
             if ((box.left | box.top | copy.x | copy.y) % block || box.left >= from.width || box.top >= from.height ||
                 copy.x >= padded(to.width) || copy.y >= padded(to.height))
                 return ReplayResult::invalid_copy;
             w = padded(w);
             h = padded(h);
             if (w > padded(to.width) - copy.x || h > padded(to.height) - copy.y) return ReplayResult::invalid_copy;
-            w = std::min({w, from.width - box.left, to.width - copy.x});
-            h = std::min({h, from.height - box.top, to.height - copy.y});
+            // Each image's own extent: the whole blocks, cut where they reach that image's edge.
+            const std::uint32_t src_w = std::min(w, from.width - box.left), src_h = std::min(h, from.height - box.top);
+            const std::uint32_t dst_w = std::min(w, to.width - copy.x), dst_h = std::min(h, to.height - copy.y);
+            const std::uint32_t blocks_w = w, blocks_h = h;
+            w = std::min(src_w, dst_w);
+            h = std::min(src_h, dst_h);
             const auto fits = [block](std::uint32_t offset, std::uint32_t extent, std::uint32_t size) {
                 return extent % block == 0 || offset + extent == size;
             };
             if (!fits(box.left, w, from.width) || !fits(copy.x, w, to.width) || !fits(box.top, h, from.height) ||
-                !fits(copy.y, h, to.height))
-                return ReplayResult::invalid_copy;
+                !fits(copy.y, h, to.height)) {
+                // One extent cannot do for both images: a mip edge inside a block on one side only (a 4x4 box into
+                // a 3x3 mip, a 6x6 mip into a 12x12 one). The host copies whole blocks. Here the source's blocks go
+                // to a buffer with its own cut extent, and from there into the destination with the destination's.
+                // The box fits the source's padded mip, so the buffer always holds every block the destination
+                // reads (blocks_w x blocks_h texels a slice).
+                if (!can_stage) return ReplayResult::invalid_copy;
+                if (!within(copy.z, d, to_depth)) return ReplayResult::invalid_copy;
+                const std::uint32_t bytes = block_format(p.source.format, src.aspectMask).bytes;
+                if (!bytes) return ReplayResult::unsupported;
+                p.staging_size = VkDeviceSize(blocks_w / block) * (blocks_h / block) * d * bytes;
+                VkBufferImageCopy read{};
+                read.bufferRowLength = blocks_w;
+                read.bufferImageHeight = blocks_h;
+                read.imageSubresource = {src.aspectMask, src.baseMipLevel, src.baseArrayLayer, 1};
+                read.imageOffset = {std::int32_t(box.left), std::int32_t(box.top), std::int32_t(box.front)};
+                read.imageExtent = {src_w, src_h, d};
+                VkBufferImageCopy write = read;
+                write.imageSubresource = {dst.aspectMask, dst.baseMipLevel, dst.baseArrayLayer, 1};
+                write.imageOffset = {std::int32_t(copy.x), std::int32_t(copy.y), std::int32_t(copy.z)};
+                write.imageExtent = {dst_w, dst_h, d};
+                p.staged = {read, write};
+                p.range = dst;
+                p.source_range = src;
+                return ReplayResult::success;
+            }
         }
         if (!within(copy.x, w, to.width) || !within(copy.y, h, to.height) || !within(copy.z, d, to_depth))
             return ReplayResult::invalid_copy;
@@ -1345,7 +1385,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::invalid_copy;
                 p.buffer_copies.push_back({buffer_copy->src_offset, buffer_copy->dst_offset, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
-                result = detail::prepare_texture_copy(*texture_copy, p);
+                result = detail::prepare_texture_copy(*texture_copy, p, bool(vk.staging_buffer));
+                if (result == ReplayResult::success && p.staging_size) {
+                    p.staging = vk.staging_buffer(p.staging_size);
+                    if (!p.staging) return ReplayResult::unsupported;
+                }
             } else {
                 result = detail::prepare_resource_copy(p);
             }
@@ -1681,6 +1725,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
+            } else if (p.staging) {
+                // Source blocks into the staging buffer, then into the destination (prepare_texture_copy).
+                const VkImageLayout src_layout = detail::copy_layout(
+                    vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                const VkImageLayout dst_layout = detail::copy_layout(
+                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staging, 1, &p.staged[0]);
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                vk.copy_buffer_to_image(command_buffer, p.staging, p.binding.image, dst_layout, 1, &p.staged[1]);
             } else if (!p.image_copies.empty()) {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),

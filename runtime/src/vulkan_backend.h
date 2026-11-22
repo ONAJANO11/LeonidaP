@@ -189,6 +189,14 @@ public:
         bindless_commit_ = std::move(commit);
     }
 
+    // The device's memory types, so that staging buffers (ReplayFunctions::staging_buffer) prefer device-local
+    // memory. Without them the first memory type a buffer accepts is used.
+    void set_memory_properties(const VkPhysicalDeviceMemoryProperties& memory) {
+        std::lock_guard lock(mutex_);
+        memory_ = memory;
+        has_memory_ = true;
+    }
+
     VulkanDeviceFunctions vk;
 
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
@@ -223,6 +231,46 @@ private:
         return view;
     }
 
+    // A transfer buffer with its own memory, device-local where the memory types are known (staging copies only
+    // move data between images on the GPU). False when it cannot be created; nothing is left behind then.
+    bool create_transfer_buffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory) {
+        buffer = VK_NULL_HANDLE;
+        memory = VK_NULL_HANDLE;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = size;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vk.vkCreateBuffer(device_, &info, nullptr, &buffer) != VK_SUCCESS) {
+            buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_, buffer, &requirements);
+        // Device-local types first, then any type the buffer accepts.
+        for (const VkMemoryPropertyFlags wanted : {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                                                   VkMemoryPropertyFlags(0)}) {
+            for (std::uint32_t i = 0; i < 32 && !memory; ++i) {
+                if (!(requirements.memoryTypeBits & (1u << i))) continue;
+                if (wanted && (!has_memory_ || i >= memory_.memoryTypeCount ||
+                               (memory_.memoryTypes[i].propertyFlags & wanted) != wanted))
+                    continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                allocate.allocationSize = requirements.size;
+                allocate.memoryTypeIndex = i;
+                if (vk.vkAllocateMemory(device_, &allocate, nullptr, &memory) != VK_SUCCESS) memory = VK_NULL_HANDLE;
+            }
+            if (memory) break;
+        }
+        if (!memory || vk.vkBindBufferMemory(device_, buffer, memory, 0) != VK_SUCCESS) {
+            if (memory) vk.vkFreeMemory(device_, memory, nullptr);
+            vk.vkDestroyBuffer(device_, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+            memory = VK_NULL_HANDLE;
+            return false;
+        }
+        return true;
+    }
+
     VkDevice device_;
     bool loaded_ = false;
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
@@ -235,6 +283,8 @@ private:
     std::unordered_map<QueryHeapId, QueryPool> query_pools_;  // element pointers stay valid across inserts
     double timestamp_period_ = 0;
     ReplayFunctions replay_;
+    VkPhysicalDeviceMemoryProperties memory_{};
+    bool has_memory_ = false;
 };
 
 // A Vulkan timeline semaphore with D3D12 fence semantics for the host side.
@@ -308,6 +358,7 @@ public:
             std::lock_guard lock(context_.submit_mutex());
             vk.vkQueueWaitIdle(queue_);
         }
+        for (const Staging& s : staging_) destroy(s);  // the queue is idle
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
     }
@@ -321,14 +372,24 @@ public:
     // the layout tracker as it was. Pending Wait()s are attached to this submission.
     ReplayResult execute(std::span<const CommandList* const> lists) {
         std::lock_guard lock(context_.mutex_);
+        release_staging(false);
+        // Staging buffers made while preparing belong to this submission (pending until it is submitted).
+        ReplayFunctions replay = context_.replay_;
+        replay.staging_buffer = [this](VkDeviceSize size) { return create_staging(size); };
         std::vector<PreparedList> prepared(lists.size());
         const auto resolve = [this](ResourceId id) { return context_.resolve(id); };
         for (std::size_t i = 0; i < lists.size(); ++i) {
-            const auto result = prepare(*lists[i], resolve, context_.replay_, prepared[i]);
-            if (result != ReplayResult::success) return result;
+            const auto result = prepare(*lists[i], resolve, replay, prepared[i]);
+            if (result != ReplayResult::success) {
+                release_staging(true);  // nothing was recorded
+                return result;
+            }
         }
         VkCommandBuffer command_buffer = acquire();
-        if (!command_buffer) return ReplayResult::unsupported;
+        if (!command_buffer) {
+            release_staging(true);
+            return ReplayResult::unsupported;
+        }
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         context_.vk.vkBeginCommandBuffer(command_buffer, &begin);
@@ -337,9 +398,10 @@ public:
             context_.vk.vkEndCommandBuffer(command_buffer);
             const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
             if (context_.bindless_commit_) context_.bindless_commit_(submitted);
+            release_staging(true);  // no list was written
             return ReplayResult::unsupported;
         }
-        for (const auto& list : prepared) emit(list, command_buffer, context_.replay_, &context_.tracker_);
+        for (const auto& list : prepared) emit(list, command_buffer, replay, &context_.tracker_);
         // A fence wait on the CPU makes GPU writes visible to the host only after a barrier to the host domain:
         // readback buffers are read through Map once the application has waited.
         VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -350,6 +412,12 @@ public:
         context_.vk.vkEndCommandBuffer(command_buffer);
         const bool submitted = submit(command_buffer, VK_NULL_HANDLE, 0);
         if (context_.bindless_commit_) context_.bindless_commit_(submitted);
+        if (submitted) {
+            for (Staging& s : staging_)
+                if (s.ticket == pending) s.ticket = submitted_;  // freed once the GPU is past this submission
+        } else {
+            release_staging(true);  // the command buffer never reached the GPU
+        }
         return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
@@ -369,6 +437,40 @@ public:
     }
 
 private:
+    // A staging buffer for one submission; `ticket` is the progress value after which the GPU no longer uses it.
+    struct Staging {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint64_t ticket = 0;
+    };
+    static constexpr std::uint64_t pending = UINT64_MAX;  // made for the submission being prepared
+
+    VkBuffer create_staging(VkDeviceSize size) {
+        Staging s;
+        if (!context_.create_transfer_buffer(size, s.buffer, s.memory)) return VK_NULL_HANDLE;
+        s.ticket = pending;
+        staging_.push_back(s);
+        return s.buffer;
+    }
+
+    void destroy(const Staging& s) {
+        context_.vk.vkDestroyBuffer(context_.device(), s.buffer, nullptr);
+        context_.vk.vkFreeMemory(context_.device(), s.memory, nullptr);
+    }
+
+    // Frees the buffers whose submission has completed, and with `pending_too` those of a submission that was
+    // given up before it reached the GPU.
+    void release_staging(bool pending_too) {
+        if (staging_.empty()) return;
+        std::uint64_t done = 0;
+        context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
+        std::erase_if(staging_, [&](const Staging& s) {
+            const bool release = s.ticket == pending ? pending_too : s.ticket <= done;
+            if (release) destroy(s);
+            return release;
+        });
+    }
+
     VkCommandBuffer acquire() {
         std::uint64_t done = 0;
         context_.vk.vkGetSemaphoreCounterValue(context_.device(), progress_, &done);
@@ -429,6 +531,7 @@ private:
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done
     std::uint64_t submitted_ = 0;
     std::vector<std::pair<VkCommandBuffer, std::uint64_t>> buffers_;  // buffer, ticket that frees it
+    std::vector<Staging> staging_;  // staged texture copies, freed by ticket like the command buffers
     std::vector<VkSemaphore> waits_;
     std::vector<std::uint64_t> wait_values_;
     bool ok_ = false;

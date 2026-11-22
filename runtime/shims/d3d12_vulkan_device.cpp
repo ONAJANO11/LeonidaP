@@ -1251,6 +1251,7 @@ public:
         state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
                                                                   info.separate_depth_stencil_layouts,
                                                                   info.conditional_rendering);
+        state_.context->set_memory_properties(state_.memory);  // staging copies prefer device-local memory
         if (info.host_image_copy) load_host_image_copy(get_device);
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
