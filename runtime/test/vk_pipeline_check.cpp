@@ -23,6 +23,7 @@
 #include "vk_device_pick.h"
 #include "pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
+#include "pipeline_stats_csv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -682,9 +683,9 @@ int main(int argc, char** argv) {
         std::printf("SKIPPED %s (%s)\n", name.c_str(), reason.c_str());
     };
 
-    std::FILE* stats_out = stats_path.empty() ? nullptr : std::fopen(stats_path.c_str(), "w");
+    std::FILE* stats_out = stats_path.empty() ? nullptr : std::fopen(stats_path.c_str(), "wb");
     if (!stats_path.empty() && !stats_out) { std::fprintf(stderr, "cannot write %s\n", stats_path.c_str()); return 1; }
-    if (stats_out) std::fprintf(stats_out, "name,stage,statistic,value\n");
+    if (stats_out) std::fprintf(stats_out, "name,stage,statistic,value%s", stats_csv_eol);
     // --stats: one CSV row per statistic of the executable that runs the translated shader (stage bit `bit`).
     auto write_stats = [&](const std::string& name, const std::string& stage, VkShaderStageFlagBits bit, VkPipeline p) {
         if (!stats_out) return;
@@ -704,12 +705,12 @@ int main(int argc, char** argv) {
             vkGetPipelineExecutableStatisticsKHR(dev, &ei, &m, st.data());
             std::lock_guard<std::mutex> g(mu);
             for (auto& x : st) {
-                std::fprintf(stats_out, "%s,%s,%s,", name.c_str(), stage.c_str(), x.name);
+                write_stats_csv_prefix(stats_out, name, stage, x.name);
                 switch (x.format) {
-                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::fprintf(stats_out, "%u\n", x.value.b32); break;
-                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::fprintf(stats_out, "%lld\n", (long long)x.value.i64); break;
-                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::fprintf(stats_out, "%llu\n", (unsigned long long)x.value.u64); break;
-                default: std::fprintf(stats_out, "%g\n", x.value.f64); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::fprintf(stats_out, "%u%s", x.value.b32, stats_csv_eol); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::fprintf(stats_out, "%lld%s", (long long)x.value.i64, stats_csv_eol); break;
+                case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::fprintf(stats_out, "%llu%s", (unsigned long long)x.value.u64, stats_csv_eol); break;
+                default: std::fprintf(stats_out, "%g%s", x.value.f64, stats_csv_eol); break;
                 }
             }
         }

@@ -603,9 +603,15 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_pick COMMAND vk_device_pick_test)
   endif()
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    add_executable(pipeline_stats_csv_test test/pipeline_stats_csv_test.cpp)
+    add_test(NAME pipeline_stats_csv COMMAND "${Python3_EXECUTABLE}" -I
+             "${CMAKE_CURRENT_SOURCE_DIR}/test/check_pipeline_stats_csv.py" "${CMAKE_SYSTEM_NAME}"
+             ${CMAKE_CROSSCOMPILING_EMULATOR} "$<TARGET_FILE:pipeline_stats_csv_test>")
+  endif()
   # D3D12 COM objects over the Vulkan backend. Their method stubs are generated from the SDK's d3d12.h at build
   # time (tools/gen_d3d12_stubs.py), so nothing derived from the SDK header is checked in.
-  find_package(Python3 COMPONENTS Interpreter QUIET)
   # The generator finds d3d12.h through INCLUDE, which a Developer Prompt sets. A cross build (for example
   # runtime/cmake/clang-cl-xwin.cmake) has no such prompt, so it is handed the header CMake finds.
   set(_stubs_header)
