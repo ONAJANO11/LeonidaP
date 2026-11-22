@@ -780,12 +780,14 @@ def _gather_address_bit_offsets(text: str) -> list[int]:
 @pytest.mark.parametrize("my", range(4))
 def test_gather4_l_literal_sampler_emits_only_the_code_its_modes_need(mx, my, make_shader):
     """CLAMP_X = bits [2:0], CLAMP_Y = [5:3]; 0 wrap, 1 mirror, 2 clamp, 3 mirror once. Each axis maps its two
-    texel coordinates: wrap = 1 OpSMod, mirror = 1 OpSMod + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual."""
+    texel coordinates: wrap = 1 modulo, mirror = 1 modulo + 1 OpSLessThan, mirror once = 1 OpSGreaterThanEqual.
+    A modulo is OpSRem + its own OpSLessThan fix-up (SHADER-369), never OpSMod."""
     shader = make_shader(_gather_l(mx | my << 3))
     text = shader.translate()
     shader.validate(text)
-    assert _count(text, "OpSMod") == 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
-    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1)
+    mods = 2 * (mx in (0, 1)) + 2 * (my in (0, 1))
+    assert _count(text, "OpSMod") == 0 and _count(text, "OpSRem") == mods
+    assert _count(text, "OpSLessThan") == 2 * (mx == 1) + 2 * (my == 1) + mods
     assert _count(text, "OpSGreaterThanEqual") == 2 * (mx == 3) + 2 * (my == 3)
     assert _gather_address_bit_offsets(text) == []      # the sampler modes are literals
 
@@ -831,7 +833,77 @@ def test_gather4_l_run_time_sampler_selects_the_mode_from_the_sgpr(make_shader):
     text = shader.translate()
     shader.validate(text)
     assert _gather_address_bit_offsets(text) == [0, 3]      # CLAMP_X and CLAMP_Y
-    assert _count(text, "OpSMod") == 8 and _count(text, "OpSLessThan") == 4 and _count(text, "OpSGreaterThanEqual") == 4
+    assert _count(text, "OpSMod") == 0 and _count(text, "OpSRem") == 8
+    assert _count(text, "OpSLessThan") == 4 + 8 and _count(text, "OpSGreaterThanEqual") == 4
+
+
+class _GatherAddrStub:
+    """Just enough of the generator for Gen.gather_addr: ids, uint constants, and the emitted lines."""
+    def __init__(self):
+        self.n, self.lines = 0, []
+
+    def tmp(self):
+        self.n += 1
+        return f"%t{self.n}"
+
+    def cu(self, v):
+        return f"%c{v & 0xFFFFFFFF:x}"
+
+    def emit(self, s):
+        self.lines.append(s)
+
+    def as_int(self, u):
+        return u        # the evaluator reads %c<hex> constants as ints already
+
+    nonneg_mod = getattr(rdna2spirv.Gen, "nonneg_mod", None)
+
+
+def _trunc_rem(a, b):
+    return a - b * int(a / b)
+
+
+def _eval_gather_addr(lines, env, smod):
+    """Evaluate gather_addr's integer code; smod is how this 'driver' computes OpSMod."""
+    def val(x):
+        return int(x[2:], 16) if x.startswith("%c") else env[x]
+    for line in lines:
+        dst, _, op, _type, *args = line.split()
+        if op == "OpExtInst":
+            assert args[1] == "SClamp"
+            env[dst] = min(max(val(args[2]), val(args[3])), val(args[4]))
+            continue
+        a = [val(x) for x in args]
+        env[dst] = {"OpISub": lambda: a[0] - a[1], "OpIAdd": lambda: a[0] + a[1],
+                    "OpSRem": lambda: _trunc_rem(a[0], a[1]), "OpSMod": lambda: smod(a[0], a[1]),
+                    "OpSLessThan": lambda: a[0] < a[1], "OpSGreaterThanEqual": lambda: a[0] >= a[1],
+                    "OpIEqual": lambda: a[0] == a[1], "OpSelect": lambda: a[1] if a[0] else a[2]}[op]()
+    return env
+
+
+def _vulkan_address(c, n, mode):
+    if mode == 0:
+        return c % n                       # Python's % has the divisor's sign
+    if mode == 1:
+        p = c % (2 * n)
+        return p if p < n else 2 * n - 1 - p
+    if mode == 3:
+        return min(max(c if c >= 0 else -1 - c, 0), n - 1)
+    return min(max(c, 0), n - 1)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3, "run time"])
+def test_gather_addr_does_not_depend_on_how_a_driver_signs_smod(mode):
+    """SHADER-369: AMD's Windows driver 24.10.24 (Ryzen 5 7600 iGPU) read zeros for exactly the ps_gather_wrap
+    cases whose wrap/mirror coordinate is negative, as if OpSMod took the dividend's sign. The address code must
+    give Vulkan's wrap/mirror/clamp/mirror-once texel under the spec's OpSMod and under that reading alike."""
+    for smod in (lambda a, b: a % b, _trunc_rem):        # divisor's sign (spec), dividend's sign
+        for n in (1, 2, 3, 8, 16):
+            for m in ([mode] if mode != "run time" else [0, 1, 2, 3, 4, 7]):
+                stub = _GatherAddrStub()
+                out = rdna2spirv.Gen.gather_addr(stub, "%x_coord", "%n_in", m if mode != "run time" else "%mode")
+                for c in range(-3 * n - 2, 3 * n + 3):
+                    env = _eval_gather_addr(stub.lines, {"%x_coord": c, "%n_in": n, "%mode": m}, smod)
+                    assert env[out] == _vulkan_address(c, n, m if m <= 3 else 2), (m, n, c)
 
 
 @pytest.mark.parametrize("word0", [4, 0x30, 0x7, 0x8000])
