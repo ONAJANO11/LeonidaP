@@ -507,7 +507,8 @@ side inwards:
   that only the console's driver could give a meaning (tiling, compression metadata, performance hints) are
   written as zero.
 - **Device**: `CreateShaderResourceView` and `CreateUnorderedAccessView` of textures write a T# into the slot,
-  `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
+  `CreateSampler` an S#; buffer UAVs write a 16-byte GFX10 V# (raw, structured or typed, no counters); each then
+  makes sure set 0 has the view or sampler and the table has the key. Details:
   - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
     and a shader-resource view of the same mip are one entry.
   - A D3D12 comparison sampler with function NEVER and an ordinary sampler both encode zero in the hardware
@@ -1434,8 +1435,8 @@ The trace will enumerate them.
   - `MIP` wherever the image can have more than one level.
   - `SHADER_GATHER` with `SHADER_SAMPLE` (not `A8_UNORM`, whose swizzled view isn't verified for gathers).
   - `UAV_TYPED_LOAD` with every typed UAV. Typed UAV texture reads use the sampled binding (`image_read_typed`),
-    not a storage-image read. Typed buffer UAVs share the store side's gaps: the layer creates no buffer UAV
-    views yet, and `rdna2spirv.py` `FORMATS` decodes only some buffer formats (no SINT, 8/16-bit UINT, 10_11_11).
+    not a storage-image read. Buffer UAVs now carry a GFX10 V# for raw, structured and typed formats (no counter
+    views yet); `rdna2spirv.py` `FORMATS` still decodes only some buffer formats (no SINT, 8/16-bit UINT, 10_11_11).
   - The UAV atomic bits other than exchange for `R32_UINT`, whose UAV views get the `r32ui` storage view. Today
     that works on 2D UAVs only: the translator's image atomics and the `r32ui` slots cover 2D and 3D, and the
     layer creates no 3D UAV views yet. There is no `image_atomic_swap`, and `R32_SINT` gets no `r32ui` view.

@@ -13,6 +13,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/shader_library.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <cstdint>
 #include <cstring>
@@ -512,6 +513,78 @@ int main() {
         allocator.reset();
         queue.reset();
         fence.reset();
+        // Buffer UAV descriptors: raw, structured and typed slots carry a GFX10 V# (D3D-233's UAV half).
+        {
+            const auto uav_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            Ref<ID3D12Resource> uav_buffer;
+            EXPECT(SUCCEEDED(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav_desc,
+                                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                            IID_PPV_ARGS(&uav_buffer.p))));
+            EXPECT(uav_buffer->GetGPUVirtualAddress() >= 0x10000);
+            D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4,
+                                                 D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            Ref<ID3D12DescriptorHeap> heap;
+            EXPECT(SUCCEEDED(inner->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+            const UINT stride = inner->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            D3D12_CPU_DESCRIPTOR_HANDLE slot = heap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.Buffer.FirstElement = 4;
+            uav.Buffer.NumElements = 16;
+            inner->CreateUnorderedAccessView(uav_buffer.p, nullptr, &uav, slot);
+            std::uint32_t words[8]{};
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            leonida::gfx10::Buffer decoded{};
+            EXPECT(leonida::gfx10::decode({words[0], words[1], words[2], words[3]}, decoded));
+            EXPECT(decoded.address == uav_buffer->GetGPUVirtualAddress() + 16);
+            EXPECT(decoded.stride == 0 && decoded.num_records == 64);
+            EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT));
+            EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::raw);
+
+            slot.ptr += stride;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAGS(0);
+            uav.Format = DXGI_FORMAT_UNKNOWN;
+            uav.Buffer.StructureByteStride = 16;
+            uav.Buffer.FirstElement = 2;
+            uav.Buffer.NumElements = 8;
+            inner->CreateUnorderedAccessView(uav_buffer.p, nullptr, &uav, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            EXPECT(leonida::gfx10::decode({words[0], words[1], words[2], words[3]}, decoded));
+            EXPECT(decoded.address == uav_buffer->GetGPUVirtualAddress() + 32);
+            EXPECT(decoded.stride == 16 && decoded.num_records == 8);
+            EXPECT(decoded.oob_select == leonida::gfx10::OobSelect::structured);
+
+            slot.ptr += stride;
+            uav.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            uav.Buffer.StructureByteStride = 0;
+            uav.Buffer.FirstElement = 1;
+            uav.Buffer.NumElements = 4;
+            inner->CreateUnorderedAccessView(uav_buffer.p, nullptr, &uav, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            EXPECT(leonida::gfx10::decode({words[0], words[1], words[2], words[3]}, decoded));
+            EXPECT(decoded.address == uav_buffer->GetGPUVirtualAddress() + 16);
+            EXPECT(decoded.stride == 16 && decoded.num_records == 4);
+            EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_R32G32B32A32_SFLOAT));
+
+            // Past the end leaves a null slot; so does a buffer without ALLOW_UNORDERED_ACCESS.
+            slot.ptr += stride;
+            uav.Buffer.NumElements = 0xFFFFFFFFu;
+            inner->CreateUnorderedAccessView(uav_buffer.p, nullptr, &uav, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            for (std::uint32_t word : words) EXPECT(word == 0);
+            Ref<ID3D12Resource> plain_buffer;
+            const auto plain_desc = buffer_desc(256, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(inner->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &plain_desc,
+                                                            D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                            IID_PPV_ARGS(&plain_buffer.p))));
+            uav.Buffer.FirstElement = 0;
+            uav.Buffer.NumElements = 4;
+            inner->CreateUnorderedAccessView(plain_buffer.p, nullptr, &uav, slot);
+            std::memcpy(words, reinterpret_cast<void*>(slot.ptr), sizeof(words));
+            for (std::uint32_t word : words) EXPECT(word == 0);
+        }
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
     std::filesystem::remove_all(library);

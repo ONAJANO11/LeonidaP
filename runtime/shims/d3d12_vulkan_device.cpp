@@ -4004,7 +4004,80 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (counter) return stub("ID3D12Device::CreateUnorderedAccessView(counter)");
+        if (!r->image()) {
+            if (!desc || desc->ViewDimension != D3D12_UAV_DIMENSION_BUFFER) {
+                log_once("buffer UAV needs a buffer view description; dimension",
+                         desc ? int(desc->ViewDimension) : -1);
+                return;
+            }
+            if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+                log_once("unordered-access view of a buffer created without ALLOW_UNORDERED_ACCESS; flags",
+                         int(r->desc().Flags));
+                return;
+            }
+            const auto& uav = desc->Buffer;
+            const UINT64 base_va = const_cast<Resource*>(r)->GetGPUVirtualAddress();
+            if (!base_va || !uav.NumElements || (uav.Flags & ~D3D12_BUFFER_UAV_FLAG_RAW)) return;
+            if (uav.CounterOffsetInBytes) {
+                stub("ID3D12Device::CreateUnorderedAccessView(buffer counter offset)");
+                return;
+            }
+            const UINT64 width = r->desc().Width;
+            leonida::gfx10::Buffer buffer{};
+            if (uav.Flags & D3D12_BUFFER_UAV_FLAG_RAW) {
+                if (desc->Format != DXGI_FORMAT_R32_TYPELESS || uav.StructureByteStride != 0) return;
+                if (uav.FirstElement > width / 4) return;
+                const UINT64 byte_off = UINT64(uav.FirstElement) * 4;
+                const UINT64 byte_size = UINT64(uav.NumElements) * 4;
+                if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = 0;
+                buffer.num_records = std::uint32_t(byte_size);
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::raw;
+            } else if (uav.StructureByteStride != 0) {
+                if (desc->Format != DXGI_FORMAT_UNKNOWN || uav.StructureByteStride > 16383) return;
+                const UINT64 stride = uav.StructureByteStride;
+                if (uav.FirstElement > width / stride) return;
+                const UINT64 byte_off = UINT64(uav.FirstElement) * stride;
+                const UINT64 byte_size = UINT64(uav.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = uav.NumElements;
+                buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            } else {
+                const Format fmt = vulkan_format(desc->Format, false);
+                if (fmt.format == VK_FORMAT_UNDEFINED || fmt.typeless ||
+                    !(fmt.aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
+                    log_once("buffer UAV format not supported:", int(desc->Format));
+                    return;
+                }
+                const VkFormat named = fmt.rgb96 ? rgb96_named_format(fmt.format) : fmt.format;
+                const std::uint32_t code = leonida::gfx10::format_from_vulkan(named);
+                const leonida::BlockFormat bf = footprint_block(fmt, VK_IMAGE_ASPECT_COLOR_BIT);
+                if (!code || bf.block != 1 || !bf.bytes || bf.bytes > 16383) {
+                    log_once("buffer UAV format not supported:", int(desc->Format));
+                    return;
+                }
+                const UINT64 stride = bf.bytes;
+                if (uav.FirstElement > width / stride) return;
+                const UINT64 byte_off = UINT64(uav.FirstElement) * stride;
+                const UINT64 byte_size = UINT64(uav.NumElements) * stride;
+                if (byte_size > width - byte_off) return;
+                buffer.address = base_va + byte_off;
+                buffer.stride = std::uint32_t(stride);
+                buffer.num_records = uav.NumElements;
+                buffer.format = code;
+                buffer.swizzle = leonida::gfx10::format_swizzle(named);
+                buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            }
+            const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+            return;
+        }
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));
