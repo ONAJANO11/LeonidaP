@@ -36,6 +36,11 @@ import re
 import sys
 import tempfile
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the shared helper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _paths import same_report_path as _same_report_path  # noqa: E402
+
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
@@ -541,15 +546,6 @@ def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: boo
 def _load_json(path: str) -> dict:
     with open(path, encoding="utf-8-sig") as handle:
         return json.load(handle)
-
-
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def _build(args) -> int:

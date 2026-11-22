@@ -33,6 +33,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import awc_opus  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from _paths import same_report_path as _same_report_path  # noqa: E402
 
 FIELDS = ("bank", "stream", "codec", "codec_name", "channels", "sample_rate", "declared_samples",
           "duration_s", "streamed_music", "data_offset", "data_size", "bank_size", "notes")
@@ -143,15 +144,6 @@ def _bank_rows(path: str, bank: str) -> list:
             else:   # as before: a streamed-music channel replaces a row with its id
                 rows[same] = row
     return rows
-
-
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def collect(src: str, *, out: str | None = None):

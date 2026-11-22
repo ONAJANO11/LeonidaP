@@ -49,6 +49,11 @@ if _TOOLS_DIR not in sys.path:
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the shared helper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _paths import same_report_path  # noqa: E402
+
 # Struct hashes (case-sensitive joaat of the engine struct name where recovered).
 ARCHETYPE = 0x82D6FC83        # CBaseArchetypeDef
 MLO_ARCHETYPE = 0x10506455    # CMloArchetypeDef
@@ -706,15 +711,6 @@ def summarize(total, entities=None, lights_out=None):
         summary["lane_graph"] = {"nodes": len(nodes), "links": len(links), "junctions": len(junctions),
                                  "note": "graph statistics need exactly one node list and one link list"}
     return summary
-
-
-def same_report_path(first, second):
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main(argv=None):

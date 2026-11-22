@@ -16,6 +16,11 @@ import sys
 import tempfile
 from collections import Counter
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the shared helper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _paths import same_report_path as _same_report_path  # noqa: E402
+
 
 def entropy(b: bytes) -> float:
     if not b:
@@ -40,15 +45,6 @@ def probe(path: str) -> dict:
         "head_entropy": round(entropy(body), 3),
         "looks_encrypted": entropy(body) > 7.9,
     }
-
-
-def _same_report_path(first: str, second: str) -> bool:
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main() -> int:

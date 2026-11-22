@@ -49,9 +49,13 @@ import re
 import struct
 import sys
 import time
-import unicodedata
 import zlib
 from collections import Counter
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the shared helper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _paths import same_report_path  # noqa: E402
 
 BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -945,42 +949,6 @@ def _offset(text):
     if value < 0:
         raise argparse.ArgumentTypeError("must not be negative")
     return value
-
-
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first, second):
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
 
 
 def main(argv=None):

@@ -39,6 +39,11 @@ import unicodedata
 import zlib
 from contextlib import contextmanager
 
+# -I keeps the script directory off sys.path, so add it explicitly before importing the shared helper.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _paths import case_insensitive_volume as _case_insensitive_volume  # noqa: E402
+
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
 ENTITY = 0xCE501483
@@ -604,26 +609,6 @@ def _resolve_report_path(path):
         missing.append(name)
         path = parent
     return os.path.join(os.path.realpath(path), *reversed(missing))
-
-
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `out/R.json` and `out/r.json` would pass as two
-    reports and the second write would replace the first."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
 
 
 def _pending_path_key(path):
