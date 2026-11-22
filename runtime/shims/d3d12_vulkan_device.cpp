@@ -15,6 +15,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/moltenvk_no_contraction.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
@@ -338,6 +339,8 @@ struct DeviceState {
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
     VkResolveModeFlags depth_resolve_modes = 0;
     VkResolveModeFlags stencil_resolve_modes = 0;
+    // Whether MoltenVK compiles translated shaders with Metal's safe math, so they need fewer NoContraction.
+    leonida::MetalSafeMath safe_math = leonida::MetalSafeMath::never;
 
     // VK_EXT_host_image_copy; null unless the device enabled it and its copies accept GENERAL.
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
@@ -1889,7 +1892,8 @@ public:
                 }
                 code_stage = &stage;
             }
-            const std::vector<std::uint32_t> words = library->spirv(*stage.entry);
+            const std::vector<std::uint32_t> words =
+                leonida::drop_no_contraction(library->spirv(*stage.entry), device_.safe_math);
             if (words.empty()) return E_FAIL;
             VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module_info.codeSize = words.size() * 4;
@@ -2136,7 +2140,7 @@ public:
             return E_NOTIMPL;
         }
         if (entry->wave64) log_once("wave64 compute shader runs 32-wide (subgroup size control not requested yet)", 0);
-        const std::vector<std::uint32_t> words = library->spirv(*entry);
+        const std::vector<std::uint32_t> words = leonida::drop_no_contraction(library->spirv(*entry), device_.safe_math);
         if (words.empty()) {
             std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
             return E_FAIL;
@@ -2650,12 +2654,14 @@ public:
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
                 VkPhysicalDeviceDepthStencilResolveProperties resolve{
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES, &driver};
                 VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &resolve};
                 get_props2(info.physical, &props);
                 state_.depth_resolve_modes = resolve.supportedDepthResolveModes;
                 state_.stencil_resolve_modes = resolve.supportedStencilResolveModes;
+                state_.safe_math = leonida::moltenvk_safe_math(driver.driverID, props.properties.driverVersion);
             }
         }
 
