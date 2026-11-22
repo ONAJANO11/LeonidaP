@@ -205,6 +205,14 @@ TBUFFER_STORE_WORDS = [
 # both the right addresses and the 4096-lower ones; only group 0 thread 0 runs, so no wave64 requirement.
 GLOBAL_OFFSET = [("cs_global_neg_offset", "40", [0x5EED1FFC, 0x8BAD1800, 0x5EED1FF0, 0x5EED1FF4,
                                                  0x0000009E, 0xFFFF8BAD, 0x57023FFC, 0xEEEEEEEE])]
+# cs_global_subdword.asm: global_load_sbyte / _ushort, the d16 loads and the byte / d16_hi stores, hand-derived (the .asm
+# header). Words 0..20 are loads, 21..33 the store targets read back through MUBUF.
+GLOBAL_SUBDWORD_WORDS = [
+    0xFFFFFFA3, 0xFFFFFF80, 0x00000001, 0x0000007F, 0x0000F2A3, 0x00008081, 0x000081F2, 0x000001C4,
+    0xA1B200A3, 0x0081C3D4, 0xA1B2FF80, 0xA1B2007F, 0x0080C3D4, 0xA1B2F2A3, 0xA1B281F2, 0xC4E5C3D4,
+    0x7F01C3D4, 0xA1B200C4, 0x00A3C3D4, 0xFFFFFFF2, 0x00008081,
+    0x443322D4, 0x8877D455, 0xCCD4AA99, 0xD4FFEEDD, 0x443322B2, 0x8877B255, 0xCCB2AA99, 0xB2FFEEDD,
+    0x4433A1B2, 0xA1B26655, 0xCCA1B299, 0xD4332211, 0xA1B29BDF]
 # cs_user_sgprs.asm: vk_compute_test puts these words in s4..s7 and the shader stores them back.
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
@@ -485,6 +493,12 @@ def tbuffer_store_test(tools, spirv, env=None):
     """The 52 region words tbuffer_store_format_* leaves and the untouched words after them, up to the regions at
     0x200. The heap needs 0x2d0 bytes, so it is 192 words."""
     return dump_test(tools, spirv, "cs_tbuffer_store", TBUFFER_STORE_WORDS + [0xEEEEEEEE] * 76, 192, env)
+
+
+def global_subdword_test(tools, spirv, env=None):
+    """The 34 result words of cs_global_subdword and the untouched words after them, up to the seeds at 0x200. The heap
+    needs 0x2c0 bytes, so it is 192 words."""
+    return dump_test(tools, spirv, "cs_global_subdword", GLOBAL_SUBDWORD_WORDS + [0xEEEEEEEE] * 94, 192, env)
 
 
 class Skip(str):
@@ -1288,6 +1302,7 @@ def main():
     results.append(("cs_fmt_sint32", fmt_sint32_test(tools, spirv)))
     results.append(("cs_fmt_xy_xyz", fmt_xy_xyz_test(tools, spirv)))
     results.append(("cs_tbuffer_store", tbuffer_store_test(tools, spirv)))
+    results.append(("cs_global_subdword", global_subdword_test(tools, spirv)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",

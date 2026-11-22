@@ -17,6 +17,7 @@ import check
 GOOD_FMT = struct.pack("<64I", *check.FMT_1010102_WORDS, *[0xEEEEEEEE] * 48)
 GOOD_XY_XYZ = struct.pack("<192I", *check.FMT_XY_XYZ_WORDS, *[0xEEEEEEEE] * 108)
 GOOD_TBUFFER_STORE = struct.pack("<192I", *check.TBUFFER_STORE_WORDS, *[0xEEEEEEEE] * 140)
+GOOD_GLOBAL_SUBDWORD = struct.pack("<192I", *check.GLOBAL_SUBDWORD_WORDS, *[0xEEEEEEEE] * 158)
 FULL_WAVE = ((0, "compute subgroup size: 64\n0 mismatches\n"),
              (0, "compute subgroup size: 64\nout[0..7] = 32 16 24 40 8 48 4008636142 4008636142\n"))
 
@@ -34,7 +35,7 @@ TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
+         + len(check.TEXTURE_CONSTANTS) + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
          # ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
@@ -71,9 +72,10 @@ class Wave64Checks(unittest.TestCase):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "64"))
                 Path(env["VKC_DUMP"]).write_bytes(struct.pack("<64I", *check.FMT_SINT32_WORDS))
                 return 0, ""
-            if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store"):
+            if name in ("cs_fmt_xy_xyz", "cs_tbuffer_store", "cs_global_subdword"):
                 self.assertEqual((args, env["VKC_OUT_WORDS"]), (("1", "dump"), "192"))
-                Path(env["VKC_DUMP"]).write_bytes(GOOD_XY_XYZ if name == "cs_fmt_xy_xyz" else GOOD_TBUFFER_STORE)
+                Path(env["VKC_DUMP"]).write_bytes({"cs_fmt_xy_xyz": GOOD_XY_XYZ, "cs_tbuffer_store": GOOD_TBUFFER_STORE,
+                                                   "cs_global_subdword": GOOD_GLOBAL_SUBDWORD}[name])
                 return 0, "out[0..7] = 0 0 0 0 0 0 0 0\n"
             if name == "cs_user_sgprs":
                 # The seeded words come back only if check.py passed them in VKC_SGPRS.
