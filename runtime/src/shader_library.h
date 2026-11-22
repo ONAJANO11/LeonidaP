@@ -530,6 +530,7 @@ struct ShaderEntry {
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     bool uses_code_base = false;
+    std::uint32_t code_base_dword = 34;  // where it reads its code base: 38 for a pixel shader (SHADER-67)
     bool wave64 = false;
     std::vector<SignatureElement> input_signature;  // vertex shaders: what the input layout must feed
     std::vector<std::uint32_t> outputs;             // pixel shaders: the render-target locations written
@@ -611,6 +612,7 @@ private:
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            if (const Json* c = meta.find("code_base_dword")) e.code_base_dword = u32(c);
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* s = meta.find("input_signature"); s && s->kind == Json::Kind::array) {
                 for (const Json& item : s->array) {

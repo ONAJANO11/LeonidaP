@@ -1952,17 +1952,19 @@ public:
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
+        for (const CodeBlock& code : code_)
+            if (code.bytes) device_.arena_release(code.offset, code.bytes);
     }
 
-    // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
-    // maxPushConstantsSize is smaller (128 bytes is the Vulkan minimum, which some Intel and mobile drivers
-    // report) needs the uniform-buffer tail #224 flags with push_constants_need_fallback, which is not built yet,
-    // so pipelines are refused there with the limit named instead of breaking VUID-VkPushConstantRange-size-00298.
-    bool push_constants_fit() const {
+    // Pipeline layouts declare the whole block as one push-constant range: 144 bytes, 160 when a pixel shader reads
+    // its code base from dwords 38-39. A device whose maxPushConstantsSize is smaller (128 bytes is the Vulkan
+    // minimum, which some Intel and mobile drivers report) needs the uniform-buffer tail #224 flags with
+    // push_constants_need_fallback, which is not built yet, so pipelines are refused there with the limit named
+    // instead of breaking VUID-VkPushConstantRange-size-00298.
+    bool push_constants_fit(std::uint32_t bytes = leonida::shader_user_data_bytes) const {
         const std::uint32_t limit = device_.info.max_push_constants_size;
-        if (limit == 0 || limit >= sizeof(leonida::ShaderUserData)) return true;  // 0: not queried
-        log_once("pipelines need 144 bytes of push constants (uniform-buffer fallback not built yet); "
+        if (limit == 0 || limit >= bytes) return true;  // 0: not queried
+        log_once("pipelines need more push constants than the device has (uniform-buffer fallback not built yet); "
                  "maxPushConstantsSize",
                  int(limit));
         return false;
@@ -1974,9 +1976,11 @@ public:
 
     // A VS (+ PS) pipeline for dynamic rendering. Vertex input comes from the input layout matched to the VS's
     // input signature by semantic name and index: location = the element's register, the translator's rule
-    // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages, more than one sample, and two stages
-    // that both read their code base are refused with a log. Viewport, scissor, topology, vertex strides, stencil
-    // reference and blend factor are dynamic, set from the list's state at each draw.
+    // (docs/design.md, "Vertex fetch"). Hull, domain and geometry stages and more than one sample are refused with a
+    // log. Each stage that reads its code base gets its own FSSM blob in the arena: the VS's at push-constant dwords
+    // 34-35, the PS's at 38-39 (SHADER-67). Two stages whose index entries name the same slot (an index translated
+    // before the PS had its own) are refused. Viewport, scissor, topology, vertex strides, stencil reference and
+    // blend factor are dynamic, set from the list's state at each draw.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -2012,7 +2016,7 @@ public:
         Stage stages[2] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS}, {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
-        const Stage* code_stage = nullptr;
+        const Stage* code_stages[2] = {};  // by slot: dwords 34-35, 38-39
         for (Stage& stage : stages) {
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             stage.fssm = leonida::fssm_program(
@@ -2040,12 +2044,21 @@ public:
                 }
                 uses_bindless = true;
             }
+            graphics_.push_bytes = std::max(graphics_.push_bytes, stage.entry->push_constant_bytes);
             if (stage.entry->uses_code_base) {
-                if (code_stage) {
-                    log_once("two stages read their code base; one push-constant slot holds one (question 14)", 0);
+                const std::uint32_t dword = stage.entry->code_base_dword;
+                if (dword != 34 && dword != 38) {
+                    std::fprintf(stderr, "[rt] d3d12: %s reads its code base from dword %u\n",
+                                 stage.entry->name.c_str(), dword);
                     return E_NOTIMPL;
                 }
-                code_stage = &stage;
+                const Stage*& slot = code_stages[dword == 38];
+                if (slot) {
+                    std::fprintf(stderr, "[rt] d3d12: %s and %s both read their code base from dwords %u-%u\n",
+                                 slot->entry->name.c_str(), stage.entry->name.c_str(), dword, dword + 1);
+                    return E_NOTIMPL;
+                }
+                slot = &stage;
             }
             const std::vector<std::uint32_t> words = library->spirv(*stage.entry);
             if (words.empty()) return E_FAIL;
@@ -2061,6 +2074,11 @@ public:
             info.pName = "main";
             stage_infos.push_back(info);
         }
+        if (graphics_.push_bytes > sizeof(leonida::ShaderUserData)) {
+            std::fprintf(stderr, "[rt] d3d12: a stage declares %u bytes of push constants\n", graphics_.push_bytes);
+            return E_NOTIMPL;
+        }
+        if (!push_constants_fit(graphics_.push_bytes)) return E_NOTIMPL;
 
         // Input layout -> vertex input, by semantic.
         std::vector<VkVertexInputAttributeDescription> attributes;
@@ -2231,7 +2249,7 @@ public:
         // Every stage this path accepts reads the user SGPRs, so the range covers the whole stage table, not only the
         // stages present. A stage added to the table (geometry, mesh) is covered without touching this.
         for (const Stage& stage : stages) graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        const VkPushConstantRange push{graphics_.push_stages, 0, graphics_.push_bytes};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -2259,13 +2277,14 @@ public:
         if (!graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
 
-        if (code_stage) {
-            VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
-            code_bytes_ = code_stage->fssm.size();
-            code_base_ = offset;
-            graphics_.code_base = offset;
+        for (int slot = 0; slot < 2; ++slot) {
+            if (!code_stages[slot]) continue;
+            const std::vector<std::uint8_t>& fssm = code_stages[slot]->fssm;
+            CodeBlock& code = code_[slot];
+            if (!device_.arena_allocate(fssm.size(), 256, code.offset)) return E_OUTOFMEMORY;
+            std::memcpy(device_.arena.mapped + code.offset, fssm.data(), fssm.size());
+            code.bytes = fssm.size();
+            (slot ? graphics_.ps_code_base : graphics_.code_base) = code.offset;
         }
         device_.context->add_graphics_pipeline(id(), graphics_);
         registered_ = true;
@@ -2316,7 +2335,7 @@ public:
         module_info.codeSize = words.size() * 4;
         module_info.pCode = words.data();
         if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, leonida::shader_user_data_bytes};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -2339,12 +2358,10 @@ public:
             return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64.
-        VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(fssm.size(), 256, offset)) return E_OUTOFMEMORY;
-        std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
-        code_bytes_ = fssm.size();
-        code_base_ = offset;
-        pipeline_.code_base = offset;
+        if (!device_.arena_allocate(fssm.size(), 256, code_[0].offset)) return E_OUTOFMEMORY;
+        std::memcpy(device_.arena.mapped + code_[0].offset, fssm.data(), fssm.size());
+        code_[0].bytes = fssm.size();
+        pipeline_.code_base = code_[0].offset;
         device_.context->add_pipeline(id(), pipeline_);
         registered_ = true;
         return S_OK;
@@ -2445,8 +2462,11 @@ private:
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
-    VkDeviceSize code_base_ = 0;
-    VkDeviceSize code_bytes_ = 0;
+    // The FSSM blobs in the arena: compute or the VS's (dwords 34-35), then the PS's (38-39).
+    struct CodeBlock {
+        VkDeviceSize offset = 0;
+        VkDeviceSize bytes = 0;
+    } code_[2];
     bool registered_ = false;
     bool is_graphics_ = false;
 };

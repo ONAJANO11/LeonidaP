@@ -626,12 +626,16 @@ The compute path, end to end:
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
     index's `features` list is not read yet, so a shader that needs a feature the GPU lacks is not refused up front.
-  - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
-    that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
-  - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
-    stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
-    `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
-    limit in the log, until the uniform-buffer tail exists.
+  - **Code bases:** each stage that reads its code base (`uses_code_base`) gets its own FSSM blob in the arena,
+    the VS's at dwords 34–35 and the PS's at 38–39 (`code_base_dword`, section 5.2). Two stages whose index entries
+    name the same slot (an index translated before SHADER-67) are refused with both names in the log.
+  - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA and set-0 bindings. More than
+    eight render targets is `E_INVALIDARG`.
+  - **Push constants:** both PSO paths declare the block as one range: 144 bytes, or the largest
+    `push_constant_bytes` of a graphics pipeline's stages (160 with a code-base PS). Its stage flags are the whole
+    stage table the graphics path accepts, and the replay pushes with the same flags and size. A device whose
+    `maxPushConstantsSize` is below that (#224's `push_constants_need_fallback` below 144) has the PSO refused,
+    with the limit in the log, until the uniform-buffer tail exists.
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
   D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
@@ -2146,7 +2150,7 @@ store, load, mesh, geometry and BVH tests; this layer is the other half.
 |---|---|
 | `s0..s31` user data | Root signature state at draw/dispatch: root constants copied, root CBV/SRV/UAV addresses and descriptor-table base addresses as 64-bit console VAs. Mapping per section 3.5; absent parameters zero. |
 | `heap_base` (dwords 32–33) | The arena's `vkGetBufferDeviceAddress`. One value per command buffer; updated only if the arena is recreated. |
-| `code_base` (dwords 34–35) | The console VA of the current shader's FSSM blob in the arena. Per-stage conflict: see below. |
+| `code_base` (dwords 34–35; a PS's at 38–39) | The console VA of the shader's FSSM blob in the arena, one slot per stage of a pipeline: see section 5.2. |
 | Descriptor hash table (set 0, binding 2) | `uint mask` + entries of `key[8], index, pad`; FNV-1a over the 8 key dwords; linear probe up to 8; miss = index 0. Implemented in `runtime/src/descriptor_table.h` (`DescriptorTable`). The layer inserts every T#/S# it sees and keeps a fallback image/sampler at index 0. |
 | Bindless images (bindings 0, 3, 5, 6) | 2D, 2D-array/cube, 1D, 3D sampled-image arrays; one `VkImageView` per distinct T#. Cube textures are 6-layer 2D arrays and cube arrays 6N-layer ones, as the translator expects. |
 | Samplers (binding 1) | One `VkSampler` per distinct S#; literal S# values from shader constants are pre-registered. |
@@ -2261,36 +2265,41 @@ The run is synthetic and contains no game data. Raw retained rows and the correc
 
 ### 5.2 Per-stage code base
 
-The current 144-byte block has one 64-bit code base at dwords 34–35. A graphics pipeline has at least a vertex and
-a pixel shader, and each may use `s_getpc_b64` for its own constant table. One block cannot hold two different
-code bases at the same offset. The pipeline layout declares the block for every stage that may read it (or for all
-graphics stages), and `vkCmdPushConstants` is called with those stage bits. This is a real gap in the current
-contract, not a runtime bug:
-
-- Only 155 shaders use code-embedded data, and a graphics pipeline has at least two stages (typically VS+PS, or
-  MS+PS). If only one stage in a pipeline uses it, the layer can set that stage's code base; the other stage never
-  reads it. This probably covers the first boot. **Assumption.**
-- If both stages use it, the layer cannot satisfy both with the current contract. The clean fix is a translator
-  change: give each stage its own code-base slot (for example dwords 34–35 VS, 36–37 PS, 38–39 CS, 40–41 GS/MS,
-  extending the block to 168 bytes) and have each compiled shader read its stage's slot. A 168-byte push-constant
-  block is still under the 256-byte limit of common desktop GPUs, but above Vulkan's 128-byte minimum; the device
-  requirement must be checked.
-- A second option is a per-stage uniform/storage buffer for the code base, patched in at pipeline creation. That
-  adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
-  how many real PSOs have two code-base stages.
-
+A graphics pipeline has at least a vertex (or mesh) and a pixel shader, and each may use `s_getpc_b64` for its own
+constant table. One push-constant block is shared by every stage of a pipeline (the layout declares it for all
+graphics stages, and `vkCmdPushConstants` is called with those stage bits), so one slot cannot hold two code bases.
 Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
 VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
 MS+PS pipeline can therefore need a code base.
+
+**Implemented (SHADER-67):** a pixel shader reads its code base from dwords **38–39**, every other stage from
+34–35 (`code_base_dword` in `tools/rdna2spirv.py`). Pairs that can share a pipeline then never share a slot:
+
+- VS+PS and MS+PS: 34–35 and 38–39. A CS runs alone. A GS sits next to a VS and would share 34–35 with it, but no
+  GS in the corpus keeps `s_getpc_b64` for data (0 of 195, above); the runtime refuses such a pair rather than
+  guess.
+- Not 36–37: `--mesh-compute` modules use them for the output address, and the draw that follows pushes that
+  address to `tools/mesh_compute_vs.py`'s vertex shader, in the same pipeline as the PS.
+- Only a PS that reads its code base declares the longer block, 160 bytes (`push_constant_bytes` 160 in the index,
+  with `code_base_dword` 38); all other shaders keep 144 (152 for `--mesh-compute`), so their SPIR-V does not change.
+  160 bytes is under the 256 of every desktop GPU measured in #166. Below it the PSO is refused like any block that
+  does not fit, until the uniform-buffer tail exists.
+- The index records `code_base_dword` (34 or 38) next to `uses_code_base`. The runtime puts each stage's FSSM blob
+  in the arena and its VA in that slot; an entry without the field is an older translation that reads 34–35, so a
+  VS+PS pair from such an index is refused, as before.
+
+The per-stage uniform buffer considered here earlier (a descriptor binding and a load per `s_getpc_b64`) is not
+needed for this. Confirmed by `tests/semantic/test_code_base_slot.py` (the translated PS returns the 38–39 value
+with a different one in 34–35; the VS block and access chain are unchanged) and on a GPU by `d3d12_draw_test`
+(a VS and a PS that each read a constant from their own program in one pipeline, through the device and replay).
 
 **Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). Intel Arc is not uniform: the earlier fleet entries report the 128-byte specification minimum (`maxPushConstantsSize == 128`) for Arc, but an Arc B580 (Battlemage) on Windows 11, driver 32.0.101.9175, reports 256 bytes (#166, @rtrexmass), so there D3D-14's fallback never engages. The 128 figure may be specific to another OS or driver (Mesa ANV on Linux is the guess; no Arc run on Linux that records the OS is cited here, and an ANV result would settle it). So does an integrated AMD RDNA2 GPU, a Radeon 680M on the Windows driver 22.40.84.06, so the minimum is not Intel-only. 128 bytes cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
 **Open:** the exact count of such PSOs (the pairing is in the executable), and the minimum `maxPushConstantsSize` across target GPUs. If a GPU only
 supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
 tail) regardless.
 
-At run time, `CreateGraphicsPipelineState` refuses a pair where both stages read their code base, with a log, so
-the first boot measures the pair count. A device whose `maxPushConstantsSize` is below 144 has every PSO refused,
-with the limit in the log, until the uniform-buffer tail exists.
+A device whose `maxPushConstantsSize` is below 144 has every PSO refused, with the limit in the log, until the
+uniform-buffer tail exists.
 
 ### 5.3 Descriptor T#/S# parsing
 
@@ -2473,7 +2482,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
 | 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), desktop AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively. A Radeon 680M on the Windows driver 22.40.84.06 and the earlier Intel Arc entries expose only the core minimum 128 B (`maxPushConstantsSize == 128`), but an Arc B580 on Windows 11 (driver 32.0.101.9175) reports 256 B (#166), so the 128 B figure for Arc depends on the OS or driver; an Arc result on Linux (Mesa ANV) would settle which side it is. `d3d12_vulkan_device_test` accepts either answer and checks that the fallback flag matches it. Below 144 B, the device logs a warning and marks `push_constants_need_fallback`, routing the 16-byte tail (dwords 32..35: heap base and code base) to a uniform-buffer fallback. |
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. |
-| 14 | Are there PSOs with two code-base stages? | Count from the PSO/shader hash table and the index metadata. If yes, implement per-stage code-base slots (section 5.2). **Per stage, measured** (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). So VS+PS and MS+PS pipelines with two code-base stages are possible; whether any exists depends on which shaders a PSO pairs, which is in the executable, not in `shaders.rpf`. |
+| 14 | Are there PSOs with two code-base stages? | Count from the PSO/shader hash table and the index metadata. If yes, implement per-stage code-base slots (section 5.2). **Per stage, measured** (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). So VS+PS and MS+PS pipelines with two code-base stages are possible; whether any exists depends on which shaders a PSO pairs, which is in the executable, not in `shaders.rpf`. **Implemented** (SHADER-67): a PS reads its code base from dwords 38–39, the other stages from 34–35, so such a pair works without knowing the count (section 5.2). |
 | 15 | Is `ExecuteIndirect` used with signatures Vulkan cannot express directly? | Trace `CreateCommandSignature` and `ExecuteIndirect`; implement simple signatures first, expand the complex ones with compute. The simple signatures are D3D-17 (#313). |
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. |
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |

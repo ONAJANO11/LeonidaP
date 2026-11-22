@@ -14,6 +14,9 @@
 //   VKH_SUBGROUP_SIZE=32|64      requires that subgroup size of the fragment shader (or of the compute or geometry
 //                                stage under test); stderr says "fragment subgroup size: N" when it took effect and
 //                                "... not available" when the device cannot require it (exit code stays 0).
+//   VKH_CODE=vs,ps               code bases (Xbox VAs, as s_getpc_b64 sees them): vs in dwords 34..35, which every
+//                                stage but the pixel shader reads, ps in 38..39, the pixel shader's (SHADER-67).
+//                                With VKH_HEAP, data the shader reads from its own code goes at those addresses.
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -111,12 +114,23 @@ int main(int argc, char** argv) {
     } else if (argc > 5) {
         W = atoi(argv[4]); H = atoi(argv[5]);
     }
-    // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
-    uint32_t pc[38] = {};
+    // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37), the
+    // pixel shader's code base (38..39).
+    uint32_t pc[40] = {};
     const char* sgprs_env = std::getenv("VKH_SGPRS");
     if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
         return 2;
+    }
+    if (const char* code_env = std::getenv("VKH_CODE"); code_env && *code_env) {
+        const char* s = code_env;
+        uint32_t vs_code = 0, ps_code = 0;
+        if (!parse_u32(s, vs_code) || *s++ != ',' || !parse_u32(s, ps_code) || *s) {
+            std::fprintf(stderr, "VKH_CODE: expected two words, vs,ps, got \"%s\"\n", code_env);
+            return 2;
+        }
+        pc[34] = vs_code;
+        pc[38] = ps_code;
     }
     const uint32_t heap_bytes = 64 * 1024;
     const char* heap_env = std::getenv("VKH_HEAP");
@@ -455,11 +469,16 @@ int main(int argc, char** argv) {
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = 1; cb.pAttachments = &cba;
     // Translated shaders declare a 144-byte push-constant block (user SGPRs, heap base, code base; see VKH_SGPRS /
-    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes).
+    // VKH_HEAP); --mesh-compute modules and their vertex shaders add the output address (152 bytes), and a pixel
+    // shader that reads its code base its own slot (160 bytes, VKH_CODE). The range is 160 bytes wherever the device
+    // has them, so it covers every block; a device with less keeps the size the other blocks need.
     const VkShaderStageFlags pcs = (mesh ? VK_SHADER_STAGE_MESH_BIT_EXT : VK_SHADER_STAGE_VERTEX_BIT) |
                                    VK_SHADER_STAGE_FRAGMENT_BIT | (gs_path ? VK_SHADER_STAGE_GEOMETRY_BIT : 0) |
                                    (mesh_compute ? VK_SHADER_STAGE_COMPUTE_BIT : 0);
-    VkPushConstantRange pcr{pcs, 0, mesh_compute ? 152u : 144u};
+    const uint32_t pc_bytes = props.limits.maxPushConstantsSize >= sizeof(pc) ? uint32_t(sizeof(pc))
+                              : mesh_compute                                  ? 152u
+                                                                              : 144u;
+    VkPushConstantRange pcr{pcs, 0, pc_bytes};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.pushConstantRangeCount = 1; pli.pPushConstantRanges = &pcr;
     VkPipelineLayout pl; CHECK(vkCreatePipelineLayout(dev, &pli, nullptr, &pl));
@@ -564,7 +583,6 @@ int main(int argc, char** argv) {
         std::memcpy(pc, shifts, sizeof(shifts));
     }
     auto push = reinterpret_cast<PFN_vkCmdPushConstants>(vkGetDeviceProcAddr(dev, "vkCmdPushConstants"));
-    const uint32_t pc_bytes = mesh_compute ? 152u : 144u;
     if (mesh_compute) {
         // The mesh shader as compute, then make its stores visible to the vertex shader's reads.
         LOADD(vkCmdDispatch); LOADD(vkCmdPipelineBarrier);

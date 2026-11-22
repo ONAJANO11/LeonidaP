@@ -102,6 +102,15 @@ with open(os.path.join(os.path.dirname(__file__), "gfx10_formats.json"), encodin
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
 
+
+def code_base_dword(stage):
+    """First push-constant dword of the code base s_getpc_b64 reads (SHADER-67, docs/d3d12_vulkan.md section 5.2):
+    34 (block 144 bytes), or 38 for a pixel shader (block 160 bytes), so the VS or MS and the PS of one pipeline can
+    each have their own FSSM blob's address. Not 36: a --mesh-compute draw pushes its output address there to the
+    vertex shader that runs with the PS. The other stages are never two in a pipeline that reads one (CS runs alone;
+    0 of the 195 GS keep s_getpc_b64 for data, open question 14), so they share 34."""
+    return USER_SGPRS + (6 if stage == "ps" else 2)
+
 # v_pipeflush (GFX10 VOP1) only flushes the VALU pipeline: no register, memory or EXEC effect to translate.
 # s_icache_inv invalidates the instruction cache; s_ttracedata / s_ttracedata_imm send thread-trace data;
 # s_code_end pads the end of a code object; s_version records the ISA version. None of them has a register, memory,
@@ -5332,8 +5341,9 @@ class Gen:
             self.emit(f"{r} = OpShiftRightLogical %uint {self.local_index()} {self.cu(6 if self.wave64 else 5)}")
             self.dst(a[0], r)
         elif op == "s_getpc_b64":
-            # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
-            # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
+            # Address of the next instruction: code base (push constants 34-35, 38-39 in a PS, code_base_dword: where
+            # the runtime put this shader's FSSM blob in the Xbox VA window) + offset of the next instruction within
+            # the blob.
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_getpc_b64 destination")
             if not ins.get("enc"):
@@ -5350,7 +5360,8 @@ class Gen:
             self.store_reg("sgpr", a[0]["r"], rlo)
             self.store_reg("sgpr", a[0]["r"] + 1, rhi)
             self.uses_codebase = True
-            self.cu(3), self.cu(4)
+            member = code_base_dword(self.stage) - USER_SGPRS + 1      # %UserData member: after s[] and the heap base
+            self.cu(member), self.cu(member + 1)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
             x, y = self.src_u(a[1]), self.src_u(a[2])
@@ -8180,6 +8191,14 @@ def dedupe_types(text):
     return "\n".join(_ID_REF.sub(lambda t: alias.get(t.group(0), t.group(0)), l) for l in out)
 
 
+def push_constant_bytes(gen):
+    """Size of the shader's push-constant block: s0..s31, heap base, code base (144 bytes), with --mesh-compute's
+    output address (152) or a PS's own code base (160, code_base_dword) after it."""
+    if getattr(gen, "msc_layout", None):
+        return gen.msc_layout["push_constant_bytes"]
+    return 4 * (code_base_dword(gen.stage) + 2) if gen.uses_codebase else 4 * USER_SGPRS + 16
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -8593,18 +8612,16 @@ def assemble(gen):
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" for n in gen.outputs]
-    # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base).
+    # Push constants: s0..s31 user data, then the 64-bit host address of the Xbox GPU VA window (heap base), the code
+    # base, and up to the last dword this shader reads: --mesh-compute's output address, or a PS's own code base.
+    tail = (push_constant_bytes(gen) - 4 * USER_SGPRS) // 4
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
-              "%UserData = OpTypeStruct %arr_ud %uint %uint %uint %uint" + (" %uint %uint" if msc else ""),
+              "%UserData = OpTypeStruct %arr_ud" + " %uint" * tail,
               "%_ptr_PC_UserData = OpTypePointer PushConstant %UserData",
               "%_ptr_PC_uint = OpTypePointer PushConstant %uint"]
-    dec += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %UserData Block", "OpMemberDecorate %UserData 0 Offset 0",
-            f"OpMemberDecorate %UserData 1 Offset {4 * USER_SGPRS}",
-            f"OpMemberDecorate %UserData 2 Offset {4 * USER_SGPRS + 4}",
-            f"OpMemberDecorate %UserData 3 Offset {4 * USER_SGPRS + 8}",
-            f"OpMemberDecorate %UserData 4 Offset {4 * USER_SGPRS + 12}"] + (
-            [f"OpMemberDecorate %UserData 5 Offset {4 * USER_SGPRS + 16}",
-             f"OpMemberDecorate %UserData 6 Offset {4 * USER_SGPRS + 20}"] if msc else [])
+    dec += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %UserData Block",
+            "OpMemberDecorate %UserData 0 Offset 0"] + [
+            f"OpMemberDecorate %UserData {k + 1} Offset {4 * (USER_SGPRS + k)}" for k in range(tail)]
     gvars += ["%user_data = OpVariable %_ptr_PC_UserData PushConstant"]
     if gen.uses_fhalf:
         types += ["%fhalf_g = OpConstant %float 0.5"]
@@ -8815,8 +8832,9 @@ def assemble(gen):
         fn += ["%ud_base_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c1",
                "%ud_base_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c2"]
     if gen.uses_codebase:
-        fn += ["%ud_code_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c3",
-               "%ud_code_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c4"]
+        member = code_base_dword(gen.stage) - USER_SGPRS + 1
+        fn += [f"%ud_code_lo_p = OpAccessChain %_ptr_PC_uint %user_data {gen.cu(member)}",
+               f"%ud_code_hi_p = OpAccessChain %_ptr_PC_uint %user_data {gen.cu(member + 1)}"]
     for i in range(USER_SGPRS):
         fn += [f"%ud{i}p = OpAccessChain %_ptr_PC_uint %user_data %c0 {gen.cu(i)}",
                f"%ud{i} = OpLoad %uint %ud{i}p",
@@ -10408,7 +10426,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          "capabilities": caps, "extensions": exts,
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))}),
-         "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
+         "bindings": binds, "push_constant_bytes": push_constant_bytes(g),
          "subgroup_size": 64 if g.wave64 else 32,
          # 64-wide subgroups can only be requested for compute/mesh on RADV and NVIDIA; VS/PS/GS wave64
          # shaders must be treated as emulated (per-32-lane halves) until cross-half ops go through LDS.
@@ -10429,6 +10447,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         m["needs_maintenance8"] = True
     if g.uses_codebase:
         m["uses_code_base"] = True
+        m["code_base_dword"] = code_base_dword(g.stage)
     if g.cs:
         m["local_size"] = list(g.cs["size"])
         m["user_sgprs"] = g.cs["user"]

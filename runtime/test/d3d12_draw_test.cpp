@@ -7,8 +7,12 @@
 //   - a render target cleared blue, two indexed draws with different root arguments (top-left red, bottom-right
 //     green), and one back-facing triangle (bottom-left) that culling must remove;
 //   - the image read back through CopyTextureRegion and compared pixel by pixel. Where the quadrants land also
-//     checks the viewport flip (D3D clip space is y-up) and the front-face winding.
-// The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag). No game data.
+//     checks the viewport flip (D3D clip space is y-up) and the front-face winding;
+//   - a VS and a PS that both read a constant from their own program (SHADER-67): the VS through its code base in
+//     push-constant dwords 34-35, the PS through its own in 38-39. Each blob is in the arena; an index whose PS
+//     still names dwords 34-35 (translated before the PS had its own slot) is refused.
+// The shaders are GLSL written to the translator's contract (test/glsl/vs_draw.vert, ps_draw.frag, vs_code.vert,
+// ps_code.frag). No game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -54,11 +58,22 @@ int main() {
     const auto fullscreen_program = fssm_program({0x56530002, 0xbf810000});
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
     const auto fullscreen_container = shader_container(fullscreen_program);
+    // Programs whose constants the code-base shaders read: the VS 1.0 at byte 12 (red), the PS 1.0 at byte 16
+    // (green). Each finds 0 at the other's offset, so a stage reading the other's blob leaves its channel black.
+    const auto vs_code_program = fssm_program({0x56530003, 0xbf810000, 0x3f800000, 0});
+    const auto ps_code_program = fssm_program({0x50530003, 0xbf810000, 0, 0x3f800000});
+    const auto stale_ps_program = fssm_program({0x50530004, 0xbf810000, 0, 0x3f800000});
+    const auto vs_code_container = shader_container(vs_code_program), ps_code_container = shader_container(ps_code_program);
+    const auto stale_ps_container = shader_container(stale_ps_program);
     const auto library = std::filesystem::temp_directory_path() / "leonida_draw_test";
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_VS_FULLSCREEN_SPV, library / "vs_fullscreen.spv",
+                               std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_VS_CODE_SPV, library / "vs_code.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_CODE_SPV, library / "ps_code.spv", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(LEONIDA_TEST_PS_CODE_SPV, library / "ps_code_stale.spv",
                                std::filesystem::copy_options::overwrite_existing);
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -71,7 +86,15 @@ int main() {
                  " \"vs_fullscreen\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(fullscreen_program)
               << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"input_signature\": []},\n"
                  " \"ps_draw\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"vs_code\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_code_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, "
+                 "\"code_base_dword\": 34, \"input_signature\": []},\n"
+                 " \"ps_code\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_code_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 160, \"uses_code_base\": true, "
+                 "\"code_base_dword\": 38, \"outputs\": [0]},\n"
+                 " \"ps_code_stale\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(stale_ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, \"outputs\": [0]}}";
     }
 
     constexpr UINT size = 64;
@@ -130,7 +153,7 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen;
+        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen, code_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
@@ -183,6 +206,14 @@ int main() {
         fullscreen_desc.VS = {fullscreen_container.data(), fullscreen_container.size()};
         fullscreen_desc.InputLayout = {nullptr, 0};
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&fullscreen_desc, IID_PPV_ARGS(&fullscreen.p))));
+        // Two stages with code bases: the VS's in dwords 34-35, the PS's in 38-39. With a PS whose index entry has
+        // no code_base_dword (so 34, as before SHADER-67), both would need the same slot: refused.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC code_desc = fullscreen_desc;
+        code_desc.VS = {vs_code_container.data(), vs_code_container.size()};
+        code_desc.PS = {ps_code_container.data(), ps_code_container.size()};
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&code_desc, IID_PPV_ARGS(&code_pso.p))));
+        code_desc.PS = {stale_ps_container.data(), stale_ps_container.size()};
+        EXPECT(device->CreateGraphicsPipelineState(&code_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
 
         // Geometry: a quad in the top-left quadrant (front-facing, clockwise in D3D screen space) and a triangle in
         // the bottom-left one wound the other way (back-facing).
@@ -347,8 +378,9 @@ int main() {
         std::memcpy(pixels.data(), mapped, pixels.size());
 
         // Second pass on the same target, cleared blue again: the red quad XORed into the top-left quadrant, which
-        // gives (255,0,255,0) where logicOp exists, and the full-screen triangle (yellow, red tint: red) through a
-        // viewport on the bottom-right quadrant, with no vertex buffer in its pipeline.
+        // gives (255,0,255,0) where logicOp exists, the full-screen triangle (yellow, red tint: red) through a
+        // viewport on the bottom-right quadrant, with no vertex buffer in its pipeline, and the code-base pipeline
+        // on the top-right quadrant: red from the VS's program, green from the PS's, so yellow.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -365,6 +397,10 @@ int main() {
         const D3D12_VIEWPORT bottom_right{float(size / 2), float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_right);
         list->SetPipelineState(fullscreen.p);
+        list->DrawInstanced(3, 1, 0, 0);
+        const D3D12_VIEWPORT top_right_quadrant{float(size / 2), 0, float(size / 2), float(size / 2), 0, 1};
+        list->RSSetViewports(1, &top_right_quadrant);
+        list->SetPipelineState(code_pso.p);
         list->DrawInstanced(3, 1, 0, 0);
         if (logic_op) {
             list->RSSetViewports(1, &viewport);
@@ -475,7 +511,7 @@ int main() {
         EXPECT(list->Close() == E_INVALIDARG);
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target}) r->reset();
-        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen}) p->reset();
+        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen, &code_pso}) p->reset();
         pso.reset();
         root.reset();
         rtv_heap.reset();
@@ -507,13 +543,15 @@ int main() {
         }
     }
     EXPECT(!mismatches);
-    // Second pass: XOR quad top-left (where logicOp exists), full-screen triangle bottom-right, blue elsewhere.
+    // Second pass: XOR quad top-left (where logicOp exists), full-screen triangle bottom-right, the code-base
+    // pipeline's yellow top-right, blue bottom-left.
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel want = top && left && logic_op ? Pixel{255, 0, 255, 0}
                                : !top && !left         ? Pixel{255, 0, 0, 255}
+                               : top && !left          ? Pixel{255, 255, 0, 255}
                                                        : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = second_pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;
@@ -554,8 +592,8 @@ int main() {
     }
     std::printf("M1: five draws and a culled triangle matched all %u pixels: input layout by semantic, root "
                 "constants and a root CBV per draw, vertex buffer in the arena, index buffer in an upload heap, an "
-                "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot; then %s "
-                "and a full-screen pass without vertex input\n",
+                "unbound target and DSV, a rebound root signature, step rate 0 and an unbound vertex slot; then %s, "
+                "a full-screen pass without vertex input and a VS and PS that each read their own code base\n",
                 size * size, logic_op ? "an XOR logic op" : "(no logicOp on this GPU)");
     return 0;
 }
