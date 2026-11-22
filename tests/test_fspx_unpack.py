@@ -265,6 +265,138 @@ class Cli(unittest.TestCase):
                 meta = json.load(f)
             self.assertEqual(meta["words"], [1, 2])
 
+    def test_missing_input_returns_1_without_creating_out(self):
+        with tempfile.TemporaryDirectory() as t:
+            missing = os.path.join(t, "nope.dxbc")
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(missing, "--out", out)
+            self.assertEqual(code, 1)
+            self.assertIn("nope.dxbc", err)
+            self.assertFalse(os.path.exists(out))
+
+    def test_missing_second_input_does_not_create_out(self):
+        with tempfile.TemporaryDirectory() as t:
+            good = os.path.join(t, "good.dxbc")
+            with open(good, "wb") as f:
+                f.write(Containers().container())
+            missing = os.path.join(t, "missing.dxbc")
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(good, missing, "--out", out)
+            self.assertEqual(code, 1)
+            self.assertIn("missing.dxbc", err)
+            self.assertFalse(os.path.exists(out))
+
+    def test_directory_input_returns_1_without_creating_out(self):
+        with tempfile.TemporaryDirectory() as t:
+            inp_dir = os.path.join(t, "some_dir")
+            os.makedirs(inp_dir)
+            out = os.path.join(t, "out")
+            code, _, err = self.run_tool(inp_dir, "--out", out)
+            self.assertEqual(code, 1)
+            self.assertIn("directory", err.lower())
+            self.assertFalse(os.path.exists(out))
+
+    def test_existing_file_as_out_returns_1_and_leaves_file_untouched(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "one.dxbc")
+            with open(src, "wb") as f:
+                f.write(Containers().container())
+            out_file = os.path.join(t, "existing.txt")
+            with open(out_file, "wb") as f:
+                f.write(b"keep me")
+            code, _, err = self.run_tool(src, "--out", out_file)
+            self.assertEqual(code, 1)
+            self.assertIn("not a directory", err.lower())
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_existing_file_as_out_ancestor_returns_1_and_leaves_file_untouched(self):
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "one.dxbc")
+            with open(src, "wb") as f:
+                f.write(Containers().container())
+            blocker = os.path.join(t, "blocker")
+            with open(blocker, "wb") as f:
+                f.write(b"keep me")
+            code, _, err = self.run_tool(src, "--out", os.path.join(blocker, "nested"))
+            self.assertEqual(code, 1)
+            self.assertIn("not a directory", err.lower())
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_refuses_to_overwrite_dxbc_input_in_same_directory(self):
+        c = Containers().container()
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "foo.dxbc")
+            with open(src, "wb") as f:
+                f.write(c)
+            code, _, err = self.run_tool(src, "--out", t)
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", err.lower())
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), c)
+            self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
+            self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
+
+    def test_refuses_case_variant_collision_with_input(self):
+        c = Containers().container()
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "FOO.DXBC")
+            with open(src, "wb") as f:
+                f.write(c)
+            code, _, err = self.run_tool(src, "--out", t)
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", err.lower())
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), c)
+            self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
+            self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
+
+    def test_refuses_collision_with_sidecar_or_index_input(self):
+        payload = make_fspx([(0, kind0()), (6, program())])
+        with tempfile.TemporaryDirectory() as t:
+            fspx_dir = os.path.join(t, "fspx")
+            os.makedirs(fspx_dir)
+            code_in = os.path.join(fspx_dir, "bar.code")
+            with open(code_in, "wb") as f:
+                f.write(payload)
+            code, _, err = self.run_tool(code_in, "--out", t)
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", err.lower())
+            with open(code_in, "rb") as f:
+                self.assertEqual(f.read(), payload)
+            self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
+
+            idx_in = os.path.join(t, "index.json")
+            with open(idx_in, "wb") as f:
+                f.write(b'{"keep": true}\n')
+            code, _, err = self.run_tool(idx_in, "--out", t)
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", err.lower())
+            with open(idx_in, "rb") as f:
+                self.assertEqual(f.read(), b'{"keep": true}\n')
+
+    def test_refuses_second_input_collision_without_partial_writes(self):
+        c = Containers().container()
+        with tempfile.TemporaryDirectory() as t:
+            d1 = os.path.join(t, "d1")
+            d2 = os.path.join(t, "d2")
+            os.makedirs(d1)
+            os.makedirs(d2)
+            first = os.path.join(d1, "alpha.dxbc")
+            second = os.path.join(d2, "beta.dxbc")
+            for p in (first, second):
+                with open(p, "wb") as f:
+                    f.write(c)
+            code, _, err = self.run_tool(first, second, "--out", d2)
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to overwrite", err.lower())
+            with open(second, "rb") as f:
+                self.assertEqual(f.read(), c)
+            self.assertFalse(os.path.exists(os.path.join(d2, "alpha.dxbc")))
+            self.assertFalse(os.path.exists(os.path.join(d2, "fspx")))
+            self.assertFalse(os.path.exists(os.path.join(d2, "index.json")))
+
 
 class TranslatorSidecars(unittest.TestCase):
     """rdna2spirv reads an FSPX program's code and dispatch state from fspx/ when there is no FSSM blob."""
