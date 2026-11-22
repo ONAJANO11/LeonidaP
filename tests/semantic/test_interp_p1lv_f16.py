@@ -291,15 +291,17 @@ class InterpP1lvF16HalvesFallbackTests(unittest.TestCase):
 class InterpF16BaryFallbackTests(unittest.TestCase):
     """--bary-fallback (BARY_FALLBACK) translation and execution for *_f16 ops."""
 
-    def test_bary_fallback_for_p1ll_p1lv_p2_uses_smooth_inputs_without_per_vertex(self):
+    def test_bary_fallback_reads_f16_halves_from_the_producer(self):
+        # --bary-fallback's devices have no VK_KHR_fragment_shader_barycentric, so no PerVertexKHR inputs: 16-bit
+        # interpolation reads the producer's decoded halves, as --f16-interp-fallback does. Before, `high` and low read
+        # the same plain 32-bit channel (@XFlawless1's finding: off by 0.984 on llvmpipe for ps_interp_f16_high).
         lines = [
             "v_mov_b32_e32 v10, 0",
             "v_interp_p1ll_f16 v2, v0, attr0.x",
             "v_interp_p2_f16 v2, v1, attr0.x, v2",
-            "v_interp_p1lv_f16 v3, v0, attr0.y, v10 high",
-            "v_interp_p2_f16 v3, v1, attr0.y, v3 high clamp",
-            "v_interp_p1lv_f16 v4, v0, attr0.z, v10",       # standalone f32 intermediate
-            "exp mrt0 v2, v3, v4, v2 done vm",
+            "v_interp_p1lv_f16 v3, v0, attr0.x, v10 high",
+            "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+            "exp mrt0 v2, v3, v2, v3 done vm",
             "s_endpgm",
         ]
         spv, meta = translate_with_flags("ps_f16_bf", lines, dxbc=PS_ATTR01_DXBC, bary_fallback=True)
@@ -309,64 +311,55 @@ class InterpF16BaryFallbackTests(unittest.TestCase):
         self.assertNotIn("FragmentBarycentricKHR", spv)
         self.assertNotIn("SPV_KHR_fragment_shader_barycentric", spv)
         self.assertNotIn("%bary", spv)
-        self.assertIn("OpDecorate %in_attr0 Location 0", spv)
-        self.assertNotIn("OpDecorate %in_attr0 Flat", spv)
+        self.assertIn("OpDecorate %in_f16h0_0 Location 28", spv)
+        self.assertIn("OpDecorate %in_f16h0_1 Location 29", spv)
+        self.assertNotIn("OpDecorate %in_f16h0_0 Flat", spv)
         self.assertEqual(meta["features"], [])
-        self.assertEqual(meta["inputs"], [0])
+        self.assertEqual(meta["f16_halves"], {"0": [28, 29]})
         self.assertNotIn("bary_fallback_input", meta)
-        self.assertNotIn("f16_halves", meta)
 
-        # Under --bary-fallback there are no per-vertex inputs, so high reads the same smooth f32 channel.
-        attrs = {0: [(f32_bits(x), f32_bits(y), f32_bits(z), 0)
-                     for x, y, z in zip((0.5, 1.5, 2.5), (-1.0, -1.0, 0.5), (1.0, 3.0, 5.0))]}
-        words = support.mrt0_words(spv, inputs=support.varyings(spv, attrs, BARY))
-        self.assertEqual(words[0] & 0xFFFF, 0x3F00)      # 1.75
-        self.assertEqual(words[1] & 0xFFFF, 0x0000)      # -0.25 clamped to +0.0
-        self.assertEqual(words[2], f32_bits(3.5))        # standalone p1lv f32 intermediate
+        words = support.mrt0_words(spv, inputs={"%in_f16h0_0": (1.75, 0.0, 0.0, 0.0),
+                                                "%in_f16h0_1": (0.5, 0.0, 0.0, 0.0)})
+        self.assertEqual([w & 0xFFFF for w in words[:2]], [0x3F00, 0x3800])     # low 1.75, high 0.5
 
-        # Confirm `high` and non-`high` read identically under --bary-fallback.
-        lines_same = [
+    def test_bary_fallback_with_raw_bary_read(self):
+        lines = [
             "v_mov_b32_e32 v10, 0",
-            "v_interp_p1ll_f16 v2, v0, attr0.x",
+            "v_interp_p1lv_f16 v2, v0, attr0.x, v10",
             "v_interp_p2_f16 v2, v1, attr0.x, v2",
-            "v_interp_p1lv_f16 v3, v0, attr0.x, v10 high",
-            "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
-            "exp mrt0 v2, v3, v2, v3 done vm",
+            "v_mov_b32_e32 v4, v0",
+            "v_mov_b32_e32 v5, v1",
+            "exp mrt0 v2, v4, v5, v2 done vm",
             "s_endpgm",
         ]
-        spv_same, _ = translate_with_flags("ps_f16_bf_same", lines_same, dxbc=PS_ATTR01_DXBC, bary_fallback=True)
-        words_same = support.mrt0_words(spv_same, inputs={"%in_attr0": (1.75, 0.0, 0.0, 0.0)})
-        self.assertEqual([w & 0xFFFF for w in words_same[:2]], [0x3F00, 0x3F00])
+        spv, meta = translate_with_flags("ps_f16_bf_raw_0", lines, bary_fallback=True)
+        self.assertNotIn("PerVertexKHR", spv)
+        self.assertNotIn("BaryCoordKHR", spv)
+        self.assertNotIn("FragmentBarycentricKHR", spv)
+        self.assertIn("OpDecorate %in_f16h0_0 Location 28", spv)
+        loc = meta["bary_fallback_input"]["location"]
+        self.assertNotIn(loc, (28, 29))                  # the bary input avoids the decoded-half locations
+        self.assertIn(f"OpDecorate %bary Location {loc}", spv)
+        self.assertIsNone(re.search(r"OpDecorate %bary (Flat|NoPerspective)", spv))
+        self.assertEqual(meta["ps_system_inputs"], ["bary_i", "bary_j"])
 
-    def test_bary_fallback_with_raw_bary_read_and_sparse_attr(self):
-        for attr_idx, want_bary_loc in ((0, 1), (30, 0)):
-            with self.subTest(attr=attr_idx):
-                lines = [
-                    "v_mov_b32_e32 v10, 0",
-                    f"v_interp_p1lv_f16 v2, v0, attr{attr_idx}.x, v10",
-                    f"v_interp_p2_f16 v2, v1, attr{attr_idx}.x, v2",
-                    "v_mov_b32_e32 v4, v0",
-                    "v_mov_b32_e32 v5, v1",
-                    "exp mrt0 v2, v4, v5, v2 done vm",
-                    "s_endpgm",
-                ]
-                spv, meta = translate_with_flags(f"ps_f16_bf_raw_{attr_idx}", lines, bary_fallback=True)
-                self.assertNotIn("PerVertexKHR", spv)
-                self.assertNotIn("BaryCoordKHR", spv)
-                self.assertNotIn("FragmentBarycentricKHR", spv)
-                self.assertIn(f"OpDecorate %in_attr{attr_idx} Location {attr_idx}", spv)
-                self.assertIn(f"OpDecorate %bary Location {want_bary_loc}", spv)
-                self.assertIsNone(re.search(r"OpDecorate %bary (Flat|NoPerspective)", spv))
-                self.assertEqual(meta["bary_fallback_input"], {"location": want_bary_loc})
-                self.assertEqual(meta["ps_system_inputs"], ["bary_i", "bary_j"])
+        words = support.mrt0_words(spv, inputs={"%in_f16h0_0": (1.75, 0.0, 0.0, 0.0), "%bary": BARY})
+        self.assertEqual(words[0] & 0xFFFF, 0x3F00)
+        self.assertEqual(words[1], f32_bits(BARY[1]))
+        self.assertEqual(words[2], f32_bits(BARY[2]))
 
-                words = support.mrt0_words(spv, inputs={
-                    f"%in_attr{attr_idx}": (1.75, 0.0, 0.0, 0.0),
-                    "%bary": BARY,
-                })
-                self.assertEqual(words[0] & 0xFFFF, 0x3F00)
-                self.assertEqual(words[1], f32_bits(BARY[1]))
-                self.assertEqual(words[2], f32_bits(BARY[2]))
+    def test_bary_fallback_f16_read_without_a_half_location_is_refused(self):
+        # attr30 has no decoded-half location (as under --f16-interp-fallback): refused, not read from the 32-bit channel.
+        lines = [
+            "v_mov_b32_e32 v10, 0",
+            "v_interp_p1lv_f16 v2, v0, attr30.x, v10",
+            "v_interp_p2_f16 v2, v1, attr30.x, v2",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            translate_with_flags("ps_f16_bf_attr30", lines, bary_fallback=True)
+        self.assertIn("decoded-half location", str(cm.exception))
 
     def test_f16_halves_takes_precedence_over_bary_fallback(self):
         spv, meta = translate_with_flags("ps_both_flags", P1LV_CLAMP_PAIR,

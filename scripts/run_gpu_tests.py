@@ -1090,9 +1090,6 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             vs = os.path.join(spirv_dir, "vs_ids.spv") if name == "ps_flat" else vs_tri   # check.py draws ps_flat with vs_ids
             if name in PIXEL_VERTEX:
-                if bary_fallback() and name == "ps_interp_f16_high":   # no PerVertexKHR inputs under --bary-fallback
-                    results.append((name, None, "SKIP (per-vertex f16 interpolants need barycentrics)"))
-                    continue
                 vs = os.path.join(spirv_dir, PIXEL_VERTEX[name] + ".spv")
             env = dict(gfx_env or os.environ, **PIXEL_ENV[name]) if name in PIXEL_ENV else gfx_env
             bary_gs = os.path.join(spirv_dir, f"{name}.bary_gs.spv")
