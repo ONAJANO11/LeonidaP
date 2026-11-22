@@ -174,6 +174,7 @@ jobs:
       - name: CPU runtime tests (Linux)
         run: ctest --test-dir runtime/build --output-on-failure
       - name: GPU tests on llvmpipe
+        shell: bash
         run: |
           vulkaninfo --summary | grep -E 'deviceName.*llvmpipe'  # fails the step if llvmpipe isn't there
           python3 -I scripts/run_gpu_tests.py --build runtime/build --llvm-mc /usr/lib/llvm-18/bin/llvm-mc --work "$RUNNER_TEMP/gpu-native"
