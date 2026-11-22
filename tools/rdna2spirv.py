@@ -101,6 +101,7 @@ class Gen:
         self.uses_bvh = False
         self.lconsts = {}              # 64-bit constants: value -> id
         self.uses_vote = False         # wave-uniform branches (OpGroupNonUniformAny)
+        self.reads_scc = True          # set per program: whether any instruction reads SCC (scc_logic)
         self.uses_ballot = False       # wave mask ballot (OpGroupNonUniformBallot)
         self.uses_wave_bits = False    # a whole lane mask gathered from the wave (OpGroupNonUniformBitwiseOr)
         self.uses_quad = False         # s_wqm on a lane mask (OpGroupNonUniformQuadSwap)
@@ -479,6 +480,12 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
+        if a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi") and self.wave64:
+            # One half of a wave64 EXEC: the lanes of the other half keep their state. Until 2026-11-22 a register
+            # written to exec_lo (s_and_b32 exec_lo, exec_lo, vcc_lo; s_mov_b32 exec_lo, s0) set all 64 lanes and
+            # exec_hi was rejected as a destination (tools/cf_diff.py, FUZZ-8).
+            self.exec_half_write(0 if a["t"] == "exec_lo" else 1, val)
+            return
         if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
             self.set_exec(val)
             return
@@ -1741,19 +1748,35 @@ class Gen:
         self.emit(f"OpStore %scc {z}")
 
     def scc_logic(self, a, r):
-        """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
-        an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
+        """SCC of a 32-bit bitwise op (SOP2 s_and/or/xor/andn2/orn2/nand/nor/xnor_b32, SOP1 s_not_b32): D != 0.
+        In a wave32 program an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
         is the vote of scc_from_mask, as for the _b64 forms. Until 2026-11-22 it was this lane's bit instead:
         `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in the lanes whose own bit was 0
         although the wave runs it, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane
         leave on its last iteration, before the wave did (tools/cf_diff.py, FUZZ-8). In a wave64 program the
-        same op works on one half of a mask (lanes 0-31 or 32-63), whose SCC would be a vote of that half only;
-        that case still takes the lane's bit and is not covered by the fuzzer yet."""
+        same op works on one half of a mask (lanes 0-31 or 32-63: exec_lo/hi, vcc_lo/hi or a half-mask SGPR), so
+        its SCC is a vote of that half (scc_any_half); until 2026-11-22 it took the lane's bit there too. s_not_b32
+        had its own SCC and kept the lane's bit until 2026-11-22 (reported in #477; 0 uses whose SCC is read in
+        the corpus)."""
         writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
-        if not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
+        is_mask = writes_exec or any(self.holds_lane_mask(x) for x in a[1:3])
+        if is_mask and not self.reads_scc:
+            # Nothing in the program reads SCC, so no vote is needed for it: under --wave64-emulate each vote is
+            # an exchange (a round and a barrier) that would buy nothing.
+            is_mask = False
+        if not self.wave64 and is_mask:
             self.scc_from_mask(r)
-        else:
-            self.scc_nonzero(r)
+            return
+        if self.wave64 and is_mask:
+            # The sources' half; the destination's only when it is exec/vcc_lo/hi (an SGPR destination may still
+            # hold a half of an older mask, which says nothing about this result).
+            halves = {self.mask_half(x) for x in a[1:3]} - {None}
+            if not halves and a[0]["k"] == "special":
+                halves = {self.mask_half(a[0])} - {None}
+            if len(halves) == 1:
+                self.scc_any_half(r, halves.pop())
+                return
+        self.scc_nonzero(r)
 
     SGPRS = 128                     # size of the %sgpr array without the parking slots
 
@@ -3330,9 +3353,7 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpNot %uint {x}")
             self.dst(a[0], r)
-            z = self.tmp()
-            self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
-            self.emit(f"OpStore %scc {z}")
+            self.scc_logic(a, r)
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
             def halves(s):
@@ -6540,6 +6561,7 @@ def translate(path):
                    for i in insns)
     if stage == "ms":
         g.wave64 = True            # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    g.reads_scc = any(reads_scc(i) for i in insns)
     if stage == "gs":
         ins_sig = [(reg, sv) for reg, mask, sv, ctype in input_signature(path, info["name"])]
         outs = output_signature(path, info["name"])
@@ -6996,6 +7018,16 @@ def x_scheduler_tail(gen):
 
 BRANCHES = {"s_branch", "s_cbranch_scc0", "s_cbranch_scc1", "s_cbranch_vccz", "s_cbranch_vccnz",
             "s_cbranch_execz", "s_cbranch_execnz"}
+
+
+SCC_READERS = ("s_cbranch_scc0", "s_cbranch_scc1", "s_cselect_b32", "s_cselect_b64", "s_addc_u32", "s_subb_u32",
+               "s_cmov_b32", "s_cmov_b64", "s_cmovk_i32")
+
+
+def reads_scc(ins):
+    """Whether an instruction may read SCC: the SOPP/SOP2/SOP1/SOPK readers, or any operand naming SCC."""
+    return base_op(ins["op"]) in SCC_READERS or \
+        any(x.get("k") == "special" and x.get("t") in ("scc", "src_scc") for x in ins["args"])
 
 
 def branch_condition(g, op):

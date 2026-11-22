@@ -26,8 +26,24 @@ SCC_MASK_CASES = {
     "s_and_b32 + s_cbranch_scc0": [("sccmask", FEW_LANES, "and", "s_cbranch_scc0", [("probe", 11)])],
     "s_xor_b32 + s_cbranch_scc1": [("sccmask", FEW_LANES, "xor", "s_cbranch_scc1", [("probe", 11)])],
     "s_xor_b32 + s_cselect_b32": [("csel", FEW_LANES, "xor", 11)],
+    "s_not_b32 + s_cbranch_scc0": [("sccmask", FEW_LANES, "not", "s_cbranch_scc0", [("probe", 11)])],
+    "s_not_b32 + s_cselect_b32": [("csel", FEW_LANES, "not", 11)],
     "loop closed by s_andn2_b32 exec + s_cbranch_scc1": [
         ("vloop", (0, 3, True), None, [("probe", 9), ("op", "s_add_u32 s10, s10, 1")])],
+}
+
+# Wave64 32-bit ops on one half of EXEC / VCC (FUZZ-8). Until 2026-11-22 a register written to exec_lo changed all
+# 64 lanes (exec_hi was rejected), and the SCC of such an op took the lane's own bit instead of a vote of its half.
+HALF = ("lt", "u32", 40, 0)       # lanes 41-63 only: the low half's result is 0, the high half's is not
+HALF_CASES = {
+    "s_and_b32 exec_lo, exec_lo, vcc_lo": [("halfexec", HALF, "lo", [("probe", 7)])],
+    "s_and_b32 exec_hi, exec_hi, vcc_hi": [("halfexec", HALF, "hi", [("probe", 7)])],
+    "s_mov_b32 exec_lo, <register>": [("op", "s_mov_b32 s60, 0"), ("op", "s_mov_b32 s61, exec_hi"),
+                                       ("op", "s_mov_b64 s[62:63], exec"), ("op", "s_mov_b32 exec_lo, s60"),
+                                       ("probe", 7), ("op", "s_mov_b64 exec, s[62:63]")],
+    "SCC of s_and_b32 on vcc_hi/exec_hi": [("halfscc", HALF, "and", "hi", "s_cbranch_scc0", [("probe", 7)])],
+    "SCC of s_xor_b32 on vcc_lo/exec_lo": [("halfscc", ("lt", "u32", 3, 0), "xor", "lo", "s_cbranch_scc1",
+                                            [("probe", 7)])],
 }
 
 
@@ -95,6 +111,13 @@ def test_scc_mask_cases_catch_a_per_lane_scc(case, monkeypatch):
     assert status == "mismatch"
 
 
+@pytest.mark.parametrize("case", sorted(HALF_CASES))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_wave64_half_mask_ops(case, structured):
+    status, detail = cf_diff.run_case("ps_half", HALF_CASES[case], 64, structured)
+    assert status == "match", detail
+
+
 def test_minimize_keeps_the_mismatch(monkeypatch):
     monkeypatch.setattr(rdna2spirv.Gen, "scc_logic", lambda self, a, r: self.scc_nonzero(r))
     body = [("probe", 1), ("op", "v_add_nc_u32 v8, 3, v8")] + SCC_MASK_CASES["s_and_b32 + s_cbranch_scc0"]
@@ -118,4 +141,5 @@ def test_generator_covers_every_shape():
                     walk(x)
     for i in range(200):
         walk(cf_diff.generate(random.Random(i), 32))
-    assert {"if", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe"} <= kinds
+    assert {"if", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe", "ifs",
+            "cexec", "halfexec", "halfscc", "scmpmask", "cselmask"} <= kinds
