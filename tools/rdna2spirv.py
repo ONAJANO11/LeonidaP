@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -10647,34 +10648,53 @@ def main():
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
-    for p in files:
+    total = len(files)
+    t0 = time.time()
+    last_progress = 0.0
+    label = f"shard {shard}" if shard is not None else "translate"
+    for i, p in enumerate(files, 1):
         name = os.path.splitext(os.path.basename(p))[0]
         try:
             asm = translate(p)
         except Unsupported as e:
             why[str(e)] += 1
-            continue
         except (IndexError, KeyError, ValueError) as e:
             why[f"translator error {type(e).__name__}"] += 1
-            continue
-        ok += 1
-        sa = os.path.join(a.out, name + ".spvasm")
-        sv = os.path.join(a.out, name + ".spv")
-        with open(sa, "w") as f:
-            f.write(asm)
-        r = assemble_spirv(sa, sv)
-        if r.returncode == 0:
-            valid += 1
-            try:
-                fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
-                meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
-            except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
-                meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
-            invalid.add(name)
-            why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
-        if a.no_asm and os.path.exists(sa):
-            os.remove(sa)
+            ok += 1
+            sa = os.path.join(a.out, name + ".spvasm")
+            sv = os.path.join(a.out, name + ".spv")
+            with open(sa, "w") as f:
+                f.write(asm)
+            r = assemble_spirv(sa, sv)
+            if r.returncode == 0:
+                valid += 1
+                try:
+                    fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
+                    meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
+                except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
+                    meta[name] = {"error": f"{type(e).__name__}: {e}"}
+            else:
+                invalid.add(name)
+                why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
+            if a.no_asm and os.path.exists(sa):
+                os.remove(sa)
+        now = time.time()
+        if total and (i == total or i % 100 == 0 or now - last_progress >= 15.0):
+            last_progress = now
+            pct = 100 * i // total
+            elapsed = now - t0
+            if 0 < i < total and elapsed > 0:
+                left = elapsed * (total - i) / i
+                if left < 60:
+                    eta = f", ~{int(left)}s left"
+                elif left < 3600:
+                    eta = f", ~{int(left) // 60}m left"
+                else:
+                    eta = f", ~{int(left) // 3600}h {int(left) // 60 % 60:02d}m left"
+            else:
+                eta = ""
+            print(f"  {label}: {i}/{total} ({pct}%){eta}", flush=True)
     import json as _js
     idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}

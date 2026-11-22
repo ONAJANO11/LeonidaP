@@ -128,9 +128,13 @@ folder that predates this record, reruns disassembly and translation while keepi
 The build records which translator sources produced the shaders. A change to those files reruns translation using the
 saved disassembly. Older work folders need one translation after upgrading to record this information.
 
-Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
-GPU driver and saves a pipeline cache, so the first boot doesn't compile them). The shader translation is the longest step: it runs
-on `--jobs` processes (half the CPU threads by default).
+Stages: `check` always runs first; then `shaders`, `assets` and `runtime` run together when selected (they do not
+depend on each other). `pipelines` starts once the translated shaders are ready and `vk_pipeline_check` exists, so it
+can overlap the rest of assets; it creates every translated shader on your GPU driver and saves a pipeline cache so
+the first boot doesn't compile them. The shader translation is the longest CPU step: it runs on `--jobs` processes
+(half the CPU threads by default). When shaders and assets share the machine, that budget is split between them and
+passed to `rpf9dump` as `--jobs`; a solo assets run still lets `rpf9dump` use every core. Progress lines include
+percent and a rough ETA for translation shards, asset steps, and overall stage completion.
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
 Opus streams to `work\assets\audio\wav` after the audio bank step; existing WAV files are skipped when a build resumes.

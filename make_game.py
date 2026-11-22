@@ -15,8 +15,8 @@ folder levels down). This script never decrypts or works around anything: it rea
 everything it makes under --out. The only thing it downloads is the third_party/rpf9-explorer submodule, when
 it is missing. Never share what it makes.
 
-Stages, in order (each skips work that is already done, so a stopped build continues where it left off):
-    check     file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
+Stages (each skips work that is already done, so a stopped build continues where it left off):
+    check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
               BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
@@ -25,6 +25,14 @@ Stages, in order (each skips work that is already done, so a stopped build conti
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
     pipelines create every translated shader on your GPU's driver (and every compute pipeline), report anything
               the driver rejects, and save the pipeline cache next to the port so the first boot doesn't compile
+
+shaders, assets and runtime do not depend on each other and run together after check. pipelines starts once the
+translated shaders are ready and vk_pipeline_check exists (from runtime, or already on disk), so it can overlap
+the rest of assets. When shaders and assets share the machine, --jobs is split between them and passed to
+rpf9dump; a solo assets run still lets rpf9dump use every core.
+
+Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
+weighted stage completion while they overlap).
 """
 import argparse
 import functools
@@ -38,6 +46,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -70,6 +79,99 @@ def log(msg: str) -> None:
 def fail(msg: str) -> "None":
     print(f"\nERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def fmt_duration(seconds: float) -> str:
+    """Short wall-clock remaining/elapsed text for progress lines."""
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m" if sec == 0 else f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+# Rough relative cost of each stage when run alone (docs: translate ~80 min, assets largest on disk,
+# pipelines ~2.8 h wall). Used only for overall percent while stages overlap; not a schedule.
+STAGE_WEIGHTS = {"shaders": 40, "assets": 45, "runtime": 2, "pipelines": 55}
+
+
+class Progress:
+    """Thread-safe counter that logs percent and ETA. total 0 logs once and stays quiet."""
+
+    def __init__(self, label: str, total: int, *, every_s: float = 5.0):
+        self.label = label
+        self.total = max(0, int(total))
+        self.done = 0
+        self.every_s = every_s
+        self._t0 = time.monotonic()
+        self._lock = threading.Lock()
+        self._last_log = 0.0
+        if self.total == 0:
+            log(f"{label}: nothing to do")
+        else:
+            self._emit(force=True)
+
+    def tick(self, n: int = 1, *, force: bool = False) -> None:
+        with self._lock:
+            self.done = min(self.total, self.done + max(0, n))
+            self._emit(force=force or self.done >= self.total)
+
+    def set(self, done: int, *, force: bool = False) -> None:
+        with self._lock:
+            self.done = min(self.total, max(0, int(done)))
+            self._emit(force=force or self.done >= self.total)
+
+    def _emit(self, *, force: bool) -> None:
+        if self.total <= 0:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_log) < self.every_s and self.done < self.total:
+            return
+        self._last_log = now
+        pct = 100 * self.done // self.total
+        elapsed = now - self._t0
+        if 0 < self.done < self.total:
+            left = elapsed * (self.total - self.done) / self.done
+            eta = f", ~{fmt_duration(left)} left"
+        elif self.done >= self.total and elapsed >= 1:
+            eta = f", {fmt_duration(elapsed)} elapsed"
+        else:
+            eta = ""
+        log(f"{self.label}: {self.done}/{self.total} ({pct}%){eta}")
+
+
+class StageBoard:
+    """Overall build percent from weighted stage completion (stages may finish out of order)."""
+
+    def __init__(self, stages: list[str]):
+        self.weights = {s: STAGE_WEIGHTS[s] for s in stages if s in STAGE_WEIGHTS}
+        self._done: set[str] = set()
+        self._t0 = time.monotonic()
+        self._lock = threading.Lock()
+        if self.weights:
+            log(f"build: 0% · waiting on {', '.join(self.weights)}")
+
+    def complete(self, name: str) -> None:
+        with self._lock:
+            if name not in self.weights or name in self._done:
+                return
+            self._done.add(name)
+            finished = sum(self.weights[s] for s in self._done)
+            total = sum(self.weights.values())
+            pct = 100 * finished // total if total else 100
+            left = [s for s in self.weights if s not in self._done]
+            elapsed = time.monotonic() - self._t0
+            if left and finished:
+                eta = f", ~{fmt_duration(elapsed * (total - finished) / finished)} left"
+            elif not left and elapsed >= 1:
+                eta = f", {fmt_duration(elapsed)} elapsed"
+            else:
+                eta = ""
+            rest = f" · still {', '.join(left)}" if left else ""
+            log(f"build: {pct}% · {name} done{rest}{eta}")
 
 
 def below_normal() -> None:
@@ -896,10 +998,23 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         which = f"0..{jobs - 1}" if len(todo) == jobs else ",".join(str(i) for i in todo)
         log(f"  rdna2spirv.py {disasm} --out {spirv} --shard {which}/{jobs}" + "".join(" " + e for e in extra))
     # --no-asm: keep only the .spv modules; the .spvasm text would add ~35 GB for the corpus
-    procs = [subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
-                               *extra])
-             for i in todo]
-    bad = [f"shard {i} exited with {r}" for i, r in zip(todo, [p.wait() for p in procs]) if r != 0]
+    procs = {i: subprocess.Popen([sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}",
+                                  "--no-asm", *extra])
+             for i in todo}
+    progress = Progress("shaders: translate", jobs, every_s=10.0)
+    progress.set(jobs - len(todo), force=True)
+    bad = []
+    while procs:
+        for i, p in list(procs.items()):
+            code = p.poll()
+            if code is None:
+                continue
+            del procs[i]
+            if code != 0:
+                bad.append(f"shard {i} exited with {code}")
+            progress.tick(force=True)
+        if procs:
+            time.sleep(1.0)
     if bad:
         fail("rdna2spirv.py: " + ", ".join(bad))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
@@ -947,7 +1062,7 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
-def assets(game: str, work: str, wav: bool, jobs: int) -> None:
+def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None) -> None:
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
         sys.path.insert(0, TOOLS)
@@ -955,14 +1070,14 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
 
     get_exporter = functools.cache(rpf9dump)
     out = os.path.join(work, "assets")
-    for rel in MODEL_ARCHIVES:
-        src = os.path.join(game, rel)
-        name = os.path.splitext(os.path.basename(rel))[0]
-        for mode in ("models", "textures"):
-            if os.path.isfile(os.path.join(out, name, mode, "manifest.json")):
-                continue
-            log(f"assets: {mode} from {rel}")
-            run([get_exporter(work), mode, src, out])
+
+    def dump(*parts: str) -> None:
+        """Run rpf9dump; pass --jobs only when the build overlaps another CPU-heavy stage."""
+        cmd = [get_exporter(work), *parts]
+        if dump_jobs is not None:
+            cmd.extend(["--jobs", str(dump_jobs)])
+        run(cmd)
+
     # Texture pools: data/ttdb/** and each pack's own pack/<name>/data/ttdb/** (pool names repeat across packs,
     # so pack pools go under ttpf_pack/<pack>/).
     pools = []
@@ -983,49 +1098,82 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     for _, name, dest, _ in info:
         key = (os.path.normcase(dest), os.path.normcase(name))
         counts[key] = counts.get(key, 0) + 1
+    pool_jobs = []
     for p, name, dest, rel in sorted(info, key=lambda x: os.path.getsize(x[0])):
         root = dest
         if counts[(os.path.normcase(dest), os.path.normcase(name))] > 1:
             root = os.path.join(dest, f"{name}~{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:12]}")
-        pool_dir = os.path.join(root, name)
+        pool_jobs.append((p, name, root, os.path.join(root, name)))
+
+    archive_todo = [(rel, mode) for rel in MODEL_ARCHIVES
+                    for mode in ("models", "textures")
+                    if not os.path.isfile(os.path.join(
+                        out, os.path.splitext(os.path.basename(rel))[0], mode, "manifest.json"))]
+    pool_todo = [(p, name, root, pool_dir) for p, name, root, pool_dir in pool_jobs
+                 if ttpf_manifest(pool_dir) is None]
+    # complete_pool may still rewrite DDS for pools that already have a manifest; count every pool once.
+    pool_follow = pool_jobs
+    need_audio = not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json"))
+    ogg = os.path.join(out, "audio", "ogg")
+    ogg_done = os.path.join(out, "audio", "ogg.done")
+    need_ogg = not os.path.isfile(ogg_done)
+    need_wav = bool(wav)
+    xma_dir = os.path.join(out, "audio", "xma")
+    xma_done = os.path.join(out, "audio", "xma.done")
+    need_xma = not os.path.isfile(xma_done)
+    ff = shutil.which("ffmpeg")
+    need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
+    total = (len(archive_todo) + len(pool_todo) + len(pool_follow) + int(need_audio) + int(need_ogg)
+             + int(need_wav) + int(need_xma) + int(need_xma_decode))
+    progress = Progress("assets", total, every_s=2.0)
+
+    for rel, mode in archive_todo:
+        src = os.path.join(game, rel)
+        log(f"assets: {mode} from {rel}")
+        dump(mode, src, out)
+        progress.tick(force=True)
+    for p, name, root, pool_dir in pool_todo:
+        log(f"assets: texture pool {os.path.relpath(p, game)}")
+        dump("ttpf", p, root)
+        if ttpf_manifest(pool_dir) is None:
+            fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+        progress.tick(force=True)
+    for p, name, root, pool_dir in pool_follow:
         manifest = ttpf_manifest(pool_dir)
         if manifest is None:
-            log(f"assets: texture pool {os.path.relpath(p, game)}")
-            run([get_exporter(work), "ttpf", p, root])
-            manifest = ttpf_manifest(pool_dir)
-            if manifest is None:
-                fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
+            fail(f"Texture exporter did not publish a complete manifest in {pool_dir}")
         written, blocked = ttpf_assets.complete_pool(p, pool_dir, manifest, settings)
         if written or blocked:
             log(f"assets: {name}: {written} full BCPack DDS written, {blocked} limited (see manifest.json)")
-    if not os.path.isfile(os.path.join(out, "audio", "audio_manifest.json")):
+        progress.tick(force=True)
+    if need_audio:
         log("assets: audio banks")
-        run([get_exporter(work), "audio", os.path.join(game, "audio.rpf"), out])
+        dump("audio", os.path.join(game, "audio.rpf"), out)
+        progress.tick(force=True)
     # The two audio steps below count as finished only by a marker written after they succeed: their folders are
     # created first and exist after a stopped run too.
-    ogg = os.path.join(out, "audio", "ogg")
-    ogg_done = os.path.join(out, "audio", "ogg.done")
-    if not os.path.isfile(ogg_done):
+    if need_ogg:
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
         mark(ogg_done, "awc_opus.py")
-    if wav:
+        progress.tick(force=True)
+    if need_wav:
         if not os.path.isdir(ogg):
             fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")
         # Opt-in: lossless Ogg Opus -> 16-bit PCM WAV, several times larger. Existing WAVs are skipped.
         log("assets: audio Ogg Opus -> PCM WAV")
         py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
-    xma_dir = os.path.join(out, "audio", "xma")
-    xma_done = os.path.join(out, "audio", "xma.done")
-    if not os.path.isfile(xma_done):
+        progress.tick(force=True)
+    if need_xma:
         log("assets: XMA2 streams")
-        run([get_exporter(work), "xma", os.path.join(game, "audio.rpf"), out])
+        dump("xma", os.path.join(game, "audio.rpf"), out)
         mark(xma_done, "rpf9dump xma")
+        progress.tick(force=True)
     # Every run: decodes what a stopped or failed run left, and everything once ffmpeg is installed later.
-    ff = shutil.which("ffmpeg")
     if ff:
         decode_xma(ff, xma_dir, jobs)
+        progress.tick(force=True)
     else:
         log("assets: ffmpeg not on PATH: XMA2 streams kept as .xma.wav (ffmpeg decodes them)")
     log("assets: done")
@@ -1054,6 +1202,7 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
     if not todo:
         return
     log(f"assets: XMA2 -> PCM WAV (ffmpeg), {len(todo)} stream(s)")
+    progress = Progress("assets: XMA2 decode", len(todo), every_s=5.0)
 
     def one(src: str) -> bool:
         dst = src[:-8] + ".wav"
@@ -1061,6 +1210,7 @@ def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
         # No stdin: ffmpeg reads it for key commands, which stops a build started in the background of a terminal.
         r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-c:a", "pcm_s16le", "-f", "wav", tmp],
                            stdin=subprocess.DEVNULL)
+        progress.tick()
         if r.returncode == 0 and os.path.isfile(tmp):
             os.replace(tmp, dst)
             return True
@@ -1206,6 +1356,82 @@ def pipelines(work: str, out: str, jobs: "int | None" = None) -> None:
     log("pipelines: done")
 
 
+def _invoke_stage(fn) -> None:
+    """Run a stage in a worker thread. fail() uses sys.exit; turn that into an exception the pool can collect
+    so siblings can finish before the process stops."""
+    try:
+        fn()
+    except SystemExit as e:
+        if e.code in (0, None):
+            return
+        raise RuntimeError(f"stage exited with {e.code}") from e
+
+
+def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
+                     runtime_build: str | None, emulate: bool, keep_emulated: bool,
+                     fallbacks: tuple[str, ...]) -> None:
+    """Run independent stages together after check. pipelines starts once shaders (if selected) and
+    vk_pipeline_check are ready, so it can overlap a still-running assets stage."""
+    cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
+    split = max(1, jobs // len(cpu_heavy)) if len(cpu_heavy) > 1 else jobs
+    dump_jobs = split if len(cpu_heavy) > 1 and "assets" in stages else None
+    shader_jobs = split if len(cpu_heavy) > 1 and "shaders" in stages else jobs
+    board = StageBoard([s for s in ("shaders", "assets", "runtime", "pipelines") if s in stages])
+
+    work_items: list[tuple[str, object]] = []
+    if "shaders" in stages:
+        work_items.append(("shaders", lambda: shaders(
+            game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)))
+    if "assets" in stages:
+        work_items.append(("assets", lambda: assets(game, work, wav, jobs, dump_jobs=dump_jobs)))
+    if "runtime" in stages:
+        work_items.append(("runtime", lambda: runtime(game, out, v, runtime_build, jobs)))
+
+    if len(work_items) > 1:
+        if dump_jobs is not None:
+            log(f"running {', '.join(n for n, _ in work_items)} in parallel "
+                f"(jobs split to {split} for shaders/assets)")
+        else:
+            log(f"running {', '.join(n for n, _ in work_items)} in parallel")
+
+    if not work_items and "pipelines" not in stages:
+        return
+
+    failed = False
+    with ThreadPoolExecutor(max_workers=max(1, len(work_items) + (1 if "pipelines" in stages else 0))) as ex:
+        futures = {name: ex.submit(_invoke_stage, fn) for name, fn in work_items}
+
+        def wait(name: str) -> bool:
+            """True when the stage finished cleanly. Marks the build failed on error."""
+            nonlocal failed
+            try:
+                futures[name].result()
+                board.complete(name)
+                return True
+            except Exception:
+                failed = True
+                return False
+
+        if "pipelines" in stages:
+            shaders_ok = wait("shaders") if "shaders" in futures else True
+            if shaders_ok:
+                # Checker may already be on disk from an earlier run; only wait on runtime when it is missing.
+                if not pipeline_check_exe() and "runtime" in futures:
+                    wait("runtime")
+                futures["pipelines"] = ex.submit(_invoke_stage, lambda: pipelines(work, out, jobs))
+
+        for name, fut in list(futures.items()):
+            try:
+                fut.result()
+                board.complete(name)
+            except Exception:
+                failed = True
+
+    if failed:
+        # The failing stage already printed through fail(); stop without a second message.
+        sys.exit(1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
     ap.add_argument("--game", help="your package folder (found automatically if left out)")
@@ -1313,14 +1539,9 @@ def main() -> int:
               fallbacks=fallbacks, jobs=a.jobs)
     log(f"building into {out} (work files in {work})")
     t0 = time.time()
-    if "shaders" in stages:
-        shaders(game, work, a.jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
-    if "assets" in stages:
-        assets(game, work, a.wav, a.jobs)
-    if "runtime" in stages:
-        runtime(game, out, v, runtime_build, a.jobs)
-    if "pipelines" in stages:
-        pipelines(work, out, a.jobs)
+    run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
+                     runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
+                     fallbacks=fallbacks)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 
