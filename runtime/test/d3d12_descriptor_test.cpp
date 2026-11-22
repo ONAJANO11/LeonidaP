@@ -25,6 +25,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/vulkan_portability.h"
 
 #include <algorithm>
 #include <array>
@@ -300,6 +301,14 @@ int main() {
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    // Whether the device's samplers take a LOD bias: MoltenVK's don't (portability subset, samplerMipLodBias false),
+    // so the runtime gives them mipLodBias 0 and the translated shaders apply the S#'s bias (--lod-bias-fallback).
+    const bool samplers_take_bias = leonida::sampler_mip_lod_bias(
+        reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            d.instance_proc(d.instance, "vkEnumerateDeviceExtensionProperties")),
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(d.instance_proc(d.instance, "vkGetPhysicalDeviceFeatures2")),
+        d.physical,
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties2")));
 
     constexpr UINT size = 8, texels = size * size, bytes = texels * 4;
     std::vector<std::uint8_t> results(4 * bytes), after_destruction(bytes), borders(3 * bytes), bgr_results(2 * bytes);
@@ -318,6 +327,7 @@ int main() {
         info.bindless_partially_bound = d.partially_bound;
         info.image_view_min_lod = d.image_view_min_lod;
         info.sampler_filter_minmax = d.sampler_filter_minmax;
+        info.sampler_mip_lod_bias = samplers_take_bias;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -1481,8 +1491,15 @@ int main() {
                         clamped, texels);
             EXPECT(wrapped == texels && clamped == texels);
 
-            // With LOD zero requested, opposite bias extremes select the first and last mips.
+            // With LOD zero requested, opposite bias extremes select the first and last mips. Where samplers take no
+            // bias the sampler gets mipLodBias 0 and samples mip 0 either way: the translated shader adds the bias
+            // there (tools/rdna2spirv.py --lod-bias-fallback, GPU-tested by ps_ssharp), and this GLSL shader doesn't.
             for (const auto& words : biased_samplers) {
+                if (!samplers_take_bias && words != negative_bias) {
+                    std::printf("literal sampler bias %.0f: not judged, the device's samplers take no LOD bias "
+                                "(MoltenVK); the translated shaders apply it\n", g::decode(words).lod_bias);
+                    continue;
+                }
                 SampleKeys key = keys[0];
                 std::memcpy(key.ssharp, words.data(), sizeof(key.ssharp));
                 std::array<std::uint8_t, bytes> pixels{};

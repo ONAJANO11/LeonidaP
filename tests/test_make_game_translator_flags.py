@@ -150,7 +150,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None):
+    def run_main(self, *extra_argv, per_vertex=None, lod_bias=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -158,6 +158,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_emulate", return_value=False), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_sampler_lod_bias", return_value=lod_bias), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -180,6 +181,16 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_lod_bias_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU's samplers take no LOD bias (MoltenVK), not where they do
+        or it can't tell; asked for explicitly, it is on everywhere. It comes after the f16 one (FALLBACK_FLAGS)."""
+        self.assertEqual(self.run_main(lod_bias=False), (("--lod-bias-fallback",),) * 2)
+        self.assertEqual(self.run_main(lod_bias=True), ((), ()))
+        self.assertEqual(self.run_main(lod_bias=None), ((), ()))
+        self.assertEqual(self.run_main("--lod-bias-fallback", lod_bias=True), (("--lod-bias-fallback",),) * 2)
+        self.assertEqual(self.run_main(per_vertex=False, lod_bias=False),
+                         (("--f16-interp-fallback", "--lod-bias-fallback"),) * 2)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,16 @@ MESH_COMPUTE = False
 # can use there.
 F16_HALVES = False
 F16_HALF_TOP = 29
+# --lod-bias-fallback: the S#'s LOD_BIAS applied by the shader, for devices whose samplers have no LOD bias
+# (VkPhysicalDevicePortabilitySubsetFeaturesKHR::samplerMipLodBias false: MoltenVK, since Metal samplers have none);
+# the runtime then creates every VkSampler with mipLodBias 0. Vulkan adds the sampler's bias to the base LOD before
+# the min/max clamp, so the shader adds it at the same point: a 2D implicit PS sample (sampled with Grad from the quad
+# derivatives) gets those gradients times 2^bias, another implicit PS sample takes it as the Bias operand (plus the
+# instruction's own bias for _b), an explicit LOD gets it added (_l) or is it (_lz, _c_lz, and implicit
+# samples outside the PS, which sample LOD 0), and _d scales its gradients by 2^bias. Gathers are unchanged: Vulkan
+# gathers ignore the sampler's bias, and image_gather4_l fetches at the given LOD on every device (Gen.ssharp_lod_bias).
+# image_get_lod queries at the coordinate times 2^bias, which adds the bias to the LOD the query computes.
+LOD_BIAS_FALLBACK = False
 
 
 def f16_half_location(n, half):
@@ -154,6 +164,7 @@ class Gen:
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
+        self.lod_bias_applied = False   # --lod-bias-fallback: a sample applies its S#'s LOD_BIAS (metadata)
         self.uses_psb = False
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` export, so that export's EXEC is kept
@@ -1640,6 +1651,13 @@ class Gen:
         f = [self.tof(self.load_reg("vgpr", r)) for r in addr[:2]]
         uv, lod = self.tmp(), self.tmp()
         self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+        sbias = self.ssharp_lod_bias(a[3])
+        if sbias is not None:
+            # --lod-bias-fallback: OpImageQueryLod returns (d_l - level_base, lambda'), and lambda' includes the
+            # sampler's bias, which the VkSampler no longer has. Querying at uv * 2^bias scales the derivatives, so
+            # log2(rho) and lambda' grow by the bias, and the device still applies the sampler's LOD range, mip
+            # filter and level clamp to the first component.
+            uv = self.scale_by_exp2(uv, "%v2float", sbias)
         self.emit(f"{lod} = OpImageQueryLod %v2float {si} {uv}")
         self.uses_query = True
         out = 0
@@ -7291,6 +7309,49 @@ class Gen:
             out.append(m)
         return tuple(out)
 
+    def ssharp_lod_bias(self, s_op):
+        """--lod-bias-fallback: the S#'s LOD_BIAS as a float id, or None when the flag is off or a literal S# has none.
+
+        SQ_IMG_SAMP_WORD2 [13:0], signed 5.8 fixed point (Mesa gfx10-rsrc.json; runtime/src/gfx10_descriptors.h
+        decode()), so -32..31.996 in steps of 1/256; int / 256 is exact in f32. Not clamped to the device's
+        maxSamplerLodBias: an implicit sample's Bias operand is clamped by the device (as the native path's
+        mipLodBias is by the runtime), an explicit LOD keeps the console's range."""
+        if not LOD_BIAS_FALLBACK:
+            return None
+        reg = s_op["r"] + 2
+        literal = self.sgpr_imm.get(reg)
+        if literal is not None:
+            value = (((literal & 0x3fff) ^ 0x2000) - 0x2000) / 256.0
+            if not value:
+                return None
+            self.lod_bias_applied = True
+            return self.fconst(value)
+        word = self.load_reg("sgpr", reg)
+        raw, signed, value, bias = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{raw} = OpBitFieldSExtract %uint {word} {self.cu(0)} {self.cu(14)}")
+        self.emit(f"{signed} = OpBitcast %int {raw}")
+        self.emit(f"{value} = OpConvertSToF %float {signed}")
+        self.emit(f"{bias} = OpFMul %float {value} {self.fconst(1.0 / 256.0)}")
+        self.lod_bias_applied = True
+        return bias
+
+    def scale_by_exp2(self, v: str, vtype: str, e: str) -> str:
+        """v * 2^e (e a float id), exact when e is an integer: Ldexp by floor(e), times Exp2 of the fraction (1 for
+        none, since Vulkan lets Exp2(0) be 3 ULP off)."""
+        fl, n, fr, ex, whole, m, s, out = (self.tmp() for _ in range(8))
+        self.emit(f"{fl} = OpExtInst %float %glsl Floor {e}")
+        self.emit(f"{n} = OpConvertFToS %int {fl}")
+        self.emit(f"{fr} = OpFSub %float {e} {fl}")
+        self.emit(f"{ex} = OpExtInst %float %glsl Exp2 {fr}")
+        self.emit(f"{whole} = OpFOrdEqual %bool {fr} %f0")
+        self.emit(f"{m} = OpSelect %float {whole} %f1 {ex}")
+        self.emit(f"{s} = OpExtInst %float %glsl Ldexp {m} {n}")
+        if vtype == "%float":
+            self.emit(f"{out} = OpFMul %float {v} {s}")
+        else:
+            self.emit(f"{out} = OpVectorTimesScalar {vtype} {v} {s}")
+        return out
+
     def clamp_gather_lod(self, lod: str, word_reg: int) -> str:
         """Clamp to S# word 1's unsigned 4.8 MIN_LOD and MAX_LOD before choosing the fetch mip.
 
@@ -7696,13 +7757,19 @@ class Gen:
             else:
                 uv = self.tmp()
                 self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
+            # --lod-bias-fallback: the S#'s LOD_BIAS where Vulkan would add the sampler's (LOD_BIAS_FALLBACK).
+            sbias = self.ssharp_lod_bias(a[3])
+            lod0 = sbias or "%f0"           # _lz, _c_lz and implicit samples outside the PS: LOD 0, plus the bias
             if typed_sample:
-                operands = "Lod %f0"
+                operands = f"Lod {lod0}"
                 if typed_implicit:
                     # Compute the quad gradients before the per-image format branch.
                     dx, dy = self.tmp(), self.tmp()
                     self.emit(f"{dx} = OpDPdx %v2float {uv}")
                     self.emit(f"{dy} = OpDPdy %v2float {uv}")
+                    if sbias is not None:
+                        # No Bias operand goes with Grad: 2^bias times both gradients is log2(rho) + bias.
+                        dx, dy = (self.scale_by_exp2(g, "%v2float", sbias) for g in (dx, dy))
                     operands = f"Grad {dx} {dy}"
 
                 def sample(image, cls, ty):
@@ -7719,10 +7786,29 @@ class Gen:
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b") and self.stage == "ps"
+            lod = f[ncoord] if kind == "_l" and len(f) > ncoord else None
+            if sbias is not None:
+                if kind == "_b" and bias is not None:
+                    total = self.tmp()
+                    self.emit(f"{total} = OpFAdd %float {bias} {sbias}")
+                    bias = total
+                elif kind == "" and implicit:
+                    bias = sbias
+                elif kind == "_l":
+                    if lod is None:
+                        lod = sbias
+                    else:
+                        total = self.tmp()
+                        self.emit(f"{total} = OpFAdd %float {lod} {sbias}")
+                        lod = total
+                elif kind == "_d":
+                    # No Bias operand goes with Grad: 2^bias times every gradient is log2(rho) + bias.
+                    vt = "%float" if ncoord == 1 else "%v2float"
+                    grads = tuple(self.scale_by_exp2(g, vt, sbias) for g in grads)
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit,
-                                                      f[ncoord] if kind == "_l" and len(f) > ncoord else None, bias)
+                                                      lod if kind == "_l" else sbias, bias)
                 off = None
 
             def opnd(mask, args):
@@ -7738,17 +7824,20 @@ class Gen:
             elif grads_fb is not None:
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad {grads_fb[0]} {grads_fb[1]}")
             elif kind == "":
-                self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
-                          f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', '%f0')}")
+                if self.stage == "ps":   # --lod-bias-fallback: the S# bias as the Bias operand
+                    self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}"
+                              f"{opnd('Bias', bias) if bias else opnd('', '')}")
+                else:
+                    self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod0)}")
             elif kind == "_lz":
-                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', '%f0')}")
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod0)}")
             elif kind == "_l":
-                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', f[ncoord] if len(f) > ncoord else '%f0')}")
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod or '%f0')}")
             elif kind == "_b" and self.stage == "ps":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('Bias', bias)}")
             elif kind == "_c_lz":
                 d = self.tmp()
-                self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', '%f0')}")
+                self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', lod0)}")
                 if d16:
                     # d16: the compare result is an f16 in the low half, as in the other d16 paths below. Until
                     # 2026-11-21 it was written as f32 bits, whose low half is 0 for every result (1.0 = 0x3f800000).
@@ -8265,11 +8354,12 @@ class Gen:
 
         The level is 0 for _lz / _c_lz (and for implicit samples outside the PS, which sample LOD 0), the given LOD
         for _l, and OpImageQueryLod's for implicit samples (plus the bias for _b), floored and clamped to the image's
-        levels. Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the
-        shift is exact for any address mode at that level. Only a trilinear blend of two levels differs: the
-        coarser level moves by offset / 2 of its texels instead of offset. Implicit samples become Grad samples with
-        the derivatives of the original coordinate (scaled by 2^bias for _b): the LOD and anisotropy are those of the
-        unshifted sample, even when the offset changes from pixel to pixel."""
+        levels; with --lod-bias-fallback the S#'s bias is in `lod` (_lz, _c_lz, or added to _l's) or in `bias`.
+        Texel offsets apply before wrapping and clamping, and an integer offset commutes with them, so the shift is
+        exact for any address mode at that level. Only a trilinear blend of two levels differs: the coarser level
+        moves by offset / 2 of its texels instead of offset. Implicit samples become Grad samples with the derivatives
+        of the original coordinate (scaled by 2^bias for a bias): the LOD and anisotropy are those of the unshifted
+        sample, even when the offset changes from pixel to pixel."""
         self.uses_query = True
         ci = lambda v: self.as_int(self.cu(v))
         lv, lvm = self.tmp(), self.tmp()
@@ -8283,17 +8373,17 @@ class Gen:
             uvs = self.tmp()
             self.emit(f"{uvs} = OpVectorShuffle %v2float {uv} {uv} 0 1")
         level_f = None
-        if kind == "_l":
-            level_f = lod if lod is not None else "%f0"
-        elif implicit:
+        if implicit:
             q, qx = self.tmp(), self.tmp()
             self.emit(f"{q} = OpImageQueryLod %v2float {si} {uvs}")
             self.emit(f"{qx} = OpCompositeExtract %float {q} 0")
             level_f = qx
-            if kind == "_b" and bias is not None:
+            if bias is not None:
                 qb = self.tmp()
                 self.emit(f"{qb} = OpFAdd %float {qx} {bias}")
                 level_f = qb
+        elif lod is not None or kind == "_l":    # --lod-bias-fallback: _lz / _c_lz take the S# bias as their LOD
+            level_f = lod if lod is not None else "%f0"
         if level_f is None:
             level = ci(0)
         else:
@@ -8326,7 +8416,7 @@ class Gen:
             dx, dy = self.tmp(), self.tmp()
             self.emit(f"{dx} = OpDPdx {vf} {uvs}")
             self.emit(f"{dy} = OpDPdy {vf} {uvs}")
-            if kind == "_b" and bias is not None:
+            if bias is not None:
                 e, ev, sdx, sdy = self.tmp(), self.tmp(), self.tmp(), self.tmp()
                 self.emit(f"{e} = OpExtInst %float %glsl Exp2 {bias}")
                 if spatial == 1:
@@ -11407,6 +11497,9 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["f16_halves"] = {str(n): [f16_half_location(n, 0), f16_half_location(n, 1)] for n in ns}
             if "mesh_compute" in m:     # tools/mesh_compute_vs.py exports them from the slot's raw params
                 m["mesh_compute"] = dict(m["mesh_compute"], f16_halves=m["f16_halves"])
+    if g.lod_bias_applied:
+        # --lod-bias-fallback: a sample applies its S#'s LOD_BIAS, so its VkSampler must have mipLodBias 0.
+        m["lod_bias_fallback"] = True
     if g.build_meta:
         m.update(g.build_meta)
     return m
@@ -11589,8 +11682,13 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--lod-bias-fallback", action="store_true",
+                    help="samples apply the S#'s LOD_BIAS themselves, for devices whose samplers have no LOD bias "
+                         "(portability subset samplerMipLodBias false: MoltenVK), where the runtime creates samplers "
+                         "with mipLodBias 0 (metadata: lod_bias_fallback)")
     a = ap.parse_args()
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global LOD_BIAS_FALLBACK
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
@@ -11599,6 +11697,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    LOD_BIAS_FALLBACK = a.lod_bias_fallback
     if a.merge:
         try:
             merged = merge_shard_parts(a.out)

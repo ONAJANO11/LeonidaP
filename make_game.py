@@ -764,7 +764,7 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--lod-bias-fallback", "lod_bias_fallback"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -865,6 +865,18 @@ def runtime_gpu_per_vertex():
         r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
                            capture_output=True, text=True, timeout=60)
         v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
+        return None if v is None else bool(v)
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def runtime_gpu_sampler_lod_bias():
+    """sampler_lod_bias as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where its
+    samplers take no LOD bias (portability subset without samplerMipLodBias: MoltenVK), None when it can't tell."""
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        v = json.loads(r.stdout.strip().splitlines()[-1]).get("sampler_lod_bias")
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
         return None
@@ -1291,6 +1303,10 @@ def main() -> int:
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader")
+    ap.add_argument("--lod-bias-fallback", action="store_true",
+                    help="samples apply the sampler's LOD bias themselves; on by itself when the runtime's GPU has "
+                         "samplers without one (MoltenVK), where the runtime creates them with mipLodBias 0. On "
+                         "another GPU the runtime keeps the bias in the sampler, so it would be applied twice")
     a = ap.parse_args()
     stages = STAGES
     if a.stages is not None:
@@ -1357,6 +1373,10 @@ def main() -> int:
         log("shaders: the GPU the runtime would use can't take PerVertexKHR inputs (MoltenVK, or no "
             "fragmentShaderBarycentric): translating with --f16-interp-fallback")
         a.f16_interp_fallback = True
+    if "shaders" in stages and not a.lod_bias_fallback and runtime_gpu_sampler_lod_bias() is False:
+        log("shaders: the GPU the runtime would use has samplers without a LOD bias (portability subset without "
+            "samplerMipLodBias: MoltenVK): translating with --lod-bias-fallback")
+        a.lod_bias_fallback = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,
               fallbacks=fallbacks, jobs=a.jobs)

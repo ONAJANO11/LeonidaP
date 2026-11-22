@@ -92,6 +92,10 @@ struct VulkanDeviceInfo {
     bool sampler_anisotropy = false;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
+    // The device's samplers take a LOD bias. False on a VK_KHR_portability_subset device without samplerMipLodBias
+    // (MoltenVK): samplers are then created with mipLodBias 0, and the shaders, translated with --lod-bias-fallback
+    // on such a GPU, apply the S#'s bias themselves (src/vulkan_portability.h).
+    bool sampler_mip_lod_bias = true;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
     bool calibrated_timestamps = false;
     // VK_EXT_conditional_rendering (with its conditionalRendering feature) is enabled: SetPredication works, and
