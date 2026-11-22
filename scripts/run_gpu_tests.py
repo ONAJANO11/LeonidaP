@@ -783,6 +783,20 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name in ("cs_lds_wave_exchange", "cs_w64x_lds_wave_exchange"):
+            # LDS exchange between the lanes of one wave without s_barrier (headers of the .asm files): every
+            # thread stores actual ^ expected, so the mismatch count must be 0. The wave64 one needs a 64-wide
+            # subgroup (or --wave64-emulate), the wave32 one asks for 32 lanes.
+            w64 = name.startswith("cs_w64x") and not w64_emulated()
+            env = dict(os.environ, **WAVE32_LANE_ENV) if name == "cs_lds_wave_exchange" else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "512", "zero64"] + (["--require-wave64"] if w64 else []), env=env)
+            if w64 and rc == 77:
+                results.append((name, None, "full 64-wide compute subgroups unavailable"))
+            elif name == "cs_lds_wave_exchange" and (skip := wave32_lane_skip(msg)):
+                results.append((name, None, str(skip)))
+            else:
+                results.append((name, rc == 0 and " 0 mismatches" in msg,
+                                next((ln for ln in msg.splitlines() if "mismatches" in ln), msg[-100:])))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))

@@ -1060,6 +1060,9 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                     values[res] = (~x).bit_length() - 1
             else:
                 raise UnsupportedConstruct(f"GLSL.std.450 {name}")
+        elif op == "OpControlBarrier" and constants.get(a[0]) == 3 and constants.get(a[1]) == 3:
+            pass    # Subgroup execution and memory scope (the translator's LDS order between lanes): the lanes
+            #         here run in lockstep, in program order, which is what the barrier asks of a real GPU
         else:
             raise UnsupportedConstruct(op)
 

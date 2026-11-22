@@ -34,8 +34,8 @@ TOTAL = (len(check.COMPUTE) + 5 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + 12)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures,
+         # ps_ssharp and the two LDS wave-exchange tests (cs_lds_wave_exchange, cs_w64x_lds_wave_exchange)
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -82,6 +82,18 @@ class Wave64Checks(unittest.TestCase):
                 return 0, "out[0..7] = " + " ".join(map(str, words)) + "\n"
             if name == "cs_cvt_f32_sat":
                 return cvt_answer(env)
+            if name == "cs_lds_wave_exchange":      # wave32, zero64 mode: 512 groups, every word must be 0
+                self.assertEqual(args, ("512", "zero64"))
+                return 0, "512 groups x 64: 0 mismatches\n"
+            if name == "cs_w64x_lds_wave_exchange":
+                self.assertEqual(args[:2], ("512", "zero64"))
+                if emulated:
+                    self.assertNotIn("--require-wave64", args)
+                    return 0, "512 groups x 64: 0 mismatches\n"
+                self.assertIn("--require-wave64", args)
+                if wavemask[0] == 77:
+                    return wavemask
+                return 0, "compute subgroup size: 64\n512 groups x 64: 0 mismatches\n"
             if name == "cs_fma_fused":
                 # The operands come in through VKC_SGPRS; without them the fused words are not produced.
                 self.assertEqual((env or {}).get("VKC_SGPRS"), check.FMA_FUSED_ENV["VKC_SGPRS"])
@@ -144,6 +156,7 @@ class Wave64Checks(unittest.TestCase):
             spirv = Path(tmp) / "spirv"
             spirv.mkdir()
             (spirv / "cs_wavemask.spv").touch()
+            (spirv / "cs_w64x_lds_wave_exchange.spv").touch()
             for name in (*WAVE64_DUMPS, *check.STORE_WORDS):
                 (spirv / f"{name}.spv").touch()
             if not missing_ballot:
@@ -168,7 +181,7 @@ class Wave64Checks(unittest.TestCase):
         self.assertRegex(out, r"cs_wavemask +SKIP")
         self.assertRegex(out, r"cs_wave64_ballot +SKIP")
         self.assertRegex(out, r"cs_exec64 +ok")
-        self.assertIn(f"{TOTAL - 5 - len(WAVE64_DUMPS)} of {TOTAL} pass, {5 + len(WAVE64_DUMPS)} skipped", out)
+        self.assertIn(f"{TOTAL - 6 - len(WAVE64_DUMPS)} of {TOTAL} pass, {6 + len(WAVE64_DUMPS)} skipped", out)
 
     def test_full_wave_checks_pass_with_expected_results(self):
         status, out = self.run_checks(*FULL_WAVE)

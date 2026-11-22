@@ -374,6 +374,11 @@ int main(int argc, char** argv) {
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
+    if (!std::strcmp(argv[3], "zero64")) {    // cs_lds_wave_exchange.asm: every thread stores actual ^ expected
+        for (uint32_t g = 0; g < groups; g++)
+            for (uint32_t t = 0; t < 64; t++)
+                if (out[g * 64 + t] != 0) { if (!bad) first_bad = g * 64 + t; bad++; }
+    }
     if (!std::strcmp(argv[3], "bvh")) {
         const uint32_t want[8] = {0x48, 0x40, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
         for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }

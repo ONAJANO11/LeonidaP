@@ -719,6 +719,9 @@ def test_nested_barrier_runs_in_barrier_rounds(stem, make_shader):
     asm = shader.translate()
     shader.validate(asm)
     assert rdna2spirv.translate.last_gen.control_flow == "barrier rounds"
+    # The subgroup barriers that order LDS accesses of one wave (lds_wave_order) may sit among the blocks; only
+    # workgroup-scope barriers are counted here.
+    asm = "\n".join(ln for ln in asm.splitlines() if ln.strip() != "OpControlBarrier %c3 %c3 %c108")
     blocks = asm[asm.index("OpSwitch %pcv"):asm.index("%sw_default = OpLabel")]
     assert "OpControlBarrier" not in blocks and "OpStore %x_bar %true" in blocks
     assert asm.count("OpControlBarrier") == 2

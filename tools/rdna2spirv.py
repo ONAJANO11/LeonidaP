@@ -41,6 +41,7 @@ STRUCTURED = True     # False (--dispatch-loop): every shader with branches as o
 WAVE64_EMULATE = False   # --wave64-emulate: wave64 compute/mesh shaders exact on any subgroup size (Gen.x_round)
 WAVE64_GRAPHICS = "warn"   # --wave64-graphics: tier C wave64 VS/PS/GS (not exact on 32-wide subgroups): warn | error | off
 W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for the summary line
+LDS_WAVE_ORDER = False   # --lds-wave-order on: subgroup barriers between conflicting LDS accesses of one wave (lds_wave_order)
 # --bary-fallback: raw barycentric reads come from an ordinary perspective-interpolated vec3 input (the location is
 # in the metadata as "bary_fallback_input") instead of BuiltIn BaryCoordKHR, for devices without
 # VK_KHR_fragment_shader_barycentric. Whatever feeds the stage before the PS (a pass-through geometry shader) writes
@@ -221,6 +222,12 @@ class Gen:
         self.x_mcache = {}         # emulate: wave_mask key -> (lo, hi) already exchanged in this block
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
+        self.lds_order = False     # native cs/ms: order the LDS accesses of one wave with subgroup barriers (lds_wave_order)
+        self.lds_entry = {}        # lds_order: block -> LDS accesses (kinds "r"/"w"/"a") not yet ordered when it starts
+        self.lds_pend = frozenset()  # lds_order: the same, at the instruction being translated
+        self.lds_barriers = 0      # lds_order: subgroup barriers emitted
+        self.lds_block = 0         # lds_order: the block being translated
+        self.lds_skip = set()      # lds_order: blocks where no barrier is emitted (lds_nonuniform_blocks)
         self.uses_storage3d = False
         self.uses_heap = False
         self.uses_codebase = False
@@ -2925,6 +2932,28 @@ class Gen:
         if writes:
             self.x_dirty.add((kind, "w"))
 
+    def lds_wave_order(self, op):
+        """Native cs/ms: LDS accesses of the lanes of one wave, in the order of the instructions. On hardware the
+        lanes of a wave run each instruction together and the LDS queue of a wave is in order, so a ds_read sees
+        what every lane's earlier ds_write stored, with at most an s_waitcnt in between (reductions, prefix sums,
+        transposes inside a wave). SPIR-V orders nothing between two invocations without a barrier: the
+        implementation may reorder the accesses (RADV did, shadPS4 #5285) and on a GPU with independent thread
+        scheduling the lanes of a subgroup may be at different instructions. Before an access that conflicts with an
+        earlier one that no barrier has ordered yet (lds_order_step) this emits one subgroup control barrier with
+        release/acquire on workgroup memory. It sits outside the EXEC selection of the access, in the block's
+        control flow, which is subgroup-uniform here: branches are wave-wide (s_cbranch_* reduce over the subgroup)
+        and every block runs for the whole wave, as the subgroup operations the blocks already use require."""
+        if op == "s_barrier":
+            self.lds_pend = frozenset()
+            return
+        kind = lds_access_kind(op)
+        if kind is None:
+            return
+        need, self.lds_pend = lds_order_step(self.lds_pend, kind)
+        if need and self.lds_block not in self.lds_skip:
+            self.emit(f"OpControlBarrier {self.cu(3)} {self.cu(3)} {self.cu(0x108)}")
+            self.lds_barriers += 1
+
     def g_vote(self, r, kind, b):
         """r = OpGroupNonUniform{Any,All} of bool b over the wave."""
         if not self.emulate:
@@ -3669,6 +3698,8 @@ class Gen:
         self.cur_uniform_readlane = bool(self.w64g) and id(ins) in self.w64g["uniform_readlane"]
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
+        elif self.lds_order:
+            self.lds_wave_order(base_op(ins["op"]))
         if ins["op"].endswith("_dpp"):
             return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
@@ -10819,6 +10850,7 @@ def translate(path):
         g.vm_latch = stage == "ps" and exec_changes_after_vm([insns], [[]])
         g.park_masks(([insns], [[]]))
         halves_analysis(g, [insns], [[]])
+        lds_order_setup(g, [insns], [[]])
         g.build_meta = _shader_meta.collect(path, info["name"], [insns], [[]],
                                             user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
         for ins in insns:
@@ -10892,12 +10924,15 @@ def translate(path):
                                         user_sgpr_limit=user_limit, system_sgprs=sys_sgprs)
 
     g.bar_rounds = needs_barrier_rounds(g, blocks, succ)
+    lds_order_setup(g, blocks, succ)
     g.x_seg = len(blocks) + 1           # emulate: continuation segments are numbered after "done" (len(blocks))
     for n, blk in enumerate(blocks):
         g.body = []
         g.block_label = f"%blk{n}"
         g.x_marks, g.x_dirty = [], set()
-        g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
+        g.lds_pend = g.lds_entry.get(n, frozenset())
+        g.lds_block = n
+        g.x_tok, g.x_mcache = {}, {}    # a register's value is only known from where this block wrote it
         g.x_gen += 1
         g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
         g.sgpr_imm.clear()
@@ -10960,6 +10995,115 @@ def translate(path):
 
 
 _DEF = re.compile(r"(%\w+) = (Op\w+)(?: (%\w+))?")
+
+
+_LDS_ATOMIC_NAMES = frozenset(Gen.LDS_ATOMICS) | {"ds_cmpst_b32"}
+
+
+def lds_access_kind(op):
+    """How a DS instruction touches LDS memory: "r" read, "w" write, "a" atomic (read-modify-write), None for
+    everything else (ds_bpermute/ds_permute/ds_swizzle move registers, not memory)."""
+    if not op.startswith("ds_"):
+        return None
+    if op.startswith("ds_read"):
+        return "r"
+    if op.startswith("ds_write"):
+        return "w"
+    name = op if op == "ds_wrxchg_rtn_b32" else op.replace("_rtn_", "_")
+    return "a" if name in _LDS_ATOMIC_NAMES else None
+
+
+def lds_order_step(pend, kind):
+    """(needs a barrier first, accesses still unordered afterwards) for one LDS access `kind` after the unordered
+    accesses `pend`. A read waits for writes and atomics (read after write), a write for everything (write after
+    read, write after write), an atomic for reads and writes: two atomics on one dword are ordered by the memory
+    model itself. The barrier orders everything before it, so `pend` starts again from this access."""
+    if kind == "r":
+        need = bool(pend & {"w", "a"})
+    elif kind == "w":
+        need = bool(pend)
+    else:
+        need = bool(pend & {"r", "w"})
+    return need, (frozenset() if need else pend) | {kind}
+
+
+def lds_entry_states(blocks, succ):
+    """Forward data flow of lds_order_step over the blocks: for each block the accesses that may still be unordered
+    when it starts (an s_barrier or an emitted subgroup barrier orders them). None when the code has no LDS access
+    that could need a barrier."""
+    def run(n, pend):
+        for ins in blocks[n]:
+            op = base_op(ins["op"])
+            if op == "s_endpgm" or op in BRANCHES:
+                break
+            if op == "s_barrier":
+                pend = frozenset()
+            elif (kind := lds_access_kind(op)) is not None:
+                pend = lds_order_step(pend, kind)[1]
+        return pend
+    if not any(lds_access_kind(base_op(i["op"])) for blk in blocks for i in blk):
+        return None
+    entry = {0: frozenset()}
+    work = [0]
+    while work:
+        n = work.pop()
+        out = run(n, entry[n])
+        for s in succ[n]:
+            new = entry.get(s, frozenset()) | out
+            if s not in entry or new != entry[s]:
+                entry[s] = new
+                work.append(s)
+    return entry
+
+
+_SCC_BRANCHES = ("s_cbranch_scc0", "s_cbranch_scc1")
+_B32_BITWISE = frozenset({f"s_{o}_b32" for o in ("and", "or", "xor", "andn2", "orn2", "nand", "nor", "xnor")})
+
+
+def lds_nonuniform_blocks(g, blocks, succ):
+    """Blocks in which lds_wave_order must not emit: those reachable through an SCC branch whose SCC may differ
+    between the lanes of one subgroup. The one known source (scc_logic): in a wave64 program a 32-bit bitwise
+    scalar op on one half of a lane mask takes the lane's own bit as SCC, so lanes of a subgroup can take
+    different sides of the following s_cbranch_scc0/1, and a subgroup barrier in the block behind it would be
+    reached by only part of the subgroup. A wave64 program is treated that way when it has such an op on EXEC /
+    VCC or on a register the lane-mask analysis sees holding a mask, and an SCC branch; every block reachable from
+    the successors of an SCC branch is then skipped (the branch's own block still runs for the whole wave).
+    Wave32 programs and wave64 programs without such an op: none (the vote of scc_from_mask makes SCC uniform)."""
+    if not g.wave64:
+        return set()
+    risky = False
+    for blk in blocks:
+        for ins in blk:
+            op = base_op(ins["op"])
+            if op in _B32_BITWISE and (g.lane_masks.get(id(ins)) or
+                                       any(x.get("k") == "special" and x.get("t", "").startswith(("exec", "vcc"))
+                                           for x in ins["args"])):
+                risky = True
+    if not risky:
+        return set()
+    skip, work = set(), []
+    for n, blk in enumerate(blocks):
+        term = next((base_op(i["op"]) for i in blk if base_op(i["op"]) in BRANCHES or base_op(i["op"]) == "s_endpgm"), None)
+        if term in _SCC_BRANCHES:
+            work += succ[n]
+    while work:
+        n = work.pop()
+        if n not in skip:
+            skip.add(n)
+            work += succ[n]
+    return skip
+
+
+def lds_order_setup(g, blocks, succ):
+    """Turn on lds_wave_order (option --lds-wave-order on, default off) for a native (not wave64-emulated:
+    x_memory_order starts a round, i.e. a barrier, there) compute or mesh shader that has LDS accesses; the entry
+    state of block 0 is empty."""
+    if LDS_WAVE_ORDER and g.stage in ("cs", "ms") and not g.emulate:
+        entry = lds_entry_states(blocks, succ)
+        g.lds_order = entry is not None
+        g.lds_entry = entry or {}
+        g.lds_pend = frozenset()
+        g.lds_skip = lds_nonuniform_blocks(g, blocks, succ) if g.lds_order else set()
 
 
 def needs_barrier_rounds(g, blocks, succ):
@@ -11320,6 +11464,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["wave64_graphics_reasons"] = g.w64g["reasons"]
         if g.w64g["idioms"]:
             m["wave64_graphics_idioms"] = g.w64g["idioms"]
+    if g.lds_order:
+        m["lds_wave_order"] = g.lds_barriers      # --lds-wave-order on: subgroup barriers emitted (0: none needed)
     if g.emulate:
         # Exact on any subgroup size: no subgroup operation, cross-lane data in %x_buf (workgroup memory).
         m["wave64_exchange"] = "workgroup"
@@ -11569,6 +11715,10 @@ def main():
                     help="wave64 vertex, pixel and geometry shaders that are not exact on 32-wide subgroups (tier C of "
                          "tools/wave64_halves.py): warn = count them in the summary and mark them in the index, "
                          "error = refuse them (Unsupported), off = skip the analysis")
+    ap.add_argument("--lds-wave-order", choices=("off", "on"), default="off",
+                    help="on: native compute/mesh shaders get an OpControlBarrier at Subgroup scope between "
+                         "conflicting LDS accesses of one wave that no s_barrier orders (metadata: lds_wave_order); "
+                         "default off, the output is then unchanged")
     ap.add_argument("--bary-fallback", action="store_true",
                     help="pixel shaders that read raw barycentrics take them from an ordinary interpolated input "
                          "(metadata: bary_fallback_input) instead of BaryCoordKHR, for devices without "
@@ -11591,10 +11741,12 @@ def main():
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
     a = ap.parse_args()
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global LDS_WAVE_ORDER
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
     WAVE64_GRAPHICS = a.wave64_graphics
+    LDS_WAVE_ORDER = a.lds_wave_order == "on"
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute

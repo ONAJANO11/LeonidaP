@@ -16,6 +16,7 @@ are also what a shader reads through s_getpc_b64 (the code base) at that offset.
 The stage comes from the name's prefix. Mesh and geometry shaders (ms_, gs_) also need a DXBC container with
 their signatures, which this doesn't make.
 The comment at the top of each .asm says which test program to run on the result and what it should print.
+With LEONIDA_LDS_WAVE_ORDER=1 the translator gets --lds-wave-order on (cs_lds_wave_exchange.asm is the test for it).
 With LEONIDA_FMA=khr (or glsl), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77) or --fma glsl.
 With LEONIDA_BARY_FALLBACK=1, pixel shaders that read raw barycentrics are translated with --bary-fallback, and
@@ -145,6 +146,8 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_LDS_WAVE_ORDER") == "1":   # subgroup barriers between LDS accesses of one wave
+        cmd += ["--lds-wave-order", "on"]
     if os.environ.get("LEONIDA_BARY_FALLBACK") == "1":   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr"):   # fused multiply-add as GLSL Fma (default) or OpFmaKHR

@@ -1280,6 +1280,11 @@ def main():
         results.append((name, compute_test(tools, spirv, name, "1", "dump",
                                            require_wave64=name not in WAVE32_DUMPS and not W64_EMULATED,
                                            expected_words=want, needs_32_lanes=name in WAVE32_LANE_DUMPS)))
+    # LDS exchange between the lanes of one wave without s_barrier: every thread's actual ^ expected must be 0
+    results.append(("cs_lds_wave_exchange", compute_test(tools, spirv, "cs_lds_wave_exchange", "512", "zero64",
+                                                         needs_32_lanes=True)))
+    results.append(("cs_w64x_lds_wave_exchange", compute_test(tools, spirv, "cs_w64x_lds_wave_exchange", "512", "zero64",
+                                                              require_wave64=not W64_EMULATED)))
     for name, want in BOUNDS:
         results.append((name, compute_test(tools, spirv, name, "1", "dump", expected_words=want)))
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
