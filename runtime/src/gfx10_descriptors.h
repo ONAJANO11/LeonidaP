@@ -152,14 +152,18 @@ inline constexpr bool is_image(const ImageWords& words) { return detail::get(wor
 // stay unchanged. D3D12 depth is at most 2048, so count - 1 and offset fit 11 bits.
 inline constexpr std::uint32_t volume_uav_flag = 0x80000000;
 inline constexpr std::uint32_t volume_uav_tag = 0xD7800000;
+inline constexpr std::uint32_t volume_uav_tag_mask = 0xff800000;
+// RGB9E5 emulation uses R32_UINT storage, not the logical float format in T# word 1. The same tag marks packed
+// 1D-family UAVs (without a W range). No ordinary SRV or raw hardware T# has this synthetic metadata.
+inline constexpr std::uint32_t packed_uav_flag = 0x00400000;
 inline constexpr std::uint32_t volume_uav_word(std::uint32_t offset, std::uint32_t count) {
     return volume_uav_tag | ((count - 1) << 11) | offset;
 }
 inline constexpr bool partial_volume_uav(const ImageWords& words, const Image& image) {
     const auto mip_depth = image.depth >> image.first_mip;
     return image.type == ImageType::image_3d && (words[4] & volume_uav_flag) &&
-           (words[7] & 0xffc00000) == volume_uav_tag &&
-           words[7] != volume_uav_word(0, mip_depth ? mip_depth : 1u);
+           (words[7] & volume_uav_tag_mask) == volume_uav_tag &&
+           (words[7] & ~packed_uav_flag) != volume_uav_word(0, mip_depth ? mip_depth : 1u);
 }
 
 inline constexpr float image_min_lod(const ImageWords& words) {

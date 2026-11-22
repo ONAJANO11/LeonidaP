@@ -184,6 +184,21 @@ class LoadOnlyShaders(unittest.TestCase):
             self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
             self.assertEqual(m.value(source[2], 0, 0), 6)
 
+    def test_2d_explicit_mip_d16_packs_only_selected_components(self):
+        listing = ["image_load_mip v0, v[4:6], s[0:7] dmask:0x9 dim:SQ_RSRC_IMG_2D d16",
+                   "s_waitcnt vmcnt(0)"]
+        m = Module(translate(listing))
+        self.assertEqual({image[0] for _, _, image in m.fetches()}, {"%float", "%uint", "%int"})
+        for rid, _, _ in m.fetches():
+            bits, = (r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
+            components = [int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits]
+            self.assertEqual(components, [0, 3])
+        # All three branches write just v0: R in the low half and A in the high half.
+        writes = [m.defs[ptr][1] for ptr in re.findall(r"^\s*OpStore (%\w+) ", m.text, re.MULTILINE)]
+        vgprs = [m.value(pointer[2], 0, 0) for pointer in writes if len(pointer) > 2 and pointer[1] == "%vgpr"]
+        self.assertEqual(vgprs.count(0), 3)
+        self.assertNotIn(1, vgprs)
+
     def test_no_storage_image_capability_and_no_storage_binding(self):
         for dim in DIMS:
             with self.subTest(dim=dim):
@@ -228,6 +243,40 @@ class LoadOnlyShaders(unittest.TestCase):
             bits = next(r for r, op, args in m.order if op == "OpBitcast" and args[1] == rid)
             comps = sorted(int(args[2]) for _, op, args in m.order if op == "OpCompositeExtract" and args[1] == bits)
             self.assertEqual(comps, [0, 3], "dmask 0x9: R into v0, A into v1")
+
+
+class TypedGatherShaders(unittest.TestCase):
+    def test_2d_gather_picks_the_sampled_type_and_selected_component(self):
+        for dst, modifier in (("v[0:3]", ""), ("v[0:1]", " d16")):
+            with self.subTest(modifier=modifier):
+                m = Module(translate([f"image_gather4_lz {dst}, v[4:5], s[0:7], s[8:11] "
+                                      f"dmask:0x2 dim:SQ_RSRC_IMG_2D{modifier}", "s_waitcnt vmcnt(0)"]))
+                types = set()
+                for rid, op, args in m.order:
+                    if op != "OpImageGather":
+                        continue
+                    types.add(args[0])
+                    self.assertEqual(m.value(args[3], 0, 0), 1)  # green
+                    sampled_op, sampled = m.defs[args[1]]
+                    self.assertEqual(sampled_op, "OpSampledImage")
+                    image_load, image = m.defs[sampled[1]]
+                    self.assertEqual(image_load, "OpLoad")
+                    _, chain = m.defs[image[1]]
+                    self.assertEqual(m.binding[chain[1]], 0)
+                    if modifier and args[0] != "%v4float":
+                        def uses(opcode, operand):
+                            return [(r, a) for r, op, a in m.order if op == opcode and operand in a[1:]]
+                        ((raw, _),) = uses("OpBitcast", rid)
+                        taps = {int(a[2]): r for r, a in uses("OpCompositeExtract", raw)}
+                        self.assertEqual(set(taps), {0, 1, 2, 3})
+                        for tap in (0, 2):
+                            ((lo, mask),) = uses("OpBitwiseAnd", taps[tap])
+                            ((hi, shift),) = uses("OpShiftLeftLogical", taps[tap + 1])
+                            self.assertEqual(m.value(mask[2], 0, 0), 0xffff)
+                            self.assertEqual(m.value(shift[2], 0, 0), 16)
+                            self.assertTrue(any(hi in a for _, a in uses("OpBitwiseOr", lo)))
+
+                self.assertEqual(types, {"%v4uint_st", "%v4int_st", "%v4float"})
 
 
 class StoreAndLoad(unittest.TestCase):
@@ -312,6 +361,7 @@ class TextureUavLoads(unittest.TestCase):
             for t4, t7, z, level, expected in (
                 (flag, tag, 1, 0, 4), (flag, tag, 2, 0, None), (flag, tag, 0xffffffff, 0, None),
                 (flag, tag, 0, 1, None), (0, tag, 2, 1, 2), (flag, 0, 2, 1, 2), (0, 0, 2, 1, 2),
+                (flag, tag | 0x00400000, 1, 0, 4), (flag, tag | 0x00400000, 2, 0, None),
             ):
                 with self.subTest(ty=image[0], t4=t4, t7=t7, z=z, level=level):
                     regs.update({("%sgpr", 20): t4, ("%sgpr", 23): t7, ("%vgpr", 10): z, ("%vgpr", 11): level})
@@ -327,6 +377,10 @@ class Validation(unittest.TestCase):
     def test_spirv_val_accepts_every_dimension(self):
         shaders = {dim: load_shader(dim) for dim in DIMS}
         shaders.update({"1D_ARRAY": uav_array_load(), "3D_MIP": volume_mip_load(), "MIXED_D16_MIP": mixed_d16_mip_loads()})
+        shaders["GATHER_D16"] = translate([
+            "image_gather4_lz v[0:1], v[4:5], s[0:7], s[8:11] dmask:0x2 dim:SQ_RSRC_IMG_2D d16",
+            "s_waitcnt vmcnt(0)",
+        ])
         with tempfile.TemporaryDirectory() as tmp:
             for dim, text in shaders.items():
                 with self.subTest(dim=dim):
