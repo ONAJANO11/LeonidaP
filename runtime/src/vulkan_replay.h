@@ -3045,23 +3045,39 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 colors[slot].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 colors[slot].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             }
-            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            VkRenderingAttachmentInfo depth_att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            VkRenderingAttachmentInfo stencil_att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            const bool has_depth = (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+            const bool has_stencil = (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
             if (p.depth.id) {
-                const VkImageLayout layout = image_layout(p.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                detail::to_attachment(vk, command_buffer, prepared_draw.depth, layout, depth_access, depth_stages,
+                const bool ro_depth = (draw->depth.dsv_flags & 1u) != 0;
+                const bool ro_stencil = (draw->depth.dsv_flags & 2u) != 0;
+                VkImageLayout desired = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                if ((ro_depth || !has_depth) && (ro_stencil || !has_stencil))
+                    desired = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                else if (ro_depth)
+                    desired = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL;
+                else if (ro_stencil)
+                    desired = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL;
+                const VkImageLayout layout = image_layout(p.depth.binding, desired);
+                const bool any_write = (has_depth && !ro_depth) || (has_stencil && !ro_stencil);
+                const VkAccessFlags daccess = any_write ? depth_access : VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+                detail::to_attachment(vk, command_buffer, prepared_draw.depth, layout, daccess, depth_stages,
                                       tracker, separate);
-                depth.imageView = p.depth.view;
-                depth.imageLayout = layout;
-                depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                depth_att.imageView = p.depth.view;
+                depth_att.imageLayout = layout;
+                depth_att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                depth_att.storeOp = ro_depth ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+                stencil_att = depth_att;
+                stencil_att.storeOp = ro_stencil ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
             }
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
             rendering.renderArea = {{0, 0}, p.area};
             rendering.layerCount = p.layers;  // array views: SV_RenderTargetArrayIndex picks the layer
             rendering.colorAttachmentCount = std::uint32_t(colors.size());
             rendering.pColorAttachments = colors.data();
-            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
-            if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            if (p.depth.id && has_depth) rendering.pDepthAttachment = &depth_att;
+            if (p.depth.id && has_stencil) rendering.pStencilAttachment = &stencil_att;
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};

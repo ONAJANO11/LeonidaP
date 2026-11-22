@@ -3804,6 +3804,9 @@ public:
                 log_once("depth-stencil view dimension not supported:", desc->ViewDimension);
                 view = {};
             }
+            if (desc && view.resource)
+                view.dsv_flags = static_cast<std::uint8_t>(
+                    desc->Flags & (D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL));
             if (r->desc().Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) view = {};
         } else if (resource) {
             stub("ID3D12Device::CreateDepthStencilView(resource from another device)");
