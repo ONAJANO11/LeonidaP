@@ -132,9 +132,20 @@ struct DeviceState {
         VkDeviceSize size = 0;
         std::mutex mutex;
         std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+
+        // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
+        // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
+        // most bytes live at once, which differs from it by fragmentation.
+        bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
+        VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
+        VkDeviceSize use_in_use[3] = {}, use_peak[3] = {};
+        std::uint64_t allocations = 0, failures = 0;
     } arena;
 
-    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out) {
+    enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader };
+    static constexpr const char* kArenaUseNames[3] = {"buffer", "descriptor heap", "shader"};
+
+    bool arena_allocate(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize& out, ArenaUse use) {
         std::lock_guard lock(arena.mutex);
         for (auto it = arena.free.begin(); it != arena.free.end(); ++it) {
             const VkDeviceSize start = (it->first + alignment - 1) / alignment * alignment;
@@ -145,13 +156,49 @@ struct DeviceState {
             if (start > block) arena.free[block] = start - block;
             if (start + bytes < end) arena.free[start + bytes] = end - (start + bytes);
             out = start;
+            ++arena.allocations;
+            arena.in_use += bytes;
+            arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
+            arena.peak_end = std::max(arena.peak_end, start + bytes);
+            arena.use_in_use[use] += bytes;
+            arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
+            if (arena.log)
+                std::fprintf(stderr, "[rt] d3d12: arena %s VA 0x%llx + 0x%llx\n", kArenaUseNames[use],
+                             (unsigned long long)start, (unsigned long long)bytes);
             return true;
         }
+        ++arena.failures;
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
+                         (unsigned long long)bytes);
         return false;
     }
 
-    void arena_release(VkDeviceSize offset, VkDeviceSize bytes) {
+    // A console VA outside the arena (an upload or readback buffer: its device address minus heap_base).
+    void log_va(const char* what, std::uint64_t va, VkDeviceSize bytes) {
+        if (arena.log)
+            std::fprintf(stderr, "[rt] d3d12: %s VA 0x%llx + 0x%llx (outside the arena)\n", what,
+                         (unsigned long long)va, (unsigned long long)bytes);
+    }
+
+    // Printed once at device release, so a run reports the size the arena needs.
+    void report_arena() {
         std::lock_guard lock(arena.mutex);
+        if (!arena.size) return;
+        const double mib = 1.0 / (1 << 20);
+        std::fprintf(stderr,
+                     "[rt] d3d12: GPU address arena: peak end %.1f of %.1f MiB (%.1f%%), peak live %.1f MiB "
+                     "(buffers %.1f, descriptor heaps %.1f, shaders %.1f), %llu allocations, %llu refused\n",
+                     arena.peak_end * mib, arena.size * mib, 100.0 * double(arena.peak_end) / double(arena.size),
+                     arena.peak_in_use * mib, arena.use_peak[arena_buffer] * mib,
+                     arena.use_peak[arena_descriptor_heap] * mib, arena.use_peak[arena_shader] * mib,
+                     (unsigned long long)arena.allocations, (unsigned long long)arena.failures);
+    }
+
+    void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
+        std::lock_guard lock(arena.mutex);
+        arena.in_use -= bytes;
+        arena.use_in_use[use] -= bytes;
         auto it = arena.free.emplace(offset, bytes).first;
         if (auto next = std::next(it); next != arena.free.end() && it->first + it->second == next->first) {
             it->second += next->second;
@@ -237,7 +284,7 @@ public:
     DescriptorHeap(DeviceState& device, const D3D12_DESCRIPTOR_HEAP_DESC& desc) : device_(device), desc_(desc) {
         const VkDeviceSize bytes = VkDeviceSize(desc.NumDescriptors) * kDescriptorSize;
         if ((desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped &&
-            device.arena_allocate(bytes, 256, arena_offset_)) {
+            device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
             in_arena_ = true;
             cpu_ = device.arena.mapped + arena_offset_;
             std::memset(cpu_, 0, std::size_t(bytes));
@@ -248,7 +295,8 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize);
+        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                            DeviceState::arena_descriptor_heap);
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override { return desc_; }
@@ -284,7 +332,7 @@ public:
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         device_.context->remove_resource(id());
-        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width);
+        if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_) vk.vkDestroyImage(dev, image_, nullptr);
         if (buffer_) vk.vkDestroyBuffer(dev, buffer_, nullptr);
         if (memory_) vk.vkFreeMemory(dev, memory_, nullptr);
@@ -302,7 +350,8 @@ public:
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
         if (!host && device_.arena.mapped) {
-            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_)) {
+            if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                        DeviceState::arena_buffer)) {
                 log_once("GPU address arena full (raise LEONIDA_ARENA_MB); buffer size in KiB:",
                          int(desc_.Width / 1024));
                 return E_OUTOFMEMORY;
@@ -338,6 +387,8 @@ public:
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             address.buffer = buffer_;
             va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+            device_.log_va(heap_.Type == D3D12_HEAP_TYPE_READBACK ? "readback buffer" : "upload buffer", va_,
+                           desc_.Width);
         }
         if (host) {
             if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
@@ -600,7 +651,7 @@ public:
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
-        if (code_bytes_) device_.arena_release(code_base_, code_bytes_);
+        if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
     // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
@@ -865,7 +916,7 @@ public:
 
         if (code_stage) {
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
             std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
             code_bytes_ = code_stage->fssm.size();
             code_base_ = offset;
@@ -934,7 +985,7 @@ public:
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64.
         VkDeviceSize offset = 0;
-        if (!device_.arena_allocate(fssm.size(), 256, offset)) return E_OUTOFMEMORY;
+        if (!device_.arena_allocate(fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
         std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
         code_bytes_ = fssm.size();
         code_base_ = offset;
@@ -1035,6 +1086,10 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         arena.free[64 * 1024] = arena.size - 64 * 1024;
+        arena.peak_end = 64 * 1024;
+        char log[4] = {};
+        length = 0;
+        arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         return true;
     }
@@ -1044,6 +1099,7 @@ public:
             std::lock_guard lock(state_.context->submit_mutex());
             state_.context->vk.vkDeviceWaitIdle(state_.info.device);
         }
+        state_.report_arena();
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
