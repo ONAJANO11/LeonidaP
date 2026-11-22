@@ -30,6 +30,7 @@ import json
 import os
 import struct
 import sys
+import unicodedata
 
 MAGIC = b"FSPX"
 DXBC = b"DXBC"
@@ -161,6 +162,82 @@ def unpack_payload(payload: bytes):
     return (meta, blob), 0
 
 
+_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
+
+
+def _case_insensitive_volume(path: str) -> bool:
+    """True when the volume holding `path` ignores letter case (macOS default APFS/HFS+)."""
+    if sys.platform != "darwin":
+        return False
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    try:
+        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
+    except (OSError, ValueError):
+        return True
+
+
+def _path_key(path: str) -> str:
+    resolved = os.path.normcase(os.path.realpath(path))
+    if _case_insensitive_volume(resolved):
+        resolved = unicodedata.normalize("NFD", resolved.casefold())
+    return resolved
+
+
+def _same_dir(first: str, second: str) -> bool:
+    if _path_key(first) == _path_key(second):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def _collides_with_input(out_path: str, input_path: str) -> bool:
+    """True when writing `out_path` would overwrite or case-collide with `input_path`."""
+    if _path_key(out_path) == _path_key(input_path):
+        return True
+    try:
+        if os.path.samefile(out_path, input_path):
+            return True
+    except OSError:
+        pass
+    out_abs = os.path.abspath(out_path)
+    out_dir = os.path.dirname(out_abs)
+    out_name = unicodedata.normalize("NFD", os.path.basename(out_abs).casefold())
+    for candidate in (os.path.abspath(input_path), os.path.realpath(input_path)):
+        cand_dir = os.path.dirname(candidate)
+        cand_name = unicodedata.normalize("NFD", os.path.basename(candidate).casefold())
+        if out_name == cand_name and _same_dir(out_dir, cand_dir):
+            return True
+    return False
+
+
+def _validate_out_dir(out_dir: str, need_disasm: bool) -> str:
+    """Return an error string if `out_dir` (or its required subfolders) cannot be a directory, else ""."""
+    if not out_dir:
+        return "--out must not be empty"
+    cur = os.path.abspath(out_dir)
+    while True:
+        if os.path.lexists(cur):
+            if not os.path.isdir(cur):
+                return f"--out {out_dir}: {cur} is not a directory"
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    subdirs = ["fspx", "disasm"] if need_disasm else ["fspx"]
+    for sub in subdirs:
+        sub_path = os.path.join(out_dir, sub)
+        if os.path.lexists(sub_path) and not os.path.isdir(sub_path):
+            return f"--out {out_dir}: {sub_path} is not a directory"
+    return ""
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Unpack the FSPX compute programs in FidelityFX shader containers.")
     ap.add_argument("files", nargs="+", help="the DLL, .dxbc containers or bare FSPX payloads")
@@ -170,18 +247,32 @@ def main(argv=None) -> int:
                     help="llvm-mc CPU for --disasm (default gfx1030: the programs use v_dot4 instructions, which "
                          "gfx1010 and gfx1013 do not decode)")
     a = ap.parse_args(argv)
-    os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
-    disasm = None
-    if a.disasm:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
-        disasm = shader_disasm
-        os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
-    index, bad = [], 0
+    if problem := _validate_out_dir(a.out, a.disasm):
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
+    invalid = False
+    for path in a.files:
+        if os.path.isdir(path):
+            print(f"{path}: is a directory", file=sys.stderr)
+            invalid = True
+        elif not os.path.exists(path):
+            print(f"{path}: file not found", file=sys.stderr)
+            invalid = True
+        elif not os.path.isfile(path):
+            print(f"{path}: not a file", file=sys.stderr)
+            invalid = True
+    if invalid:
+        return 1
+
+    planned, bad = [], 0
     used_names = set()
     for path in a.files:
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            print(f"{path}: {e.strerror or e}", file=sys.stderr)
+            return 1
         stem = os.path.splitext(os.path.basename(path))[0]
         if data[:4] == MAGIC:
             items = [(0, None, data)]
@@ -213,23 +304,59 @@ def main(argv=None) -> int:
                 entry["threads"] = meta["threads"]
             if "wave32" in meta:
                 entry["wave32"] = meta["wave32"]
-            if container:
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
-            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
-                f.write(blob[6])
-            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(meta, f, indent=1)
-            if disasm and meta["code"]["end"]:
-                start, end = meta["code"]["start"], meta["code"]["end"]
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
-                entry["invalid_words"] = invalid
-                with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
-                    f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
-                    f.write(asm)
-                    if err.strip():
-                        f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
-            index.append(entry)
+            planned.append((name, container, meta, blob, entry))
+
+    output_paths = []
+    for name, container, meta, _, _ in planned:
+        if container:
+            output_paths.append(os.path.join(a.out, name + ".dxbc"))
+        output_paths.append(os.path.join(a.out, "fspx", name + ".code"))
+        output_paths.append(os.path.join(a.out, "fspx", name + ".json"))
+        if a.disasm and meta["code"]["end"]:
+            output_paths.append(os.path.join(a.out, "disasm", name + ".s"))
+    output_paths.append(os.path.join(a.out, "index.json"))
+
+    for out_path in output_paths:
+        if os.path.isdir(out_path):
+            print(f"error: output path is a directory: {out_path}", file=sys.stderr)
+            return 1
+        for input_path in a.files:
+            if _collides_with_input(out_path, input_path):
+                print(f"error: refusing to overwrite input {input_path} with {out_path}", file=sys.stderr)
+                return 1
+
+    disasm = None
+    if a.disasm:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import shader_disasm  # noqa: E402  (resolves LLVM_MC at import)
+        disasm = shader_disasm
+    try:
+        os.makedirs(os.path.join(a.out, "fspx"), exist_ok=True)
+        if disasm:
+            os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
+    except OSError as e:
+        print(f"error: --out {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 1
+
+    index = []
+    for name, container, meta, blob, entry in planned:
+        if container:
+            with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                f.write(container)
+        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+            f.write(blob[6])
+        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(meta, f, indent=1)
+        if disasm and meta["code"]["end"]:
+            start, end = meta["code"]["start"], meta["code"]["end"]
+            asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu)
+            entry["invalid_words"] = invalid
+            with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
+                f.write(asm)
+                if err.strip():
+                    f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+        index.append(entry)
     with open(os.path.join(a.out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(index, f, indent=1)
     print(f"{len(index)} FSPX program(s) unpacked to {a.out}" + (f", {bad} input(s) failed" if bad else ""))
