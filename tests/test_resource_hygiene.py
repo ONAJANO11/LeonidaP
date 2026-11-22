@@ -40,6 +40,7 @@ class ResourceHygieneTest(unittest.TestCase):
             "tools/shader_disasm.py",
             "tools/hashdict.py",
             "tools/d3d12_xs_surface.py",
+            "tools/saves.py",
         ):
             with self.subTest(file=rel):
                 bare = _bare_open_calls(ROOT / rel)

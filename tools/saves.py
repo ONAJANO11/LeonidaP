@@ -218,9 +218,34 @@ def info(paths):
             info_file(p)
 
 
+def same_path(first, second):
+    if not first or not second:
+        return False
+    a, b = os.path.normcase(os.path.abspath(first)), os.path.normcase(os.path.abspath(second))
+    if a == b:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def is_inside_dir(target, directory):
+    try:
+        root = os.path.normcase(os.path.abspath(directory))
+        t = os.path.normcase(os.path.abspath(target))
+        return os.path.dirname(t) == root or t.startswith(root + os.sep)
+    except (ValueError, OSError):
+        return False
+
+
 def extract(p, out):
+    if os.path.isfile(out) or same_path(p, out):
+        raise ValueError(f"output destination {out} is an existing file")
     d = read(p)
     k = kind_of(d)
+    if k not in ('JSAV', 'ASAV'):
+        raise ValueError(f'{p}: extract supports JSAV and ASAV')
     os.makedirs(out, exist_ok=True)
     if k == 'JSAV':
         h, es = parse_jsav(d)
@@ -254,8 +279,6 @@ def extract(p, out):
             except ValueError as ex:
                 print('payload looks like text but did not parse as JSON:', ex)
         print(f'ASAV kind {h["kind"]} ({h["slot_name"]}) -> {out}')
-    else:
-        sys.exit(f'{p}: extract supports JSAV and ASAV')
 
 
 def pack_from_dir(src):
@@ -267,6 +290,13 @@ def pack_from_dir(src):
 
 
 def pack(src, out):
+    if not os.path.isdir(src):
+        raise ValueError(f"source {src} is not a directory")
+    if os.path.isdir(out):
+        raise ValueError(f"cannot write packed save to existing directory {out}")
+    if same_path(src, out) or is_inside_dir(out, src):
+        raise ValueError(f"output file {out} cannot be inside the source directory {src}")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     data = pack_from_dir(src)
     with open(out, 'wb') as f:
         f.write(data)
@@ -458,7 +488,14 @@ def import_saves(args):
     print(f'wrote {len(plan)} blobs under {root}')
 
 
-def main(argv):
+def main(argv=None):
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+    if argv is None:
+        argv = sys.argv
     if len(argv) < 2 or argv[1] in ('-h', '--help'):
         print(__doc__)
         return 0
@@ -487,4 +524,4 @@ def main(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv))
+    sys.exit(main())

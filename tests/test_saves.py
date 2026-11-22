@@ -403,5 +403,126 @@ class MalformedJsavTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class RedirectedConsoleEncodingTest(unittest.TestCase):
+    """`saves.py` must survive paths that no single-byte code page can write when stdout is redirected."""
+
+    def test_redirected_console_replaces_unencodable_character(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "save_\ue9c3")
+            os.makedirs(folder, exist_ok=True)
+            save_path = os.path.join(folder, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            out = os.path.join(folder, "extracted")
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "cp1252"
+            p = subprocess.run([sys.executable, "-I", TOOL, "extract", save_path, out],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, f"failed with: {p.stderr}")
+            self.assertIn("blocks ->", p.stdout)
+
+
+class CliPathValidationTest(unittest.TestCase):
+    """Destination and source path validation for extract and pack."""
+
+    def test_extract_refuses_existing_file_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_path = os.path.join(tmp, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            dest_file = os.path.join(tmp, "exists.txt")
+            with open(dest_file, "w") as f:
+                f.write("existing")
+            with self.assertRaises(ValueError) as ctx:
+                saves.extract(save_path, dest_file)
+            self.assertIn("existing file", str(ctx.exception))
+            p = subprocess.run([sys.executable, "-I", TOOL, "extract", save_path, dest_file],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("ERROR:", p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+
+    def test_extract_refuses_same_input_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_path = os.path.join(tmp, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            with self.assertRaises(ValueError) as ctx:
+                saves.extract(save_path, save_path)
+            self.assertIn("existing file", str(ctx.exception))
+
+    def test_pack_refuses_missing_or_file_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing")
+            with self.assertRaises(ValueError) as ctx:
+                saves.pack(missing, os.path.join(tmp, "out.jsav"))
+            self.assertIn("is not a directory", str(ctx.exception))
+
+            a_file = os.path.join(tmp, "file.txt")
+            with open(a_file, "w") as f:
+                f.write("text")
+            with self.assertRaises(ValueError) as ctx:
+                saves.pack(a_file, os.path.join(tmp, "out.jsav"))
+            self.assertIn("is not a directory", str(ctx.exception))
+
+    def test_pack_refuses_existing_directory_as_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_path = os.path.join(tmp, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            extracted = os.path.join(tmp, "extracted")
+            with contextlib.redirect_stdout(io.StringIO()):
+                saves.extract(save_path, extracted)
+            dest_dir = os.path.join(tmp, "target_dir")
+            os.makedirs(dest_dir, exist_ok=True)
+            with self.assertRaises(ValueError) as ctx:
+                saves.pack(extracted, dest_dir)
+            self.assertIn("existing directory", str(ctx.exception))
+
+    def test_pack_refuses_out_inside_source_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_path = os.path.join(tmp, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            extracted = os.path.join(tmp, "extracted")
+            with contextlib.redirect_stdout(io.StringIO()):
+                saves.extract(save_path, extracted)
+            out_inside = os.path.join(extracted, "index.json")
+            with self.assertRaises(ValueError) as ctx:
+                saves.pack(extracted, out_inside)
+            self.assertIn("cannot be inside the source directory", str(ctx.exception))
+
+    def test_pack_creates_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_path = os.path.join(tmp, "test.jsav")
+            data, _, _ = make_jsav()
+            with open(save_path, "wb") as f:
+                f.write(data)
+            extracted = os.path.join(tmp, "extracted")
+            with contextlib.redirect_stdout(io.StringIO()):
+                saves.extract(save_path, extracted)
+                nested_out = os.path.join(tmp, "nested", "sub", "rebuilt.jsav")
+                saves.pack(extracted, nested_out)
+            self.assertTrue(os.path.isfile(nested_out))
+            with open(nested_out, "rb") as f:
+                self.assertEqual(f.read(), data)
+
+    def test_main_defaults(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(saves.main(["saves.py", "--help"]), 0)
+            old_argv = sys.argv
+            try:
+                sys.argv = ["saves.py", "-h"]
+                self.assertEqual(saves.main(), 0)
+                self.assertEqual(saves.main(None), 0)
+            finally:
+                sys.argv = old_argv
+
+
 if __name__ == "__main__":
     unittest.main()
