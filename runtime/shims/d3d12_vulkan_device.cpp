@@ -307,6 +307,12 @@ leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC
     return {id, slices.MipSlice, slices.FirstWSlice, count};
 }
 
+bool texture_atomic64(const D3D12_RESOURCE_DESC& desc, bool enabled, bool castable_uint = false) {
+    return enabled && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count <= 1 &&
+           (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+           (desc.Format == DXGI_FORMAT_R32G32_UINT || desc.Format == DXGI_FORMAT_R32G32_TYPELESS || castable_uint);
+}
+
 // The VkImage a texture description becomes, with its mip count already resolved (MipLevels != 0). Shared by
 // texture creation and GetResourceAllocationInfo, so the sizes reported are the sizes later allocated.
 // Keeps the optional VkImageFormatListCreateInfo alongside VkImageCreateInfo so info.pNext stays valid.
@@ -317,10 +323,10 @@ struct TextureCreateInfo {
     VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
     std::array<VkFormat, 2> view_formats{};
 
-    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable) {
+    TextureCreateInfo(const D3D12_RESOURCE_DESC& desc, const Format& format, bool attachment_usable, bool atomic64) {
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
-        info.flags = format.typeless ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        info.flags = format.typeless || atomic64 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
         if (volume && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
             info.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
         info.imageType = volume ? VK_IMAGE_TYPE_3D : one_d ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
@@ -677,6 +683,7 @@ struct DeviceState {
         VkImageView sampled;
         VkImageView storage;  // the same range without a component mapping, for the storage bindings; or null
         std::uint64_t address;
+        std::array<VkImageView, 2> atomic64{};
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
     std::mutex descriptor_mutex;  // the set and the containers below
@@ -721,6 +728,8 @@ struct DeviceState {
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
+        for (VkImageView view : entry.atomic64)
+            if (view) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, view);
     }
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
@@ -728,7 +737,7 @@ struct DeviceState {
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false) {
+                    bool allow_channel_cast = false, bool r9g9b9e5_as_r32_uint = false, bool atomic64 = false) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
@@ -812,6 +821,12 @@ struct DeviceState {
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
+        const auto discard_views = [&] {
+            for (VkImageView view : entry.atomic64)
+                if (view) vk.vkDestroyImageView(info.device, view, nullptr);
+            if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+            vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+        };
         leonida::StorageViews views{};
         if (storage) {
             VkImageViewCreateInfo storage_info = view_info;
@@ -824,19 +839,32 @@ struct DeviceState {
                 storage_info.pNext = &storage_usage;
             }
             if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
-                vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+                discard_views();
                 return false;
             }
             const int numeric = numeric_class(storage_format);
             (numeric == 1 ? views.as_uint : numeric == 2 ? views.as_sint : views.as_float) = entry.storage;
             if (storage_format == VK_FORMAT_R32_UINT) views.r32ui = entry.storage;
+            if (atomic64 && storage_format == VK_FORMAT_R32G32_UINT) {
+                // R32G32_UINT is the D3D12 format for both int64_t and uint64_t. Only the atomic bindings
+                // reinterpret it as a single component. Restrict the aliases to storage-image usage.
+                storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+                storage_info.pNext = &storage_usage;
+                for (std::size_t i = 0; i < entry.atomic64.size(); ++i) {
+                    storage_info.format = leonida::bindless::atomic64_formats[i];
+                    if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.atomic64[i]) != VK_SUCCESS) {
+                        discard_views();
+                        return false;
+                    }
+                }
+                views.atomic64 = entry.atomic64;
+            }
         }
         // Every state a shader can read or write the texture in is GENERAL (ResourceBinding::sampled_in_general).
         entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
         if (!entry.index) {
             log_once("a bindless image array is full; dimension", int(dimension));
-            vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
-            if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
+            discard_views();
             return false;
         }
         if (existing != image_entries.end()) {
@@ -1231,6 +1259,7 @@ public:
                std::find(view_formats_.begin(), view_formats_.end(), format) != view_formats_.end();
     }
     bool r9g9b9e5_as_r32_uint() const { return r9g9b9e5_as_r32_uint_; }
+    bool atomic64_views() const { return atomic64_views_; }
     VkImageAspectFlags aspects() const { return aspects_; }
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
@@ -1378,7 +1407,10 @@ public:
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
-        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
+        const auto uint_cast = std::find(castable.begin(), castable.end(), VK_FORMAT_R32G32_UINT);
+        atomic64_views_ = texture_atomic64(desc_, device_.info.image_int64_atomics && device_.bindless,
+                                           uint_cast != castable.end());
+        TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format), atomic64_views_);
         VkImageCreateInfo& info = create.info;
         if (!castable.empty()) {
             // D3D12 always allows a view in the resource's own format, whether or not the castable list names
@@ -1392,6 +1424,9 @@ public:
                     if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
                         view_formats_.push_back(pair);
             }
+            if (atomic64_views_)
+                view_formats_.insert(view_formats_.end(), leonida::bindless::atomic64_formats.begin(),
+                                     leonida::bindless::atomic64_formats.end());
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
@@ -1774,6 +1809,7 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     std::vector<VkFormat> view_formats_;  // creation-time castable list; empty means no restriction
     bool r9g9b9e5_as_r32_uint_ = false;
+    bool atomic64_views_ = false;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
@@ -2134,6 +2170,15 @@ public:
                 }
                 uses_bindless = true;
             }
+            if (stage.entry->image_int64_atomics) {
+                const auto& features = device_.info.features;
+                const bool stage_atomics = vertex ? features.vertexPipelineStoresAndAtomics
+                                                  : features.fragmentStoresAndAtomics;
+                if (!device_.info.image_int64_atomics || !stage_atomics) {
+                    log_once("64-bit image atomics unavailable in Vulkan shader stage:", stage.bit);
+                    return E_NOTIMPL;
+                }
+            }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
                     log_once("two stages read their code base; one push-constant slot holds one (question 14)", 0);
@@ -2448,6 +2493,10 @@ public:
         if (entry->binding_count && !device_.bindless) {
             std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
                          entry->name.c_str());
+            return E_NOTIMPL;
+        }
+        if (entry->image_int64_atomics && !device_.info.image_int64_atomics) {
+            log_once("shader requires VK_EXT_shader_image_atomic_int64:", 0);
             return E_NOTIMPL;
         }
         const std::vector<std::uint32_t> words = library->spirv(*entry);
@@ -3090,6 +3139,7 @@ public:
         leonida::BindlessFeatures features{};
         features.update_after_bind = true;  // VulkanDeviceInfo::bindless promises it
         features.partially_bound = state_.info.bindless_partially_bound;
+        features.image_int64_atomics = state_.info.image_int64_atomics;
         const auto get_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
         if (get_properties) {
@@ -4653,7 +4703,7 @@ public:
             *opts = {};
             opts->MeshShaderPipelineStatsSupported = FALSE;
             opts->MeshShaderSupportsFullRangeRenderTargetArrayIndex = FALSE;
-            opts->AtomicInt64OnTypedResourceSupported = FALSE;
+            opts->AtomicInt64OnTypedResourceSupported = state_.info.image_int64_atomics && state_.bindless;
             opts->AtomicInt64OnGroupSharedSupported = FALSE;
             opts->DerivativesInMeshAndAmplificationShadersSupported = FALSE;
             opts->WaveMMATier = D3D12_WAVE_MMA_TIER_NOT_SUPPORTED;
@@ -5170,7 +5220,8 @@ private:
             return kInvalidAllocation;
         }
         VkMemoryRequirements need{};
-        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
+        const bool atomic64 = texture_atomic64(resolved, state_.info.image_int64_atomics && state_.bindless);
+        const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format), atomic64);
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
         if (tiled) {
             leonida::ResourceTiling tiling;
@@ -5223,7 +5274,7 @@ private:
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.r9g9b9e5_as_r32_uint());
+                                                  resource.r9g9b9e5_as_r32_uint(), resource.atomic64_views());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
@@ -5868,6 +5919,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
 #define LEONIDA_INSTANCE(name) const auto name = reinterpret_cast<PFN_##name>(get(owned.instance, #name))
     LEONIDA_INSTANCE(vkEnumeratePhysicalDevices);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
+    LEONIDA_INSTANCE(vkGetPhysicalDeviceFormatProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceFeatures2);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties2);
@@ -6070,6 +6122,33 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
     std::vector<VkExtensionProperties> extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomics{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    if (info.bindless && chosen_features.shaderInt64 &&
+        std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &image_atomics};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        const auto supports_format = [&](VkFormat format, VkFormatFeatureFlags required) {
+            VkFormatProperties properties{};
+            vkGetPhysicalDeviceFormatProperties(info.physical, format, &properties);
+            return (properties.optimalTilingFeatures & required) == required;
+        };
+        constexpr auto storage = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        constexpr auto atomic = storage | VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT;
+        info.image_int64_atomics = image_atomics.shaderImageInt64Atomics &&
+                                   supports_format(VK_FORMAT_R32G32_UINT, storage) &&
+                                   supports_format(VK_FORMAT_R64_UINT, atomic) &&
+                                   supports_format(VK_FORMAT_R64_SINT, atomic);
+        if (info.image_int64_atomics) {
+            image_atomics.sparseImageInt64Atomics = VK_FALSE;
+            image_atomics.pNext = enable13.pNext;
+            enable13.pNext = &image_atomics;
+            enable.vertexPipelineStoresAndAtomics = chosen_features.vertexPipelineStoresAndAtomics;
+            enable.fragmentStoresAndAtomics = chosen_features.fragmentStoresAndAtomics;
+        }
+    }
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -6182,6 +6261,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.image_int64_atomics) device_extensions.push_back(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif

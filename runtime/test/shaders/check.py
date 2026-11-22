@@ -978,6 +978,22 @@ def store_words_test(tools, spirv, name):
     return store_words_problem(out, name) if code == 0 else failure(code, out, 3)
 
 
+def imgatomic64_test(tools, spirv, fssm):
+    """Dispatch cs_imgatomic64 through the Windows D3D12 layer and check the readback."""
+    if os.name != "nt":
+        return Skip("SKIP (the typed image atomic test uses the Windows D3D12 layer)")
+    harness = os.path.join(tools, "d3d12_imgatomic64_test" + EXE)
+    if not os.path.isfile(harness):
+        return Skip("SKIP (d3d12_imgatomic64_test was not built)")
+    code, out = run(harness, os.path.abspath(spirv), os.path.abspath(fssm))
+    if code == UNSUPPORTED:
+        reason = re.search(r"unsupported: .*", out)
+        return Skip(f"SKIP ({reason.group(0) if reason else 'unsupported device'})")
+    if code or "VUID-" in out or "D3D12 typed 64-bit image atomics: 64/64 texels exact" not in out:
+        return out or f"d3d12_imgatomic64_test exited {code}"
+    return ""
+
+
 def get_lod_problem(data, want):
     """Judge one image_get_lod frame: "" when all 4096 RGBA32F pixels are within GET_LOD_TOLERANCE of `want`."""
     if len(data) != 64 * 64 * 16:
@@ -1250,6 +1266,8 @@ def main():
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
     for name in STORE_WORDS:   # TEST-184: image atomics and image_get_resinfo
         results.append((name, store_words_test(tools, spirv, name)))
+    results.append(("cs_imgatomic64", imgatomic64_test(
+        tools, spirv, os.path.join(sys.argv[1], "fssm", "cs_imgatomic64.fssm"))))
     for name in GET_LOD_TESTS:   # TEST-184: image_get_lod, 2D and 2D array
         results.append((name, get_lod_test(tools, spirv, name)))
     for name in CLIP_TESTS:

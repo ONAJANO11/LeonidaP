@@ -39,7 +39,7 @@ from check import MESH_COMPUTE, mesh_env   # LEONIDA_MESH_COMPUTE=1: mesh shader
 from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip, narrow_subgroup_skip,
                    vcmpx_forms_narrow_skip, wave32_lane_skip)   # as in check.py
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem   # pixel producers and checks
-from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
+from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, imgatomic64_test, store_words_problem
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
 
 
@@ -796,6 +796,10 @@ def run_suite(a, work: str) -> int:
                 problem = store_words_problem(msg, name)
                 results.append((name, not problem, problem or "all 64 words of the uint image, the sint image and "
                                 "the volume exact"))
+        elif name == "cs_imgatomic64":
+            problem = imgatomic64_test(a.build, spirv_dir, os.path.join(fssm_dir, name + ".fssm"))
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "D3D12 typed 64-bit image atomics: 64/64 texels exact"))
         elif name in GET_LOD_TESTS:
             # TEST-184: image_get_lod on vk_texture_test's two-mip texture (two sampler LOD ranges) and on its 2D array.
             problem = get_lod_test(a.build, spirv_dir, name)

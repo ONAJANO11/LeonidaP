@@ -528,6 +528,7 @@ struct ShaderEntry {
     std::string stage;  // "vs", "ps", "cs", "ms", "gs"
     std::string fssm_sha256;
     std::size_t binding_count = 0;  // set-0 bindings the module declares
+    bool image_int64_atomics = false;
     std::uint32_t push_constant_bytes = 0;
     std::array<std::uint32_t, 3> local_size{1, 1, 1};
     bool uses_code_base = false;
@@ -615,6 +616,10 @@ private:
             e.stage = stage->string;
             e.fssm_sha256 = hash->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) e.binding_count = b->array.size();
+            if (const Json* f = meta.find("features"); f && f->kind == Json::Kind::array)
+                for (const Json& feature : f->array)
+                    if (feature.kind == Json::Kind::string && feature.string == "shaderImageInt64Atomics")
+                        e.image_int64_atomics = true;
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);

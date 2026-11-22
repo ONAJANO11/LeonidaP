@@ -1137,9 +1137,31 @@ if(TARGET Vulkan::Headers)
     find_program(LEONIDA_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
     find_program(LEONIDA_SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
     if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL)
-      set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
       get_filename_component(LEONIDA_SPIRV_TOOLS_DIR ${LEONIDA_SPIRV_AS} DIRECTORY)
       file(TO_NATIVE_PATH "${LEONIDA_SPIRV_TOOLS_DIR}" LEONIDA_SPIRV_TOOLS_NATIVE)
+      set(LEONIDA_ATOMIC64_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/imgatomic64)
+      set(LEONIDA_ATOMIC64_FILES ${LEONIDA_ATOMIC64_DIR}/spirv/index.json
+                                ${LEONIDA_ATOMIC64_DIR}/spirv/cs_imgatomic64.spv
+                                ${LEONIDA_ATOMIC64_DIR}/fssm/cs_imgatomic64.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_ATOMIC64_FILES}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_ATOMIC64_DIR} cs_imgatomic64
+        DEPENDS test/shaders/build.py test/shaders/compute_fixture.py test/shaders/cs_imgatomic64.asm
+                ../tools/rdna2spirv.py
+        COMMENT "Translating cs_imgatomic64 for the D3D12 typed image atomic test"
+        VERBATIM)
+      add_executable(d3d12_imgatomic64_test test/d3d12_imgatomic64_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_ATOMIC64_FILES})
+      target_link_libraries(d3d12_imgatomic64_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_imgatomic64_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_imgatomic64_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_imgatomic64 COMMAND d3d12_imgatomic64_test ${LEONIDA_ATOMIC64_DIR}/spirv
+               ${LEONIDA_ATOMIC64_DIR}/fssm/cs_imgatomic64.fssm)
+      set_tests_properties(d3d12_imgatomic64 PROPERTIES SKIP_RETURN_CODE 77)
+
+      set(LEONIDA_M15_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/m15_shaders)
       set(LEONIDA_M15_FILES ${LEONIDA_M15_DIR}/spirv/index.json ${LEONIDA_M15_DIR}/fssm/vs_m15.fssm
                             ${LEONIDA_M15_DIR}/fssm/ps_m15.fssm)
       add_custom_command(

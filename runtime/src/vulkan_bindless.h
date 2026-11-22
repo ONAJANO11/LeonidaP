@@ -11,6 +11,7 @@
 //   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
 //   bindings 20/21: sampled multisample 2D images / 2D arrays, 256 each (runtime SRVs).
 //   bindings 22/23 and 24/25 are their UINT and SINT equivalents on devices supporting those classes.
+//   bindings 26/27 and 28/29: 2D and 2D-array R64_UINT/SINT atomic UAV views, when enabled.
 // These are the default counts (BindlessFeatures::counts). size_bindings() sizes the 2D, sampler and storage arrays
 // from the device's limits instead; the shaders declare runtime arrays, so any count works for them.
 //
@@ -64,10 +65,11 @@ struct StorageViews {
     VkImageView as_uint = VK_NULL_HANDLE;
     VkImageView as_sint = VK_NULL_HANDLE;
     VkImageView r32ui = VK_NULL_HANDLE;
+    std::array<VkImageView, 2> atomic64{};  // UINT, SINT
 };
 
 namespace bindless {
-inline constexpr std::uint32_t binding_count = 26;
+inline constexpr std::uint32_t binding_count = 30;
 constexpr std::array<std::uint32_t, binding_count> default_counts();
 } // namespace bindless
 
@@ -79,6 +81,7 @@ struct BindlessFeatures {
         VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
     // Descriptors in each binding, by binding number: bindless::bindings by default, or what size_bindings() chose.
     std::array<std::uint32_t, bindless::binding_count> counts = bindless::default_counts();
+    bool image_int64_atomics = false;
 };
 
 namespace bindless {
@@ -91,10 +94,12 @@ struct Binding {
 inline constexpr std::uint32_t table_binding = 2;
 inline constexpr std::uint32_t sampler_binding = 1;
 inline constexpr std::uint32_t first_ms_binding = 20;
+inline constexpr std::uint32_t first_atomic64_binding = 26;
 inline constexpr std::uint32_t no_binding = 0xffffffffu;
+inline constexpr std::array atomic64_formats = {VK_FORMAT_R64_UINT, VK_FORMAT_R64_SINT};
 
 // Indexed by binding number.
-inline constexpr std::array<Binding, 26> bindings = {{
+inline constexpr std::array<Binding, 30> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
@@ -108,6 +113,8 @@ inline constexpr std::array<Binding, 26> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
 }};
 
 static_assert(bindings.size() == binding_count);
@@ -119,6 +126,7 @@ constexpr std::array<std::uint32_t, binding_count> default_counts() {
 }
 
 constexpr bool binding_enabled(std::uint32_t binding, const BindlessFeatures& features) {
+    if (binding >= first_atomic64_binding) return features.image_int64_atomics;
     return binding < first_ms_binding || features.ms_samples[(binding - first_ms_binding) / 2] != VK_SAMPLE_COUNT_1_BIT;
 }
 
@@ -128,7 +136,8 @@ constexpr void limit_ms_bindings(BindlessFeatures& features, std::uint32_t sampl
                                  std::uint32_t resource_limit) {
     const auto& counts = features.counts;
     std::uint32_t sampled = 0, total = 0;
-    for (std::uint32_t b = 0; b < first_ms_binding; ++b) {
+    for (std::uint32_t b = 0; b < binding_count; ++b) {
+        if ((b >= first_ms_binding && b < first_atomic64_binding) || !binding_enabled(b, features)) continue;
         if (bindings[b].type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) sampled += counts[b];
         if (bindings[b].type != VK_DESCRIPTOR_TYPE_SAMPLER) total += counts[b];
     }
@@ -161,6 +170,11 @@ constexpr std::uint32_t storage_binding(ImageDimension dimension, std::uint32_t 
 
 constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
     return dimension == ImageDimension::dim_2d ? 4 : dimension == ImageDimension::dim_3d ? 7 : no_binding;
+}
+
+constexpr std::uint32_t atomic64_binding(ImageDimension dimension, std::uint32_t signedness) {
+    return dimension == ImageDimension::dim_2d || dimension == ImageDimension::dim_2d_array
+               ? first_atomic64_binding + 2 * std::uint32_t(dimension) + signedness : no_binding;
 }
 
 // Set 0's descriptor set layout at features' counts: what create_layout creates and what size_bindings'
@@ -251,6 +265,10 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
             const std::uint32_t held = capped ? std::min(storage, counts[sampled_binding(dimension)]) : storage;
             for (std::uint32_t c = 0; c < 3; ++c) counts[storage_binding(dimension, c)] = held;
             if (r32ui_binding(dimension) != no_binding) counts[r32ui_binding(dimension)] = held;
+            for (std::uint32_t c = 0; c < atomic64_formats.size(); ++c) {
+                const auto binding = atomic64_binding(dimension, c);
+                if (binding != no_binding) counts[binding] = held;
+            }
         }
     };
     const auto fits = [&](std::uint32_t headroom, std::uint64_t set_limit) {
@@ -387,7 +405,8 @@ public:
     // The caller maps the T# to the index with insert_key(). Takes effect at flush().
     std::uint32_t add_image(ImageDimension dimension, VkImageView sampled, VkImageLayout sampled_layout,
                             const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
-        const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
+        const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui ||
+                            storage.atomic64[0] || storage.atomic64[1];
         if (bindless::multisampled(dimension) && (stores || !supports_ms_class(sampled_class))) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
         const std::uint32_t low_end = std::min(std::uint32_t(used.size()), storage_capacity(dimension));
@@ -595,6 +614,18 @@ private:
         return true;
     }
 
+    bool create_fallback_image(const VkImageCreateInfo& info, FallbackImage& image) {
+        if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
+        VkMemoryRequirements requirements{};
+        vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
+        return allocation.memoryTypeIndex != 0xffffffffu &&
+               vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) == VK_SUCCESS &&
+               vk_.vkBindImageMemory(device_, image.image, image.memory, 0) == VK_SUCCESS;
+    }
+
     // One 1x1 image for each image type and component class, and the views of them every binding needs.
     bool create_fallbacks() {
         // Each MS class shares one sampled-only fallback between its 2D and 2D-array views.
@@ -620,16 +651,35 @@ private:
                 if (t != ms_type) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
                 if (t == ms_type || c == 0) info.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
                 FallbackImage& image = fallback_images_[t * classes + c];
-                if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
-                VkMemoryRequirements requirements{};
-                vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
-                VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocation.allocationSize = requirements.size;
-                allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
-                if (allocation.memoryTypeIndex == 0xffffffffu ||
-                    vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) != VK_SUCCESS ||
-                    vk_.vkBindImageMemory(device_, image.image, image.memory, 0) != VK_SUCCESS)
-                    return false;
+                if (!create_fallback_image(info, image)) return false;
+            }
+        }
+        if (features_.image_int64_atomics) {
+            // As for a real UAV, use R32G32_UINT for the backing image and both R64 formats for storage views.
+            VkImageCreateInfo image_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            image_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            image_info.imageType = VK_IMAGE_TYPE_2D;
+            image_info.format = VK_FORMAT_R32G32_UINT;
+            image_info.extent = {1, 1, 1};
+            image_info.mipLevels = image_info.arrayLayers = 1;
+            image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+            image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+            auto& image = fallback_images_.back();
+            if (!create_fallback_image(image_info, image)) return false;
+            VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+            VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usage};
+            info.image = image.image;
+            info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            for (const auto dimension : {ImageDimension::dim_2d, ImageDimension::dim_2d_array}) {
+                info.viewType = view_types[std::uint32_t(dimension)];
+                for (std::uint32_t c = 0; c < bindless::atomic64_formats.size(); ++c) {
+                    info.format = bindless::atomic64_formats[c];
+                    VkImageView view = VK_NULL_HANDLE;
+                    if (vk_.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return false;
+                    fallback_views_.push_back(view);
+                    fallback_by_binding_[bindless::atomic64_binding(dimension, c)] = view;
+                }
             }
         }
         for (std::uint32_t d = 0; d < dimensions; ++d) {
@@ -899,7 +949,8 @@ private:
         queue(sampled_at, index,
               sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
         const auto store = [&](std::uint32_t binding, VkImageView view) {
-            if (binding == bindless::no_binding || index >= features_.counts[binding]) return;
+            if (binding == bindless::no_binding || !bindless::binding_enabled(binding, features_) ||
+                index >= features_.counts[binding]) return;
             queue(binding, index,
                   view ? VkDescriptorImageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL} : fallback_info(binding));
         };
@@ -907,6 +958,8 @@ private:
         store(bindless::storage_binding(dimension, 1), storage.as_uint);
         store(bindless::storage_binding(dimension, 2), storage.as_sint);
         store(bindless::r32ui_binding(dimension), storage.r32ui);
+        for (std::uint32_t c = 0; c < storage.atomic64.size(); ++c)
+            store(bindless::atomic64_binding(dimension, c), storage.atomic64[c]);
     }
 
     VkDevice device_;
@@ -917,7 +970,7 @@ private:
     VkDescriptorSetLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
-    std::array<FallbackImage, 4 * classes> fallback_images_{};  // [2D, 3D, 1D, 2D MS][class]
+    std::array<FallbackImage, 4 * classes + 1> fallback_images_{};  // [2D, 3D, 1D, 2D MS][class], then R64
     std::vector<VkImageView> fallback_views_;
     std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;

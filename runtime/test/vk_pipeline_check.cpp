@@ -453,6 +453,7 @@ int main(int argc, char** argv) {
 
     // Scan selected shaders to request only the optional extensions they actually use.
     bool want_mesh = false, want_bary = false, want_lock = false, want_m8 = false, want_fma = false;
+    bool want_image_int64 = false;
     for (auto& [_, meta] : work) {
         if (meta->stage == "ms") want_mesh = true;
         if (meta->needs_maintenance8) want_m8 = true;
@@ -461,6 +462,7 @@ int main(int argc, char** argv) {
             else if (feat == "fragmentShaderBarycentric") want_bary = true;
             else if (feat == "fragmentShaderPixelInterlock") want_lock = true;
             else if (feat == "shaderFmaFloat32") want_fma = true;   // OpFmaKHR (rdna2spirv.py --fma khr)
+            else if (feat == "shaderImageInt64Atomics") want_image_int64 = true;
         }
     }
 
@@ -528,6 +530,10 @@ int main(int argc, char** argv) {
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomics{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT};
+    const bool ext_image_int64 = link(&image_atomics, reinterpret_cast<VkBaseOutStructure*>(&image_atomics),
+                                     VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME, want_image_int64);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     const bool ext_m8 = link(&m8, reinterpret_cast<VkBaseOutStructure*>(&m8), VK_KHR_MAINTENANCE_8_EXTENSION_NAME, want_m8);
 #else
@@ -558,6 +564,7 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
+    image_atomics.sparseImageInt64Atomics = VK_FALSE;
     if (ext_mesh) {
         mesh.multiviewMeshShader = mesh.primitiveFragmentShadingRateMeshShader = mesh.meshShaderQueries = VK_FALSE;
         mesh.taskShader = VK_FALSE;
@@ -628,6 +635,8 @@ int main(int argc, char** argv) {
             }
             if (feat == "shaderFloat64" && !f2.features.shaderFloat64) return "no shaderFloat64";
             if (feat == "shaderInt64" && !f2.features.shaderInt64) return "no shaderInt64";
+            if (feat == "shaderImageInt64Atomics" && !(ext_image_int64 && image_atomics.shaderImageInt64Atomics))
+                return "no VK_EXT_shader_image_atomic_int64 (shaderImageInt64Atomics)";
             if (feat == "bufferDeviceAddress" && !f12.bufferDeviceAddress) return "no bufferDeviceAddress";
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
@@ -650,6 +659,8 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    if (ext_image_int64 && image_atomics.shaderImageInt64Atomics)
+        for (uint32_t i = 26; i <= 29; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;
