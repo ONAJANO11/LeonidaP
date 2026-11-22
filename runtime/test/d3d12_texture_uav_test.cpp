@@ -493,6 +493,12 @@ int main(int argc, char** argv) {
         std::printf("SKIP: requires bindless descriptors, robustImageAccess and 144 bytes of push constants\n");
         return vk.validation_errors() ? 1 : 77;
     }
+    const auto warp = uav_oracle::prepare();
+    if (warp == uav_oracle::Status::unavailable) {
+        std::printf("SKIP: no D3D12 WARP adapter\n");
+        return vk.validation_errors() ? 1 : 77;
+    }
+    if (warp != uav_oracle::Status::ready) return 1;
     if (!test(vk, argv[1], false) || !test(vk, argv[1], true) || !check_standalone(vk.sliced_3d_uav) ||
         vk.validation_errors())
         return 1;

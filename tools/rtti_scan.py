@@ -22,6 +22,9 @@ import struct
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+
 
 
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
@@ -191,7 +194,8 @@ def scan_pe64_rtti(data: bytes) -> dict:
 
 def write_report(path, text):
     """Write the report next to its destination and swap it in, so a write that fails part-way (a full disk, a
-    locked range) leaves the previous report as it was instead of an empty or truncated file."""
+    locked range) leaves the previous report as it was instead of an empty or truncated file. The result keeps
+    the previous report's permission bits, or gets the usual ones for a new file."""
     parent = os.path.dirname(os.path.abspath(path))
     tmp = None
     try:
@@ -199,6 +203,7 @@ def write_report(path, text):
                                          delete=False) as f:
             tmp = f.name
             f.write(text)
+        os.chmod(tmp, published_mode(path))
         os.replace(tmp, path)
     except BaseException:
         if tmp is not None:

@@ -13,6 +13,7 @@
 //   LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation; any validation error fails the run.
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
+#include "vk_device_pick.h"
 #include "../src/descriptor_table.h"
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -967,7 +969,7 @@ struct Options {
     std::uint32_t reps = 25u;
     std::uint32_t warmup = 5u;
     double max_dispatch_ms = 120.0;
-    int device_index = -1;
+    std::optional<std::uint32_t> device_index;
     MemoryFilter mem_filter = MemoryFilter::All;
     bool list_devices = false;
     bool csv = false;
@@ -990,7 +992,7 @@ void print_usage() {
         "  --quick              fast check profile (sizes 1000,10000; groups 16; iters 4; reps 3)\n"
         "  --csv                emit CSV with timing_status and empty fields for unavailable measurements\n"
         "  --dump-spv PREFIX    write the 3 SPIR-V compute modules to PREFIX_*.spv and exit\n"
-        "  --self-test          CPU-only check of SPIR-V encoding and DescriptorTable oracle\n"
+        "  --self-test          CPU-only checks for CLI, SPIR-V encoding and descriptor lookup\n"
         "  --help               print this message\n");
 }
 
@@ -1003,7 +1005,7 @@ bool parse_u32(const char* s, std::uint32_t& out) {
     return true;
 }
 
-bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
+bool parse_args(int argc, const char* const* argv, Options& opt, bool& show_help) {
     show_help = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -1053,7 +1055,7 @@ bool parse_args(int argc, char** argv, Options& opt, bool& show_help) {
             const char* v = nullptr;
             std::uint32_t idx = 0u;
             if (!need_val(v) || !parse_u32(v, idx)) return false;
-            opt.device_index = static_cast<int>(idx);
+            opt.device_index = idx;
         } else if (arg == "--dump-spv") {
             const char* v = nullptr;
             if (!need_val(v)) return false;
@@ -1153,6 +1155,15 @@ struct MemoryPlacement {
 };
 
 int run_self_test() {
+    const char* const device_args[] = {"vk_descriptor_bench", "--device", "4294967295"};
+    Options device_options;
+    bool show_help = false;
+    if (device_options.device_index.has_value() || !parse_args(3, device_args, device_options, show_help) ||
+        device_options.device_index != std::numeric_limits<std::uint32_t>::max()) {
+        std::fprintf(stderr, "self-test: explicit device index became automatic selection\n");
+        return 1;
+    }
+
     const struct {
         const char* name;
         ShaderKind kind;
@@ -1340,13 +1351,14 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceProperties pd_props{};
     std::uint32_t qi = 0;
     std::uint32_t ts_valid_bits = 0;
-    if (opt.device_index >= 0) {
-        if (static_cast<std::uint32_t>(opt.device_index) >= pd_count) {
-            std::fprintf(stderr, "invalid --device index %d (found %u devices)\n", opt.device_index, pd_count);
+    if (opt.device_index.has_value()) {
+        const std::uint32_t device_index = *opt.device_index;
+        if (device_index >= pd_count) {
+            std::fprintf(stderr, "invalid --device index %u (found %u devices)\n", device_index, pd_count);
             destroy_instance();
             return 2;
         }
-        VkPhysicalDevice cand = pds[static_cast<std::size_t>(opt.device_index)];
+        VkPhysicalDevice cand = pds[device_index];
         VkPhysicalDeviceProperties p{};
         vkGetPhysicalDeviceProperties(cand, &p);
         if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, qi, ts_valid_bits)) {
@@ -1357,12 +1369,8 @@ int main(int argc, char** argv) {
         pd = cand;
         pd_props = p;
     } else {
-        auto score = [](VkPhysicalDeviceType t) -> int {
-            if (t == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return 4;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 3;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU) return 2;
-            if (t == VK_PHYSICAL_DEVICE_TYPE_CPU) return 1;
-            return 0;
+        auto score = [](VkPhysicalDeviceType t, std::uint32_t vendor) -> int {
+            return leonida::vk_test::device_rank(t, vendor);
         };
         int best_score = -1;
         for (VkPhysicalDevice cand : pds) {
@@ -1370,7 +1378,7 @@ int main(int argc, char** argv) {
             vkGetPhysicalDeviceProperties(cand, &p);
             std::uint32_t c_qi = 0, c_ts = 0;
             if (p.apiVersion < VK_API_VERSION_1_1 || !find_compute_queue(cand, c_qi, c_ts)) continue;
-            const int s = score(p.deviceType);
+            const int s = score(p.deviceType, p.vendorID);
             if (s > best_score) {
                 best_score = s;
                 pd = cand;
@@ -1626,10 +1634,17 @@ int main(int argc, char** argv) {
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = bytes;
         bci.usage = usage;
-        if (vkCreateBuffer(dev, &bci, nullptr, &out_buf.buffer) != VK_SUCCESS) return false;
+        // Every failure says which call failed and with what result, so a run that stops is never silent.
+        if (const VkResult r = vkCreateBuffer(dev, &bci, nullptr, &out_buf.buffer); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkCreateBuffer (%llu bytes) failed: VkResult %d\n",
+                         static_cast<unsigned long long>(bytes), static_cast<int>(r));
+            return false;
+        }
         VkMemoryRequirements mr{};
         vkGetBufferMemoryRequirements(dev, out_buf.buffer, &mr);
         if (mt_idx >= mp.memoryTypeCount || !(mr.memoryTypeBits & (1u << mt_idx))) {
+            std::fprintf(stderr, "memory type %u is not allowed for this buffer (memoryTypeBits 0x%x)\n", mt_idx,
+                         mr.memoryTypeBits);
             destroy_buf(out_buf);
             return false;
         }
@@ -1637,14 +1652,25 @@ int main(int argc, char** argv) {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = mr.size;
         mai.memoryTypeIndex = mt_idx;
-        if (vkAllocateMemory(dev, &mai, nullptr, &out_buf.memory) != VK_SUCCESS ||
-            vkBindBufferMemory(dev, out_buf.buffer, out_buf.memory, 0u) != VK_SUCCESS) {
+        if (const VkResult r = vkAllocateMemory(dev, &mai, nullptr, &out_buf.memory); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkAllocateMemory (%llu bytes, memory type %u) failed: VkResult %d\n",
+                         static_cast<unsigned long long>(mr.size), mt_idx, static_cast<int>(r));
+            out_buf.memory = VK_NULL_HANDLE;
             destroy_buf(out_buf);
             return false;
         }
-        if (map_mem && vkMapMemory(dev, out_buf.memory, 0u, bytes, 0u, &out_buf.mapped) != VK_SUCCESS) {
+        if (const VkResult r = vkBindBufferMemory(dev, out_buf.buffer, out_buf.memory, 0u); r != VK_SUCCESS) {
+            std::fprintf(stderr, "vkBindBufferMemory failed: VkResult %d\n", static_cast<int>(r));
             destroy_buf(out_buf);
             return false;
+        }
+        if (map_mem) {
+            if (const VkResult r = vkMapMemory(dev, out_buf.memory, 0u, bytes, 0u, &out_buf.mapped); r != VK_SUCCESS) {
+                std::fprintf(stderr, "vkMapMemory (%llu bytes) failed: VkResult %d\n",
+                             static_cast<unsigned long long>(bytes), static_cast<int>(r));
+                destroy_buf(out_buf);
+                return false;
+            }
         }
         return true;
     };
@@ -1897,6 +1923,17 @@ int main(int argc, char** argv) {
             const VkBufferUsageFlags map_usage =
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (pl_cfg.use_staging ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u);
             if (!alloc_buffer_mt(map_bytes, map_usage, pl_cfg.memory_type_index, !pl_cfg.use_staging, map_buf)) {
+                // The ReBAR placement is optional: a driver can list a DEVICE_LOCAL | HOST_VISIBLE type yet refuse
+                // the allocation (RTX 4080 SUPER, Windows 617.14: VK_ERROR_OUT_OF_DEVICE_MEMORY for 160 KiB).
+                // Skip it, as when no such type exists, so the other placements and table sizes still run.
+                if (std::strcmp(pl_cfg.label, "host_device_local") == 0) {
+                    if (!opt.csv)
+                        std::printf("  note: skipping placement host_device_local (memory type %u can't be "
+                                    "allocated, see stderr)\n", pl_cfg.memory_type_index);
+                    continue;
+                }
+                std::fprintf(stderr, "placement %s: allocating the %llu-byte table failed\n", pl_cfg.label,
+                             static_cast<unsigned long long>(map_bytes));
                 cleanup_all(keys_buf, map_buf);
                 return 1;
             }

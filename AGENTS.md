@@ -10,6 +10,15 @@ A port template for the Xbox Series build of GTA VI, built on the player's PC fr
 `make_game.py` carves and translates the shaders (RDNA2 → SPIR-V), exports the assets and builds `runtime/`, a PE
 loader that maps the game's executable and resolves its imports to shims. Nothing of the game is in the repository.
 
+## Where things are
+
+- The notes under `docs/` record measured formats, indexed by [docs/README.md](docs/README.md); `docs/design.md` is the one quoted most.
+- `scripts/` holds the GPU/Wine test runners (`run_gpu_tests.py`, `run_wine_tests.py`) and PowerShell build helpers.
+- `viewer/` is the map viewer: `index.html` plus `serve.py`, a local-only server for the exported world.
+- `third_party/` holds the `rpf9-explorer` submodule (`tools/rpf9dump` needs `git submodule update --init`) and the vendored `xtaskqueue` the `xgameruntime` shim links.
+- `game/xbox-1.0.2.1.json` is the per-file size and SHA-256 manifest of the Xbox package — hashes only, no game content.
+- `tests/semantic/` is the translator regression suite; a new translator rule comes with a small hand-written `.asm` fixture there.
+
 ## Hard rules
 
 - **No game data, ever**: no archives, executables, carved files, shaders in any form (DXBC, FSSM, disassembly,
@@ -55,6 +64,9 @@ These need no game files and run in seconds:
 ```powershell
 python -m compileall -q make_game.py tools tests
 python -I make_game.py --help
+python -m unittest discover -s tests/semantic -v   # translator regression suite; no LLVM, SPIR-V tools or GPU needed
+python -I tests/test_<name>.py                     # one unit test
+node --test tests/test_viewer_streaming.cjs        # viewer streaming; needs Node 22+
 dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
 cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo; cmake --build runtime/build
 ```
@@ -67,10 +79,14 @@ python -I tools/rdna2spirv.py <work>/shaders/dxbc/disasm --out <scratch> --limit
 python -I tools/rdna2spirv.py <work>/shaders/dxbc/disasm --out <scratch> --shard 0/8   # one of 8 parallel slices
 ```
 
-Report translated and `spirv-val`-valid counts before and after; a change that lowers either is a regression.
+Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`. Report translated and
+`spirv-val`-valid counts before and after; a change that lowers either is a regression.
 
 ## Conventions
 
-- Python tools run with `python -I` and use only the standard library unless a file says otherwise.
+- Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
+  are the texture tools that import numpy or Pillow: `bc_feature.py`, `amd_swizzle.py`, `tile_probe.py`,
+  `swizzle_search.py`, `tex_export.py`, `tex_mode_probe.py`, `tex_headers.py` (which falls back to the standard
+  library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.

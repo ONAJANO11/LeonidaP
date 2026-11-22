@@ -17,6 +17,8 @@
 #include <span>
 
 namespace uav_oracle {
+enum class Status { ready, unavailable, failed };
+
 namespace detail {
 using Microsoft::WRL::ComPtr;
 
@@ -68,16 +70,25 @@ struct Context {
     ComPtr<ID3D12RootSignature> root;
     std::array<ComPtr<ID3D12PipelineState>, 5> pipelines;
 
+    Status prepare_device() {
+        if (device) return Status::ready;
+        ComPtr<IDXGIFactory4> factory;
+        ComPtr<IDXGIAdapter> warp;
+        HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()));
+        if (hr == E_NOINTERFACE || hr == DXGI_ERROR_UNSUPPORTED) return Status::unavailable;
+        if (!check(hr, "CreateDXGIFactory1")) return Status::failed;
+        hr = factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf()));
+        if (hr == DXGI_ERROR_NOT_FOUND || hr == DXGI_ERROR_UNSUPPORTED || hr == E_NOTIMPL)
+            return Status::unavailable;
+        if (!check(hr, "EnumWarpAdapter")) return Status::failed;
+        hr = D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.GetAddressOf()));
+        if (hr == DXGI_ERROR_UNSUPPORTED || hr == E_NOTIMPL) return Status::unavailable;
+        return check(hr, "D3D12CreateDevice") ? Status::ready : Status::failed;
+    }
+
     bool init() {
         if (root) return true;
-        if (!device) {
-            ComPtr<IDXGIFactory4> factory;
-            ComPtr<IDXGIAdapter> warp;
-            if (!check(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "CreateDXGIFactory1") ||
-                !check(factory->EnumWarpAdapter(IID_PPV_ARGS(warp.GetAddressOf())), "EnumWarpAdapter") ||
-                !check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.GetAddressOf())),
-                       "D3D12CreateDevice")) return false;
-        }
+        if (prepare_device() != Status::ready) return false;
         const D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
         D3D12_ROOT_PARAMETER parameter{};
         parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -136,7 +147,16 @@ struct Context {
         return device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(out));
     }
 };
+
+inline Context& context() {
+    static thread_local Context ctx;
+    return ctx;
+}
 } // namespace detail
+
+inline Status prepare() {
+    return detail::context().prepare_device();
+}
 
 // Provide a valid R32_UINT or R32_TYPELESS texture descriptor and a valid UINT UAV view; a null view
 // asks D3D12 to create the default view of a typed R32_UINT resource. Both spans cover the entire
@@ -145,7 +165,7 @@ inline bool run(const D3D12_RESOURCE_DESC& resource_desc, const D3D12_UNORDERED_
                 std::span<const std::uint32_t> before, std::span<std::uint32_t> after, UINT dispatch_depth = 0) {
     using namespace detail;
     const View view = select_view(resource_desc, desc);
-    static thread_local Context ctx;
+    auto& ctx = context();
     if (view.shader >= ctx.pipelines.size() ||
         (resource_desc.Format != DXGI_FORMAT_R32_UINT && resource_desc.Format != DXGI_FORMAT_R32_TYPELESS))
         return fail("expected an R32_UINT or R32_TYPELESS texture and a texture UAV");
