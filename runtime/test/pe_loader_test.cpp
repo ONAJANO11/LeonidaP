@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "pe_loader.h"
+#include "../shims/shims.h"
 
 namespace {
 
@@ -513,6 +514,43 @@ void test_unwind(const fs::path& dll) {
           "an access violation inside the mapped image is caught by the image's own handler");
 }
 
+// RtlPcToFileHeader as code inside a mapped image calls it: a static-CRT _CxxThrowException puts its answer in the
+// exception record, and crash and stack-walk helpers call it directly. The image imports it from kernel32, ntdll or
+// the rtlsupport API set itself, so every one of those names must give the loader's version: the mapped image's base
+// for an address in it, Windows' own answer for a module Windows loaded. Runs before the package tests, so no host
+// CRT has been redirected yet and the Windows function is looked up on first use.
+void test_pc_to_file_header(const fs::path& dll) {
+    std::printf("\n-- RtlPcToFileHeader for mapped images --\n");
+    using Fn = PVOID(NTAPI*)(PVOID, PVOID*);
+    const auto fn = reinterpret_cast<Fn>(rt::shims::find("kernel32.dll", "RtlPcToFileHeader"));
+    check(fn != nullptr, "kernel32.dll!RtlPcToFileHeader is served by the loader");
+    for (const char* name : {"kernelbase.dll", "ntdll.dll", "api-ms-win-core-rtlsupport-l1-1-0.dll",
+                             "api-ms-win-core-rtlsupport-l1-2-0.dll"}) {
+        const std::string what = std::string(name) + "!RtlPcToFileHeader is the same function";
+        check(fn && rt::shims::find(name, "RtlPcToFileHeader") == reinterpret_cast<void*>(fn), what.c_str());
+    }
+    if (!fn) return;
+
+    const auto self = reinterpret_cast<PVOID>(GetModuleHandleW(nullptr));
+    PVOID base = nullptr;
+    check(fn(reinterpret_cast<PVOID>(&test_pc_to_file_header), &base) == self && base == self,
+          "an address in the test executable gives Windows' answer, its base");
+
+    PVOID inside = nullptr;
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& m = loader.load(dll);
+        inside = m.base + m.entry_rva;
+        PVOID windows_base = reinterpret_cast<PVOID>(1);
+        check(RtlPcToFileHeader(inside, &windows_base) == nullptr && windows_base == nullptr,
+              "Windows' own RtlPcToFileHeader doesn't know the mapped image");
+        base = nullptr;
+        check(fn(inside, &base) == m.base && base == m.base, "an address in the mapped image gives the image's base");
+    }
+    base = reinterpret_cast<PVOID>(1);
+    check(fn(inside, &base) == nullptr && base == nullptr, "after the Loader is gone the address is no image's");
+}
+
 // True when the code at rva (or, through up to 4 `jmp rel32` thunks, the code they lead to) has an unwind entry.
 // A jump thunk touches no stack, so it legitimately has none: libHttpClient.GDK.dll's entry point is one.
 bool unwind_covers(const rt::Module& m, uint32_t rva) {
@@ -689,6 +727,7 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        test_pc_to_file_header(dll);
         test_optional_package();
         test_optional_package_unwind();
     } catch (const std::exception& e) {

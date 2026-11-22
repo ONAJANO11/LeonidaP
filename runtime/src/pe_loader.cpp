@@ -272,11 +272,24 @@ bool prefer_host_copy(const std::string& dll) {
 // copy constructor, destructor) to it. RtlPcToFileHeader only knows images the Windows loader mapped, so for ours the
 // base is 0 and the exception can't be matched to a catch. The host copies the loader binds get their import of it
 // redirected: the Windows answer first, then the modules a live Loader has mapped (shims::mapped_image_base).
+// A mapped image's own import of it binds here too (the shim table below): a static-CRT image has
+// _CxxThrowException inside itself, and a crash or stack-walk helper may call it directly.
 using PcToFileHeaderFn = PVOID(NTAPI*)(PVOID, PVOID*);
 std::atomic<PcToFileHeaderFn> g_host_pc_to_file_header{nullptr};
 
+// The Windows function: the first address a redirected host import was bound to, or else ntdll's own export (where
+// kernel32's forwards), for a mapped image that calls it before any host copy has been redirected.
+PcToFileHeaderFn host_pc_to_file_header() {
+    if (PcToFileHeaderFn fn = g_host_pc_to_file_header.load()) return fn;
+    PcToFileHeaderFn expected = nullptr;
+    g_host_pc_to_file_header.compare_exchange_strong(
+        expected, reinterpret_cast<PcToFileHeaderFn>(
+                      reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlPcToFileHeader"))));
+    return g_host_pc_to_file_header.load();
+}
+
 PVOID NTAPI pc_to_file_header(PVOID pc, PVOID* base) {
-    if (PVOID found = g_host_pc_to_file_header.load()(pc, base)) return found;
+    if (PVOID found = host_pc_to_file_header()(pc, base)) return found;
     uint64_t mapped = 0;
     if (!shims::mapped_image_base(reinterpret_cast<uint64_t>(pc), mapped)) {
         *base = nullptr;
@@ -331,6 +344,17 @@ void redirect_pc_to_file_header_at(const void* resolved) {
 }
 
 }  // namespace
+
+// Every name a mapped image can import RtlPcToFileHeader by: kernel32 (the classic import libraries), kernelbase,
+// ntdll, and the API sets the umbrella libraries bind it to. The package's XCurl.dll, vcruntime140.dll and
+// msvcp140.dll import it from api-ms-win-core-rtlsupport-l1-1-0.dll.
+SHIM_TABLE(pc_to_file_header,
+    {"kernel32.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
+    {"kernelbase.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
+    {"ntdll.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
+    {"api-ms-win-core-rtlsupport-l1-1-0.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
+    {"api-ms-win-core-rtlsupport-l1-2-0.dll", "RtlPcToFileHeader", reinterpret_cast<void*>(&pc_to_file_header)},
+);
 
 namespace {
 bool lookup_in_loader(void* ctx, uint64_t address, std::string& module, uint32_t& rva) {

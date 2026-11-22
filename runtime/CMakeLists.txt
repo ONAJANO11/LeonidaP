@@ -394,6 +394,16 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # The same stand-in game with the static CRT, as a title may link it: _CxxThrowException and its
+    # RtlPcToFileHeader import are then inside the image, not in a host vcruntime140 the loader redirects.
+    add_executable(tiny_game_static test/fixtures/tiny_game.cpp)
+    target_link_libraries(tiny_game_static PRIVATE xgameruntime_stub)
+    target_compile_definitions(tiny_game_static PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(tiny_game_static PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_game_static PROPERTIES
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game_static/$<CONFIG>"
+    )
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
@@ -608,6 +618,8 @@ if(BUILD_TESTING)
     # The opt-in checks, one test each: thread_local on the game's threads, a C++ exception caught inside the image.
     add_test(NAME run_tiny_game_tls COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 tls)
     add_test(NAME run_tiny_game_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 eh)
+    # The static-CRT copy: its throw finds the image's base through the loader's RtlPcToFileHeader shim.
+    add_test(NAME run_tiny_game_static_eh COMMAND gta6rt --run $<TARGET_FILE:tiny_game_static> -- hello 42 eh)
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
