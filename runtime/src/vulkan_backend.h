@@ -1436,12 +1436,14 @@ public:
             if (bindless_commit) bindless_commit(submitted);
             return ReplayResult::unsupported;
         }
-        auto next_tracker = context_.tracker_;
+        // Mutate context_.tracker_ in place under tracker_lock with an O(touched) undo journal instead of cloning the
+        // entire device texture map on every ExecuteCommandLists.
+        LayoutTracker::Transaction tracker_tx(context_.tracker_);
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
         for (const auto& list : prepared) {
-            emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            emit(list, command_buffer, replay, &context_.tracker_, &open_labels);
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -1480,12 +1482,13 @@ public:
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            tracker_tx.commit();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             queries.commit();
             slot->segments = std::move(queries.retained);
         } else {
+            tracker_tx.rollback();
             discard();
         }
         if (depth24_guard.active) {
