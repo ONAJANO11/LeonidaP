@@ -6,6 +6,7 @@
 #include "vulkan_loader.h"
 #include "../src/vulkan_device_filter.h"
 #include "vk_device_pick.h"
+#include "../src/subgroup_size.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -98,7 +99,11 @@ public:
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
+    bool request_buffer_device_address = false;  // set before create(): enable bufferDeviceAddress where supported
+    bool buffer_device_address = false;  // enabled: buffer() memory and buffers can be addressed (device_address())
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
+    // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
+    leonida::SubgroupSizeCaps subgroup;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -326,6 +331,15 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
+        enable13.subgroupSizeControl = features13.subgroupSizeControl;
+        enable13.computeFullSubgroups = features13.computeFullSubgroups;
+        leonida::query_subgroup_size_caps(instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2"),
+                                          physical, features13.subgroupSizeControl, features13.computeFullSubgroups,
+                                          subgroup);
+        std::printf("subgroup sizes: %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
+                    "computeFullSubgroups %s\n",
+                    subgroup.min_size, subgroup.max_size, subgroup.default_size, unsigned(subgroup.required_stages),
+                    subgroup.subgroup_size_control ? "on" : "off", subgroup.compute_full_subgroups ? "on" : "off");
         // shaderDrawParameters, where available: translated vertex shaders will read BaseVertex and BaseInstance once PR 436
         // (zero-based VS ids) is in; harmless before.
         VkPhysicalDeviceVulkan11Features enable11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &enable13};
@@ -333,6 +347,8 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
+        buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
+        enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;
         enable12.storageBuffer8BitAccess = storage_buffer_8bit;
         // What the bindless set 0 of the translated shaders needs, where the device has it: runtime arrays of
@@ -360,6 +376,7 @@ public:
         queue_info.pQueuePriorities = &priority;
         VkPhysicalDeviceFeatures enable{};
         enable.textureCompressionBC = features.features.textureCompressionBC;  // BC uploads, where available
+        enable.shaderInt64 = features.features.shaderInt64;  // translated shaders declare Int64 (index features)
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
@@ -430,6 +447,7 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+#if defined(VK_KHR_swapchain_maintenance1)
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
         if (presentation) {
@@ -451,6 +469,7 @@ public:
                 }
             }
         }
+#endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
         if (shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 #endif
@@ -500,24 +519,34 @@ public:
         return image;
     }
 
-    // A host-visible, coherent buffer, mapped.
+    // A host-visible, coherent buffer, mapped; with `mapped` null, a device-local one the host can't see.
     VkBuffer buffer(VkDeviceSize size, VkBufferUsageFlags usage, void** mapped) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = size;
-        info.usage = usage;
+        info.usage = usage | (buffer_device_address ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
         VkBuffer buffer = VK_NULL_HANDLE;
         if (fn<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &info, nullptr, &buffer) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         VkMemoryRequirements requirements{};
         fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, buffer, &requirements);
-        const VkDeviceMemory memory =
-            allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        const VkDeviceMemory memory = allocate(requirements, mapped ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                                                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         buffers_.push_back({buffer, memory});
         if (!memory || fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, buffer, memory, 0) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        if (!mapped) return buffer;
         if (fn<PFN_vkMapMemory>("vkMapMemory")(device, memory, 0, size, 0, mapped) != VK_SUCCESS) return VK_NULL_HANDLE;
         std::memset(*mapped, 0xcd, size_t(size));
         return buffer;
+    }
+
+    // The device address of a buffer from buffer(); 0 unless buffer_device_address is enabled.
+    std::uint64_t device_address(VkBuffer buffer) const {
+        if (!buffer_device_address) return 0;
+        VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        info.buffer = buffer;
+        return fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress")(device, &info);
     }
 
     // Records `body` into a one-shot command buffer, submits it and waits for the queue.
@@ -582,7 +611,10 @@ private:
         for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i) {
             if (!(requirements.memoryTypeBits & (1u << i))) continue;
             if ((memory_.memoryTypes[i].propertyFlags & flags) != flags) continue;
+            VkMemoryAllocateFlagsInfo address_flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+            address_flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
             VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            if (buffer_device_address) info.pNext = &address_flags;
             info.allocationSize = requirements.size;
             info.memoryTypeIndex = i;
             VkDeviceMemory memory = VK_NULL_HANDLE;

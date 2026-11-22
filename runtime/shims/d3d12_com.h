@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "../src/root_signature.h"
+#include "../src/subgroup_size.h"
 
 namespace leonida {
 class VulkanPresenter;
@@ -77,6 +78,9 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
+    // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
+    leonida::SubgroupSizeCaps subgroup;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
@@ -126,6 +130,11 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // BuildRaytracingAccelerationStructure writes the console's XDXR BVH4 records into the destination buffer
+    // (src/xdxr_build.h), the layout the game's translated traversal shaders read, instead of building a
+    // VkAccelerationStructureKHR; needs buffer_device_address and the GPU address arena. The standalone device sets it
+    // unless LEONIDA_RT_AS=khr (docs/d3d12_vulkan.md 4.8); with it set, ray_tracing is not enabled.
+    bool xdxr_acceleration_structures = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
@@ -255,6 +264,8 @@ struct RootArgumentLayout {
 const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
 std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
 std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+// What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
+const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 
 // The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
 inline constexpr UINT descriptor_size = 32;
