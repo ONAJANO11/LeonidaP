@@ -1,0 +1,28 @@
+name: Sincronizar con repositorio original
+
+on:
+  schedule:
+    # Se ejecuta automáticamente todos los días a las 00:00 UTC
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Añade un botón para poder ejecutarlo manualmente cuando quieras
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar tu repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Traer cambios del original y guardar
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git remote add upstream https://github.com/USUARIO/REPOSITORIO.git
+          git fetch upstream
+          git merge upstream/main --no-edit --allow-unrelated-histories
+          git push origin main
