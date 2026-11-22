@@ -61,7 +61,30 @@ work on booting can start as soon as one is available to a developer.
 
 The port isn't downloaded ready-made. It's built on your PC from your own copy.
 
-**The easy way:**
+**One line.** The installer adds the prerequisites, clones the repository with its submodule, builds `llvm-mc` when
+Windows needs it, and starts the build. It never downloads the game, keys, or game data.
+
+Windows (PowerShell):
+
+```powershell
+$d = Join-Path $env:TEMP "leonida-install.ps1"; irm https://raw.githubusercontent.com/ItsNotRexed/Leonida/main/install.ps1 -OutFile $d; powershell -NoProfile -ExecutionPolicy Bypass -File $d
+```
+
+Ubuntu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ItsNotRexed/Leonida/main/install.sh -o /tmp/leonida-install.sh && bash /tmp/leonida-install.sh
+```
+
+Add `-Game "D:\path\to\your\package"` on Windows, or `--game /path/to/your/package` on Linux, if the copy is not in
+the usual places. `install.ps1 -Help` and `install.sh --help` list the rest; [docs/install.md](docs/install.md)
+explains each step, what gets installed, and what to do when it stops.
+
+The installer lists what it will install and asks once before changing anything; add `-Yes` / `--yes` for an
+unattended run. The one-liners fetch the current `main` copy, so download and read the script first if you want to
+audit it. Your game, the finished port and the work folder stay on your PC.
+
+**Or by hand:**
 
 1. Install the prerequisites below.
 2. Download this project **with its submodule**: `git clone --recursive https://github.com/ItsNotRexed/Leonida`. A

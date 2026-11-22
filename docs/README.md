@@ -9,6 +9,7 @@ method, scope and caveats. No game data is included.
 | Document | What it covers |
 |---|---|
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |
+| [install.md](install.md) | The Windows and Ubuntu one-liners: what they install, every option, logs and troubleshooting. |
 | [related_projects.md](related_projects.md) | Prior art we may read and the licence boundaries on it. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |

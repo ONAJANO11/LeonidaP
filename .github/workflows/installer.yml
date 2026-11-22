@@ -1,0 +1,92 @@
+name: installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.ps1
+      - install.sh
+      - docs/install.md
+      - .github/workflows/installer.yml
+  pull_request:
+    paths:
+      - install.ps1
+      - install.sh
+      - docs/install.md
+      - .github/workflows/installer.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: installer-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bash:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Parse
+        run: bash -n install.sh
+      - name: ShellCheck
+        run: shellcheck -S warning -x install.sh
+      - name: Help and dry runs
+        run: |
+          ./install.sh --help > /dev/null
+          ./install.sh --self-test --plain
+          ./install.sh --dry-run --plain
+          ./install.sh --dry-run --stages shaders --game /tmp
+          ./install.sh --dry-run --runtime --yes --stages runtime
+          if ./install.sh --not-an-option > /dev/null 2>&1; then
+            echo "unknown option was accepted" >&2
+            exit 1
+          fi
+      - name: Animated self test
+        run: |
+          script -qec "./install.sh --self-test" /dev/null > /tmp/self-test.out
+          grep -q "self test finished" /tmp/self-test.out
+
+  powershell:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Parse with Windows PowerShell
+        shell: powershell
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+      - name: Progress helper on Windows PowerShell
+        shell: powershell
+        run: .\install.ps1 -SelfTest
+      - name: Dry run and help on PowerShell 7
+        shell: pwsh
+        run: |
+          ./install.ps1 -DryRun -Stages shaders
+          ./install.ps1 -Help
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $issues = @(Invoke-ScriptAnalyzer -Path ./install.ps1 -Severity Error)
+          $issues | Format-Table -AutoSize
+          if ($issues.Count -gt 0) { exit 1 }
