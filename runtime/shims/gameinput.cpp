@@ -1188,10 +1188,23 @@ HRESULT find_reading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* de
     std::vector<Device*> scope = s.connected;
     uint64_t horizon = 0;
     if (device) {
-        if (as_device(device)->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-        if (kind != GameInputKindUnknown && !(kind & as_device(device)->info.supportedInput))
-            return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
-        scope = {as_device(device)};
+        Device* dev = as_device(device);
+        if (dev->info.deviceFamily == GameInputFamilyAggregate) {
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;
+            const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & dev->info.supportedInput) : dev->info.supportedInput;
+            scope.clear();
+            for (Device* cd : s.connected) {
+                if (effective_kind & cd->info.supportedInput) {
+                    scope.push_back(cd);
+                }
+            }
+        } else {
+            if (dev->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+            if (kind != GameInputKindUnknown && !(kind & dev->info.supportedInput))
+                return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
+            scope = {dev};
+        }
     } else {
         horizon = r->device()->evicted_order;
     }
@@ -1234,10 +1247,20 @@ public:
         Reading* best = nullptr;
         if (device) {
             Device* d = as_device(device);
-            if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
-            if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
-                return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
-            best = d->latest();
+            if (d->info.deviceFamily == GameInputFamilyAggregate) {
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;
+                const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
+                for (Device* cd : g().connected) {
+                    if (!(effective_kind & cd->info.supportedInput)) continue;
+                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+                }
+            } else {
+                if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
+                if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
+                    return GAMEINPUT_E_READING_NOT_FOUND;  // the device does not do this kind (motion on a plain pad)
+                best = d->latest();
+            }
         } else {
             for (Device* d : g().connected)  // the most recent reading from any gamepad
                 if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
@@ -1264,6 +1287,9 @@ public:
 
     HRESULT STDMETHODCALLTYPE RegisterReadingCallback(IGameInputDevice* device, uint32_t kind, float, void* context,
                                                       GameInputReadingCallback fn, GameInputCallbackToken* token) override {
+        if (token) *token = kInvalidCallbackToken;
+        if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         return add({0, CbType::Reading, as_device(device), kind, 0, context, reinterpret_cast<void*>(fn), true}, token);
     }
 
@@ -1272,6 +1298,7 @@ public:
                                                      GameInputDeviceCallback fn, GameInputCallbackToken* token) override {
         if (token) *token = kInvalidCallbackToken;
         if (!fn) return E_INVALIDARG;
+        if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
         GameInputCallbackToken t;
         std::vector<Event> now;
@@ -1344,9 +1371,45 @@ public:
         *out = new Dispatcher;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE CreateAggregateDevice(uint32_t, IGameInputDevice** out) override {
-        if (out) *out = nullptr;
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE CreateAggregateDevice(uint32_t kind, IGameInputDevice** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (kind == GameInputKindUnknown) return E_INVALIDARG;
+        // Combining multiple kinds into a single call is unsupported per Microsoft GDK spec
+        if ((kind & (kind - 1)) != 0) return E_INVALIDARG;
+        constexpr uint32_t kAllowedKinds =
+            GameInputKindKeyboard | GameInputKindMouse | GameInputKindGamepad |
+            GameInputKindArcadeStick | GameInputKindFlightStick | GameInputKindRacingWheel;
+        if (!(kind & kAllowedKinds)) return E_INVALIDARG;
+
+        std::lock_guard lock(g().mu);
+        for (Device* d : g().devices) {
+            if (d->info.deviceFamily == GameInputFamilyAggregate && d->info.supportedInput == kind) {
+                d->AddRef();
+                *out = d;
+                return S_OK;
+            }
+        }
+
+        auto* agg = new Device();
+        agg->info.deviceFamily = GameInputFamilyAggregate;
+        agg->info.supportedInput = kind;
+        agg->info.capabilities = GameInputDeviceCapabilityNone;
+        agg->status = GameInputDeviceConnected;
+        agg->name = "Aggregate GameInput Device";
+        agg->display_name.data = agg->name.c_str();
+        agg->display_name.sizeInBytes = static_cast<uint32_t>(agg->name.size());
+        agg->display_name.codePointCount = static_cast<uint32_t>(agg->name.size());
+        agg->info.displayName = &agg->display_name;
+
+        std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
+        agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
+        agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+
+        g().devices.push_back(agg);
+        agg->AddRef();
+        *out = agg;
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE FindDeviceFromId(const AppLocalDeviceId* id, IGameInputDevice** out) override {
         if (!out) return E_POINTER;
