@@ -1,6 +1,6 @@
 // Synthetic texture UAVs through the Vulkan D3D12 device. It has no compute PSOs yet, so dispatch the translated
-// cs_texture_uav.asm through its actual Vulkan set 0. Every read-back texel is also checked against Windows WARP
-// for the UINT cases. Build the shader with runtime/test/shaders/build.py and pass the .spv as argv[1].
+// cs_texture_uav.asm through its actual Vulkan set 0. Non-atomic UINT cases also compare in-view writes with
+// Windows WARP. Build the shader with runtime/test/shaders/build.py and pass the .spv as argv[1].
 // LEONIDA_VK_VALIDATION=1 enables the Khronos validation layer. No game files are used.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
@@ -25,7 +25,7 @@ namespace g = leonida::gfx10;
 constexpr auto uav_heap = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 
 // Numeric values are also the branches selected by cs_texture_uav.asm.
-enum class Kind : UINT { one_d, array, volume, two_d, float_volume, float_array };
+enum class Kind : UINT { one_d, array, volume, two_d, float_volume, float_array, atomic_volume };
 
 D3D12_RESOURCE_DESC texture(Kind kind, UINT layers, DXGI_FORMAT format = DXGI_FORMAT_R32_UINT) {
     using enum Kind;
@@ -106,14 +106,20 @@ public:
 
     bool run(ID3D12Resource* resource, UINT mip, VkExtent3D extent, const Push& push,
              std::span<const std::uint32_t> input, std::span<std::uint32_t> output) {
-        const bool volume = resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const auto desc = resource->GetDesc();
+        const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const bool check_base_mip = push.kind == UINT(Kind::float_volume) && mip != 0;
+        const std::size_t base_texels = check_base_mip ? std::size_t(desc.Width) * desc.Height * desc.DepthOrArraySize : 0;
+        constexpr std::uint32_t base_marker = std::bit_cast<std::uint32_t>(4096.0f);
+        const VkDeviceSize bytes = input.size_bytes() + base_texels * sizeof(base_marker);
         const VkImage image = rt::d3d12::vulkan_image(resource);
         EXPECT(image);
         void *src = nullptr, *dst = nullptr;
-        const VkBuffer upload = vk_.buffer(input.size_bytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &src);
-        const VkBuffer readback = vk_.buffer(output.size_bytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dst);
+        const VkBuffer upload = vk_.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &src);
+        const VkBuffer readback = vk_.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dst);
         EXPECT(upload && readback);
         std::memcpy(src, input.data(), input.size_bytes());
+        std::fill_n(static_cast<std::uint32_t*>(src) + input.size(), base_texels, base_marker);
 
         EXPECT(vk_.run([&](VkCommandBuffer cb) {
             const auto barrier = vk_.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
@@ -122,15 +128,20 @@ public:
             texture_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             texture_barrier.srcQueueFamilyIndex = texture_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             texture_barrier.image = image;
-            texture_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, volume ? 1 : extent.depth};
+            texture_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, check_base_mip ? 0u : mip,
+                                                 check_base_mip ? mip + 1 : 1, 0, volume ? 1 : extent.depth};
             texture_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                     1, &texture_barrier);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, volume ? 1 : extent.depth};
-            copy.imageExtent = {extent.width, extent.height, volume ? extent.depth : 1};
+            VkBufferImageCopy copies[2]{};
+            copies[0].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, volume ? 1 : extent.depth};
+            copies[0].imageExtent = {extent.width, extent.height, volume ? extent.depth : 1};
+            copies[1].bufferOffset = input.size_bytes();
+            copies[1].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copies[1].imageExtent = {UINT(desc.Width), desc.Height, desc.DepthOrArraySize};
+            const UINT copy_count = check_base_mip ? 2 : 1;
             vk_.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(cb, upload, image, VK_IMAGE_LAYOUT_GENERAL,
-                                                                        1, &copy);
+                                                                        copy_count, copies);
             texture_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             texture_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             texture_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -150,7 +161,7 @@ public:
             barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &texture_barrier);
             vk_.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(cb, image, VK_IMAGE_LAYOUT_GENERAL, readback,
-                                                                        1, &copy);
+                                                                        copy_count, copies);
             VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
                                  VK_ACCESS_HOST_READ_BIT};
             barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
@@ -158,6 +169,8 @@ public:
             return true;
         }));
         std::memcpy(output.data(), dst, output.size_bytes());
+        const auto* base = static_cast<const std::uint32_t*>(dst) + output.size();
+        EXPECT(std::all_of(base, base + base_texels, [&](std::uint32_t word) { return word == base_marker; }));
         return true;
     }
 
@@ -210,7 +223,7 @@ bool rejects_partial_clear(ID3D12Device* device, ID3D12Resource* resource, D3D12
 bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_RESOURCE_DESC& shape,
                 D3D12_CPU_DESCRIPTOR_HANDLE source, D3D12_CPU_DESCRIPTOR_HANDLE copy, bool sliced,
                 UINT mip, UINT first, UINT count, bool use_default = false) {
-    const bool volume = kind == Kind::volume || kind == Kind::float_volume;
+    const bool volume = kind == Kind::volume || kind == Kind::float_volume || kind == Kind::atomic_volume;
     const bool floating = kind == Kind::float_volume || kind == Kind::float_array;
     const VkExtent3D extent{UINT(shape.Width) >> mip, std::max(1u, shape.Height >> mip),
                             volume ? std::max(1u, UINT(shape.DepthOrArraySize) >> mip) : shape.DepthOrArraySize};
@@ -252,7 +265,12 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
         for (UINT y = 0; y < extent.height; ++y)
             for (UINT x = 0; x < extent.width; ++x) {
                 const UINT i = (z * extent.height + y) * extent.width + x;
-                expected[i] = bits(17 + i + 1000 + x + 16 * y + 256 * (z - first));
+                const UINT initial = 17 + i;
+                const UINT add = 1000 + x + 16 * y + 256 * (z - first);
+                if (kind == Kind::atomic_volume)
+                    expected[i] = add + (initial << 16) + ((initial + 5) << 8) + 7 + 99;
+                else
+                    expected[i] = bits(initial + add + (kind == Kind::float_volume && x % 2 == 0 ? initial : 0));
             }
     EXPECT(compute.run(resource.Get(), mip, extent, {read_slot(copy), UINT(kind)}, input, output));
     for (UINT i = 0; i < output.size(); ++i) {
@@ -261,8 +279,8 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
                      UINT(kind), mip, first, count, i, output[i], expected[i]);
         return false;
     }
-    if (!floating) {
-        // Some native drivers do not clip out-of-range W accesses to WSize. Compare the documented in-view
+    if (!floating && kind != Kind::atomic_volume) {
+        // WARP did not clip out-of-range W accesses to WSize in the native probe. Compare documented in-view
         // D3D12 accesses and independently require Vulkan to preserve every non-view slice, even under overdispatch.
         EXPECT(uav_oracle::run(shape, use_default ? nullptr : &desc, input, host,
                                volume ? writable : kind == Kind::one_d ? 1 : 0));
@@ -432,6 +450,8 @@ bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
     EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 1, 2, ~0u));
     EXPECT(check_case(device.Get(), compute, float_volume, texture(float_volume, 8, DXGI_FORMAT_R32_FLOAT),
                       source, copy, vk.sliced_3d_uav, 1, 1, 2));
+    EXPECT(check_case(device.Get(), compute, atomic_volume, texture(atomic_volume, 8),
+                      source, copy, vk.sliced_3d_uav, 1, 1, 2));
     EXPECT(check_case(device.Get(), compute, two_d, texture(two_d, 1), source, copy, false, 1, 0, 1));
     return true;
 }
@@ -444,7 +464,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     vktest::Device vk;
-    if (!vk.create(true)) return 1;
+    // Exercise Vulkan 1.3 per-format access even on a logical device without the legacy feature bits.
+    if (!vk.create(true, false)) return 1;
     VkPhysicalDeviceProperties props{};
     vk.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(vk.physical, &props);
     if (!vk.bindless || !vk.robust_image_access || props.limits.maxPushConstantsSize < 144) {
@@ -456,6 +477,6 @@ int main(int argc, char** argv) {
         return 1;
     if (!vk.sliced_3d_uav) std::printf("SKIP: sliced 3D UAV GPU writes (feature unavailable); rejection verified\n");
     std::printf("texture UAVs: %u GPU cases (%u compared with WARP), format/range/refusal checks passed\n",
-                vk.sliced_3d_uav ? 12u : 9u, vk.sliced_3d_uav ? 10u : 8u);
+                vk.sliced_3d_uav ? 13u : 9u, vk.sliced_3d_uav ? 10u : 8u);
     return 0;
 }

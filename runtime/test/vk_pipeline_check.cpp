@@ -425,7 +425,9 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties indexed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    sgProps.pNext = &indexed;
     props2.pNext = &sgProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
@@ -521,6 +523,8 @@ int main(int argc, char** argv) {
             return "no VK_KHR_maintenance8";
 #endif
         }
+        // Vulkan 1.3 permits formatless storage SPIR-V capabilities without their legacy feature bits.
+        // A particular format's read/write support is checked when the runtime binds the actual view.
         for (const auto& feat : meta.features) {
             if (feat == "meshShader" && !(ext_mesh && mesh.meshShader)) return "no VK_EXT_mesh_shader";
             if (feat == "geometryShader" && !f2.features.geometryShader) return "no geometryShader";
@@ -532,17 +536,17 @@ int main(int argc, char** argv) {
             if (feat == "runtimeDescriptorArray" && !f12.runtimeDescriptorArray) return "no runtimeDescriptorArray";
             if (feat == "shaderImageGatherExtended" && !f2.features.shaderImageGatherExtended) return "no shaderImageGatherExtended";
             if (feat == "shaderResourceMinLod" && !f2.features.shaderResourceMinLod) return "no shaderResourceMinLod";
-            if (feat == "shaderStorageImageWriteWithoutFormat" && !f2.features.shaderStorageImageWriteWithoutFormat)
-                return "no shaderStorageImageWriteWithoutFormat";
-            if (feat == "shaderStorageImageReadWithoutFormat" && !f2.features.shaderStorageImageReadWithoutFormat)
-                return "no shaderStorageImageReadWithoutFormat";
         }
         return {};
     };
 
     // Resource contract (docs/design.md): set 0, runtime-sized arrays as large bindless arrays.
-    if (!leonida::bindless::layout_fits(props2.properties.limits, {}, false)) {
-        std::fprintf(stderr, "the checker set 0 exceeds the Vulkan limits for ordinary descriptor sets\n");
+    const bool needs_update_after_bind = !leonida::bindless::layout_fits(props2.properties.limits, indexed, false);
+    if (needs_update_after_bind &&
+        (!f12.descriptorBindingSampledImageUpdateAfterBind || !f12.descriptorBindingStorageImageUpdateAfterBind ||
+         !f12.descriptorBindingStorageBufferUpdateAfterBind ||
+         !leonida::bindless::layout_fits(props2.properties.limits, indexed, true))) {
+        std::fprintf(stderr, "the checker set 0 exceeds the Vulkan descriptor limits\n");
         return 1;
     }
     std::vector<VkDescriptorSetLayoutBinding> b;
@@ -552,6 +556,16 @@ int main(int argc, char** argv) {
     }
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
+    const std::vector<VkDescriptorBindingFlags> bind_flags(
+        needs_update_after_bind ? b.size() : 0, VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
+    VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    if (needs_update_after_bind) {
+        binding_flags.bindingCount = uint32_t(bind_flags.size());
+        binding_flags.pBindingFlags = bind_flags.data();
+        dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        dli.pNext = &binding_flags;
+    }
     VkDescriptorSetLayout dsl;
     if (VkResult r = vkCreateDescriptorSetLayout(dev, &dli, nullptr, &dsl)) { std::fprintf(stderr, "layout %d\n", r); return 1; }
     VkPushConstantRange pcr{VK_SHADER_STAGE_ALL, 0, 144};

@@ -502,7 +502,9 @@ and any validation error fails them.
     destroyed, from the view's own bytes.
 - `d3d12_texture_uav_test` (D3D-78): creates 1D, 1D-array, 3D and 2D control UAVs through the D3D12 device,
   checks rejected descriptors, copies descriptors between slots, and dispatches a translated hand-written
-  shader on the actual set 0. It reads back every texel; the UINT cases also run on Windows WARP.
+  shader from a Vulkan compute pipeline on the actual set 0, not through D3D12 `Dispatch`. It reads back every
+  texel; the UINT read/modify/write cases (not atomics) also run on Windows WARP. The D3D12 command-list path
+  is used separately to flush the set and to test clears.
   The tests dispatch past the selected array/W range, so writes to an adjacent layer or slice fail the check.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
@@ -640,13 +642,15 @@ The layer's descriptor model:
   partial views in the hash table and rebases the translator's float fetch path; see the contract in `docs/design.md`.
   Without those features a partial W view is logged and left null, not made writable across the whole mip.
   These new dimensions require storage-write-without-format support for the typed view format and, when the
-  translator reads through the storage binding, storage-read-without-format as well.
+  translator reads through the storage binding, storage-read-without-format as well. Vulkan 1.3 permits the
+  SPIR-V capabilities even when the legacy `shaderStorageImage{Read,Write}WithoutFormat` bits are not enabled;
+  the caller-owned device test leaves both bits off and checks the per-format path.
   `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
   cannot target a slice interval or guarantee preserving the reinterpreted bits.
   Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
-  Hardware D3D12 on the RTX 4090 and UHD 770 clipped typed writes to the view's W range; WARP 10.0.26100.9818
-  rebased the view but did not clip writes past a finite `WSize`. The regression compares in-range writes with WARP
-  and checks preservation of out-of-range slices independently.
+  A separate native D3D12 probe on the RTX 4090 and UHD 770 clipped typed writes to the view's W range.
+  WARP 10.0.26100.9818 rebased the view but did not clip writes past a finite `WSize` in that probe. The
+  regression compares in-range writes with WARP and checks preservation of out-of-range slices independently.
 - Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
   images, 256 1D, 256 3D, 1024 storage images and 256 per storage dimension/class; start there and grow by
   recreating the set at a frame boundary. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not

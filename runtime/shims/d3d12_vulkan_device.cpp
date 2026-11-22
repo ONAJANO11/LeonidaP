@@ -2254,6 +2254,8 @@ private:
                     log_once("texture view format does not support sampled access:", view_format);
                     return;
                 }
+                // Vulkan 1.3 allows the formatless SPIR-V capabilities independently of the legacy VkDevice
+                // feature bits. Validate the actual view's format, including on a caller-owned logical device.
                 if (!(features & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) ||
                     (storage_read && !(features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))) {
                     log_once("texture view format lacks the required formatless storage image access:", view_format);

@@ -87,7 +87,7 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create(bool enable_sliced_3d_uav = false) {
+    bool create(bool enable_sliced_3d_uav = false, bool enable_legacy_formatless_features = true) {
         instance_proc = load_vulkan();
         if (!instance_proc) return false;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
@@ -238,8 +238,10 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
-        enable.shaderStorageImageReadWithoutFormat = features.features.shaderStorageImageReadWithoutFormat;
-        enable.shaderStorageImageWriteWithoutFormat = features.features.shaderStorageImageWriteWithoutFormat;
+        enable.shaderStorageImageReadWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageReadWithoutFormat;
+        enable.shaderStorageImageWriteWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
