@@ -156,6 +156,7 @@ public:
     const leonida::CommandList& commands() const { return list_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
     UINT back_stencil_ref() const { return back_stencil_ref_; }
+    std::array<float, 2> depth_bounds() const { return {depth_bounds_min_, depth_bounds_max_}; }
 
     D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override {
         d3d12_trace::record("ID3D12CommandList::GetType");
@@ -653,6 +654,15 @@ public:
         check(list_.build_acceleration_structure(cmd));
     }
 
+    // GCL1. Kept for every later draw and applied with vkCmdSetDepthBounds when the draw's pipeline has the
+    // depth-bounds test on. D3D12 requires both bounds in [0, 1] (the debug layer reports others) and Vulkan without
+    // VK_EXT_depth_range_unrestricted does too, so they are clamped; NaN becomes 0. Min > max is kept as given:
+    // D3D12 then fails every sample, which the replay does with an empty scissor (Vulkan requires min <= max).
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+        depth_bounds_min_ = unit(min);
+        depth_bounds_max_ = unit(max);
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -759,6 +769,7 @@ private:
         }
         return true;
     }
+    static float unit(float value) { return value > 0.0f ? (value < 1.0f ? value : 1.0f) : 0.0f; }
 
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
@@ -817,6 +828,8 @@ private:
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     bool stencil_ref_set_ = false;
+    float depth_bounds_min_ = 0.0f;
+    float depth_bounds_max_ = 1.0f;
     RootState compute_;
     RootState graphics_;
     std::uintptr_t compute_pipeline_ = 0;
@@ -858,6 +871,8 @@ private:
 
     void reset_state(ID3D12PipelineState* state) {
         front_stencil_ref_ = back_stencil_ref_ = 0;
+        depth_bounds_min_ = 0.0f;
+        depth_bounds_max_ = 1.0f;
         compute_ = {};
         graphics_ = {};
         topology_ = 0;
@@ -881,7 +896,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
+                           base_vertex, first_instance, depth_bounds_min_, depth_bounds_max_};
         check(list_.draw(draw));
     }
 };
@@ -1334,6 +1349,14 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
     if (!l) return false;
     front = l->front_stencil_ref();
     back = l->back_stencil_ref();
+    return true;
+}
+
+bool depth_bounds(ID3D12GraphicsCommandList1* list, FLOAT& min, FLOAT& max) {
+    const GraphicsCommandList* l = GraphicsCommandList::from(list);
+    if (!l) return false;
+    min = l->depth_bounds()[0];
+    max = l->depth_bounds()[1];
     return true;
 }
 

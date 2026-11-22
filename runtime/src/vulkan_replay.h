@@ -703,6 +703,7 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    bool depth_bounds_test = false;       // VK_DYNAMIC_STATE_DEPTH_BOUNDS, set from the draw's bounds
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -753,6 +754,7 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
+    PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // only for pipelines with the depth-bounds test
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
@@ -1526,6 +1528,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+    if (pipeline->depth_bounds_test && !vk.set_depth_bounds) return ReplayResult::unsupported;
     p.graphics = *pipeline;
     p.area = {UINT32_MAX, UINT32_MAX};
     std::uint32_t layers = UINT32_MAX;
@@ -3092,6 +3095,16 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (p.graphics.depth_bounds_test && draw->depth_bounds_min > draw->depth_bounds_max) {
+                // D3D12 fails every sample when min > max; Vulkan requires min <= max
+                // (VUID-vkCmdSetDepthBounds-minDepthBounds-10912). The bounds stay legal and an empty scissor drops
+                // the draw's samples, after its vertex work, as on D3D12.
+                vk.set_depth_bounds(command_buffer, 0.0f, 1.0f);
+                const VkRect2D none{};
+                vk.set_scissor(command_buffer, 0, 1, &none);
+            } else if (p.graphics.depth_bounds_test) {
+                vk.set_depth_bounds(command_buffer, draw->depth_bounds_min, draw->depth_bounds_max);
+            }
             for (std::uint32_t slot = 0; slot < p.vertex_buffers.size(); ++slot) {
                 if (!p.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &p.vertex_buffers[slot], &p.vertex_offsets[slot],

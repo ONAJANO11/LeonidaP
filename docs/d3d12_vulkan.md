@@ -146,6 +146,7 @@ The command-list surface maps to the IR as follows:
 | `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology |
 | `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
+| `OMSetDepthBounds` (GCL1) | state, clamped to [0, 1]; `vkCmdSetDepthBounds` at draws whose PSO has the depth-bounds test |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
 | `Dispatch` / `DispatchMesh` | command with a state snapshot |
 | `Copy*` / `Resolve*` / `Clear*` | copy/clear command |
@@ -635,6 +636,14 @@ The compute path, end to end:
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
     index's `features` list is not read yet, so a shader that needs a feature the GPU lacks is not refused up front.
+    topology, vertex strides, stencil references and the blend factor are dynamic.
+  - **Depth bounds:** `GraphicsPipelineExtras::depth_bounds_test` (what a stream's `D3D12_DEPTH_STENCIL_DESC1`
+    `DepthBoundsTestEnable` maps to; `create_graphics_pipeline_state`) turns on `depthBoundsTestEnable` with
+    `VK_DYNAMIC_STATE_DEPTH_BOUNDS`, and each draw applies the list's `OMSetDepthBounds` values. It needs the
+    `depthBounds` feature (`VulkanDeviceInfo::features`); without it such a PSO is refused with `E_INVALIDARG`,
+    as D3D12 refuses it when `OPTIONS2.DepthBoundsTestSupported` is FALSE. The plain desc has no such field, so
+    `CreateGraphicsPipelineState` never turns it on (`d3d12_depth_bounds_test`, `d3d12_gcl1_test`).
+  - **Formats:** dynamic rendering takes the RTV and DSV formats.
   - **Refused with a log:** hull, domain and geometry stages, stream output, MSAA, set-0 bindings, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole

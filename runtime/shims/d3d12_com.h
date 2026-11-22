@@ -210,6 +210,16 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
+// What a pipeline state stream (ID3D12Device2::CreatePipelineState) carries beyond
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC. Zero-initialised, it is that desc.
+struct GraphicsPipelineExtras {
+    bool depth_bounds_test = false;  // D3D12_DEPTH_STENCIL_DESC1 / DESC2 DepthBoundsTestEnable
+};
+
+// CreateGraphicsPipelineState with `extras` on a device from create_vulkan_device* (or its Xbox-ABI proxy). The
+// stream path builds on this; tests use it to reach the fields the plain desc has no room for.
+HRESULT create_graphics_pipeline_state(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                                       const GraphicsPipelineExtras& extras, REFIID riid, void** out);
 
 // Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
@@ -277,6 +287,10 @@ leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue);
 // `list`. The values are kept for the future pipeline path, which is what would apply them. False when `list` is
 // not one of this module's command lists.
 bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT& back);
+
+// The depth bounds the next draw recorded on `list` would use (ID3D12GraphicsCommandList1::OMSetDepthBounds, after
+// clamping to [0, 1]; 0 and 1 after Reset and ClearState). False when `list` is not one of this module's lists.
+bool depth_bounds(ID3D12GraphicsCommandList1* list, FLOAT& min, FLOAT& max);
 
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
