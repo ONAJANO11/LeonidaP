@@ -624,13 +624,18 @@ class TextureModeChecks(unittest.TestCase):
                 (Path(tmp) / f"{shader}.spv").touch()
             with patch.object(check, "run", return_value=answer) as run:
                 problem = check.texture_mode_test("tools", tmp, name)
-            self.assertEqual(run.call_args.args[1], check.TEXTURE_MODES[name])
+            mode = check.TEXTURE_MODES[name]
+            self.assertEqual(run.call_args.args[1:-1], (mode,) if mode else ())    # then the dump path
             self.assertEqual(run.call_args.kwargs["cwd"], tmp)
             self.assertTrue(Path(run.call_args.args[0]).is_absolute())
         return problem
 
     def test_passed_is_ok(self):
         self.assertEqual(self.run_mode((0, "ok -> pixels.raw\nvk_texture_test dref: PASSED (4096 pixels)\n")), "")
+
+    def test_the_default_mode_takes_no_mode_argument(self):
+        # vk_texture_test [out] draws ps_texture_sample; a mode word there would be read as the dump path
+        self.assertEqual(self.run_mode((0, "vk_texture_test: PASSED\n"), name="ps_texture_sample"), "")
 
     def test_failure_and_missing_passed_fail(self):
         problem = self.run_mode((1, "vk_texture_test dref: FAILED, 0 pixels wrong in the f32 result and 2048 in the d16"))

@@ -850,8 +850,10 @@ def sampler_test(tools, spirv):
 
 
 # Shaders vk_texture_test draws and judges in one of its own modes (it loads vs_ids.spv and the shader from its
-# working directory and prints PASSED), as scripts/run_gpu_tests.py runs them: name -> mode.
-TEXTURE_MODES = {"ps_cube_sample": "cube", "ps_sample_c_lz": "dref", "ps_sample_c_lz_a16": "dref_a16"}
+# working directory and prints PASSED), as scripts/run_gpu_tests.py runs them: name -> mode, None for its default
+# mode, which takes no mode argument.
+TEXTURE_MODES = {"ps_texture_sample": None, "ps_cube_sample": "cube", "ps_sample_c_lz": "dref",
+                 "ps_sample_c_lz_a16": "dref_a16"}
 
 
 def texture_mode_test(tools, spirv, name):
@@ -861,7 +863,8 @@ def texture_mode_test(tools, spirv, name):
             return f"missing {shader}.spv"
     tool = os.path.abspath(os.path.join(tools, "vk_texture_test" + EXE))
     with tempfile.TemporaryDirectory(prefix="leonida-texture-") as tmp:
-        code, out = run(tool, TEXTURE_MODES[name], str(Path(tmp) / "pixels.raw"), cwd=spirv)
+        mode = [TEXTURE_MODES[name]] if TEXTURE_MODES[name] else []
+        code, out = run(tool, *mode, str(Path(tmp) / "pixels.raw"), cwd=spirv)
     if code == UNSUPPORTED:
         m = re.search(r"unsupported: .*", out)
         return Skip(f"SKIP ({m.group(0) if m else 'unsupported device'})")
