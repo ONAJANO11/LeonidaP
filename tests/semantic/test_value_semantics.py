@@ -49,6 +49,7 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 """
 import math
 import os
+import re
 import struct
 import sys
 import unittest
@@ -666,6 +667,80 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
+
+
+class FrexpLdexpF32(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_frexp_f32.asm and cs_w32_ldexp_f32.asm: v_frexp_mant_f32, v_frexp_exp_i32_f32 and
+    v_ldexp_f32 on normal values, +-0, +-inf, a quiet NaN, the overflow/underflow edges and S1 = 0x7FFFFFFF /
+    0x80000000. The words are the GPU check's (check.py CS_DUMPS), derived in each .asm header; a plain-Python
+    reference (math.frexp / math.ldexp on the binary32 values) gives the same words."""
+
+    WANT = {"cs_w32_frexp_f32": [0x3F400000, 0xBF4CCCCD, 0xFF800000, 0x7FC00123, 0x4, 0xFFFFFFFD, 0x80, 0x1],
+            "cs_w32_ldexp_f32": [0x41400000, 0xFF800000, 0xFF400000, 0x7F800000, 0x00800000, 0x80000000,
+                                 0x7F800000, 0x80000000]}
+
+    @staticmethod
+    def f32(bits):
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+    @staticmethod
+    def bits(x):
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+
+    def mant(self, b):
+        x = self.f32(b)
+        return b if math.isinf(x) or math.isnan(x) or x == 0 else self.bits(math.frexp(x)[0])
+
+    def exp(self, b):
+        x = self.f32(b)
+        return 0 if math.isinf(x) or math.isnan(x) or x == 0 else math.frexp(x)[1] & 0xFFFFFFFF
+
+    def ldexp(self, b, n):
+        x = self.f32(b)
+        if math.isinf(x) or math.isnan(x):
+            return b
+        n = n - (1 << 32) if n & 0x80000000 else n
+        y = math.ldexp(x, max(-1000, min(1000, n)))       # a Python float holds 2^+-1000 exactly
+        if abs(y) >= 2.0 ** 128:
+            return self.bits(math.copysign(math.inf, x))
+        if y != 0 and abs(y) < 2.0 ** -149:              # far below the binary32 range: a zero of x's sign
+            return self.bits(math.copysign(0.0, x))
+        return self.bits(y)
+
+    def test_reference(self):
+        frexp = [self.mant(0x41400000), self.mant(0xBDCCCCCD), self.mant(0xFF800000), self.mant(0x7FC00123),
+                 self.exp(0x41400000), self.exp(0x3DCCCCCD), self.exp(0x7F7FFFFF),
+                 (self.exp(0x7F800000) | self.exp(0x7FC00123) | self.exp(0x80000000)) + self.exp(0x3F800000)]
+        ldexp = [self.ldexp(0x3FC00000, 3), self.ldexp(0xFF800000, -300 & 0xFFFFFFFF), self.ldexp(0xBFC00000, 127),
+                 self.ldexp(0x3F800000, 128), self.ldexp(0x3F800000, -126 & 0xFFFFFFFF),
+                 self.ldexp(0xBF800000, -200 & 0xFFFFFFFF), self.ldexp(0x3F800000, 0x7FFFFFFF),
+                 self.ldexp(0xC0000000, 0x80000000)]
+        self.assertEqual(frexp, self.WANT["cs_w32_frexp_f32"])
+        self.assertEqual(ldexp, self.WANT["cs_w32_ldexp_f32"])
+
+    def test_gpu_runners_expect_the_same_words(self):
+        for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
+            with open(os.path.join(support.ROOT, *rel), encoding="utf-8") as f:
+                text = f.read()
+            for name, want in self.WANT.items():
+                m = re.search(r'"%s"\)?[,:]\s*\[([^\]]*)\]' % name, text)
+                with self.subTest(file="/".join(rel), shader=name):
+                    self.assertIsNotNone(m)
+                    self.assertEqual([int(v, 0) for v in m.group(1).split(",")], want)
+
+    def test_translated_shaders(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        for name, want in self.WANT.items():
+            with self.subTest(shader=name):
+                header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+                spv = support.translate_fixture(name, fssm=bytes(header))
+                memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+                si.run_workgroup(spv, 32, 32,
+                                 inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+                                 push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+                self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
+                self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 if __name__ == "__main__":
     unittest.main()
