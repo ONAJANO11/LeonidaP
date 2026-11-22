@@ -9,8 +9,17 @@
 //     process-wide atexit table also holds gta6rt's own).
 // Covered CRTs: the Universal CRT (api-ms-win-crt-runtime-l1-1-0.dll / ucrtbase.dll, what MSVC links; ucrtbased.dll in Debug) and
 // msvcrt.dll (MinGW). Calls made inside host DLLs, not through the game's imports, are not seen here.
+// CreateThread and _beginthreadex are served too (RT-119): on Windows a thread created with size 0 inherits the
+// main image's SizeOfStackReserve. gta6rt maps the game into a host EXE with a smaller reserve, so a size-0 thread
+// would otherwise get gta6rt.exe's stack. The shim supplies the game image's reserve, set by the loader before any
+// mapped code runs. A nonzero caller size is passed through untouched (without STACK_SIZE_PARAM_IS_A_RESERVATION it
+// is a commit size, not a reserve). The loader matches imports by exact DLL name, so each function is registered
+// under every name a title can import it by: kernel32/kernelbase/API set for CreateThread, the CRTs for the other.
 #include <windows.h>
 
+#include <process.h>
+
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +44,10 @@ char** g_argv_ptr = nullptr;
 wchar_t** g_wargv_ptr = nullptr;
 char** g_env = nullptr;
 wchar_t** g_wenv = nullptr;
+
+std::size_t g_stack_reserve = 0;  // the mapped image's reserve; 0 until set_thread_stack is called
+
+std::size_t game_stack_reserve() { return g_stack_reserve ? g_stack_reserve : kDefaultStackReserve; }
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
@@ -121,6 +134,28 @@ int __cdecl game_wgetmainargs(int* argc, wchar_t*** argv, wchar_t*** env, int, v
     return 0;
 }
 
+// ---- thread stacks (RT-119)
+// Only size 0 is substituted: that is the case Windows resolves from the main image's reserve. A nonzero size is
+// the caller's request and is passed through with its original flags -- without STACK_SIZE_PARAM_IS_A_RESERVATION
+// it means initial commit, which must not be turned into a huge reservation.
+HANDLE __stdcall game_create_thread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stack, LPTHREAD_START_ROUTINE start,
+                                    LPVOID parameter, DWORD flags, LPDWORD thread_id) {
+    if (stack == 0) {
+        stack = static_cast<SIZE_T>(game_stack_reserve());
+        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+    }
+    return CreateThread(attributes, stack, start, parameter, flags, thread_id);
+}
+
+uintptr_t __cdecl game_begin_threadex(void* security, unsigned stack, unsigned(__stdcall* start)(void*), void* arg,
+                                      unsigned flags, unsigned* thread_id) {
+    if (stack == 0) {
+        stack = static_cast<unsigned>(std::min<std::size_t>(game_stack_reserve(), 0xFFFFFFFFu));
+        flags |= STACK_SIZE_PARAM_IS_A_RESERVATION;
+    }
+    return _beginthreadex(security, stack, start, arg, flags, thread_id);
+}
+
 struct EntryCall {
     void* entry;
 };
@@ -134,6 +169,8 @@ DWORD WINAPI game_thread(void* p) {
 }
 
 }  // namespace
+
+void set_thread_stack(std::size_t reserve_bytes) { g_stack_reserve = reserve_bytes; }
 
 void set_command_line(const std::wstring& program, const std::vector<std::wstring>& args) {
     g_wargs.clear();
@@ -161,6 +198,7 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
 }
 
 int run_entry(void* entry, size_t stack_bytes) {
+    if (!stack_bytes) stack_bytes = game_stack_reserve();  // the mapped image's /STACK, not gta6rt.exe's default
     g_exited = false;
     g_exit_code = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -198,6 +236,8 @@ using namespace rt::process;
     {dll, "_configure_wide_argv", reinterpret_cast<void*>(&game_configure_argv)}, \
     {dll, "__p__acmdln", reinterpret_cast<void*>(&game_p_acmdln_storage)}, \
     {dll, "__p__wcmdln", reinterpret_cast<void*>(&game_p_wcmdln_storage)}
+#define CREATE_THREAD(dll) {dll, "CreateThread", reinterpret_cast<void*>(&game_create_thread)}
+#define BEGIN_THREADEX(dll) {dll, "_beginthreadex", reinterpret_cast<void*>(&game_begin_threadex)}
 }  // namespace
 
 SHIM_TABLE(process,
@@ -212,4 +252,11 @@ SHIM_TABLE(process,
     {"kernel32.dll", "ExitProcess", reinterpret_cast<void*>(&game_exit_process)},
     {"kernel32.dll", "GetCommandLineA", reinterpret_cast<void*>(&game_get_command_line_a)},
     {"kernel32.dll", "GetCommandLineW", reinterpret_cast<void*>(&game_get_command_line_w)},
+    CREATE_THREAD("kernel32.dll"),
+    CREATE_THREAD("kernelbase.dll"),
+    CREATE_THREAD("api-ms-win-core-processthreads-l1-1-0.dll"),
+    BEGIN_THREADEX("api-ms-win-crt-runtime-l1-1-0.dll"),
+    BEGIN_THREADEX("ucrtbase.dll"),
+    BEGIN_THREADEX("ucrtbased.dll"),
+    BEGIN_THREADEX("msvcrt.dll"),
 );

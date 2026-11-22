@@ -503,6 +503,8 @@ Module& Loader::map_image(const std::filesystem::path& path) {
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
+    m->stack_reserve_bytes = oh.SizeOfStackReserve;
+    m->stack_commit_bytes = oh.SizeOfStackCommit;
     by_name_[lower(m->name)] = m;
     order_.push_back(m);
 

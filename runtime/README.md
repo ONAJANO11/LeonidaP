@@ -122,6 +122,14 @@ slot. This reserves one index, so **one manually mapped TLS module can be live a
 one is rejected with an error instead of sharing the slot. Images without a TLS directory (or with an
 all-zero one) load normally.
 
+`load()` also records the image's `OptionalHeader.SizeOfStackReserve` (and `SizeOfStackCommit`). With `--run`, the
+entry-point thread and any thread a title creates with stack size 0 get that reserve: Windows gives a size-0 thread
+the main image's reserve, but gta6rt maps the title into a host EXE with a smaller one. The `CreateThread` (`kernel32`,
+`kernelbase`, `api-ms-win-core-processthreads-l1-1-0`) and `_beginthreadex` (the UCRT names and `msvcrt`) shims
+substitute it only for size 0; a nonzero size is the caller's commit size and is left alone (RT-119). The
+`run_stack_reserve` CTest fixture is linked with `/STACK:64MB` and checks `GetCurrentThreadStackLimits` on the entry
+point and both size-0 thread paths; `stack_reserve_shim` checks the import names and the nonzero path.
+
 Current limits, by design:
 
 - `load()` runs no image code. Static TLS is data, not code. The TLS index helper is the runtime's own

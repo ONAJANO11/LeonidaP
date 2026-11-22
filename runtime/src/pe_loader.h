@@ -31,6 +31,10 @@ struct Module {
     uint64_t preferred_base = 0;
     uint32_t size = 0;
     uint32_t entry_rva = 0;
+    // The image's OptionalHeader stack dimensions. On Windows a size-0 thread inherits the main EXE's reserve, so
+    // these are what gta6rt must give the game's entry-point and size-0 threads (RT-119). 0 means "not specified".
+    uint64_t stack_reserve_bytes = 0;
+    uint64_t stack_commit_bytes = 0;
     bool relocated = false;
     bool initialised = false;
 

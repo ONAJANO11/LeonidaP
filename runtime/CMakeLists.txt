@@ -197,6 +197,17 @@ if(WIN32)
   target_link_options(process_cmdline_test PRIVATE /OPT:NOREF)
   target_link_libraries(process_cmdline_test PRIVATE shell32)
 
+  # RT-119: the CreateThread / _beginthreadex stack shims, their import names and the size-0 substitution.
+  add_executable(stack_reserve_shim_test
+    test/stack_reserve_shim_test.cpp
+    shims/process.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(stack_reserve_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(stack_reserve_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(stack_reserve_shim_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(stack_reserve_shim_test PRIVATE /OPT:NOREF)
+
   # Console paths (GAME:) and the write overlay: the file shims resolved through the registry, over temporary folders.
   add_executable(file_system_test
     test/file_system_test.cpp
@@ -394,6 +405,15 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # RT-119: a stand-in game linked with a large /STACK. run_entry's thread and the threads it creates with size 0
+    # must inherit that reserve, not gta6rt.exe's default. The fixture checks GetCurrentThreadStackLimits itself.
+    add_executable(stack_reserve_fixture test/fixtures/stack_reserve_fixture.cpp)
+    target_compile_definitions(stack_reserve_fixture PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(stack_reserve_fixture PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(stack_reserve_fixture PRIVATE /STACK:67108864)  # 64 MiB reserve
+    set_target_properties(stack_reserve_fixture PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
@@ -572,6 +592,9 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
   endif()
+  if(WIN32 AND TARGET stack_reserve_shim_test)
+    add_test(NAME stack_reserve_shim COMMAND stack_reserve_shim_test)
+  endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
   endif()
@@ -593,6 +616,8 @@ if(BUILD_TESTING)
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gdk_load>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gdk.cmake")
     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+    # RT-119: the fixture exits 0 only when the entry point and both size-0 thread paths see its 64 MiB /STACK.
+    add_test(NAME run_stack_reserve COMMAND gta6rt --run $<TARGET_FILE:stack_reserve_fixture> --)
     add_test(NAME run_tiny_game_exit_code COMMAND tiny_game_exit_code_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     # Two modes at once are refused before anything is mapped (#886). The stand-in game's own arguments are passed,

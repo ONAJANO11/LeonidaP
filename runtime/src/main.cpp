@@ -81,6 +81,9 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // Before any image code runs (TLS callbacks and DllMain in initialise() can create threads), teach the
+        // process/thread shims the mapped image's /STACK reserve (RT-119). 0 falls back to the runtime default.
+        rt::process::set_thread_stack(static_cast<std::size_t>(main_module.stack_reserve_bytes));
         if (init || run) {
             loader.initialise();  // TLS callbacks, then DllMain(DLL_PROCESS_ATTACH) for DLLs
             std::printf("%zu module(s) initialised\n", loader.modules().size());
