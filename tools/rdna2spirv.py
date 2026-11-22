@@ -7318,12 +7318,27 @@ class Gen:
         self.emit(f"{clamped} = OpExtInst %float %glsl FMin {lower} {limits[1]}")
         return clamped
 
+    def nonneg_mod(self, c, m, zero):
+        """c mod m in [0, m) for an int c of either sign and m > 0: OpSRem (the dividend's sign, which every
+        driver agrees on) plus m when that remainder is negative. See gather_addr for why not OpSMod."""
+        r, neg, up, res = (self.tmp() for _ in range(4))
+        self.emit(f"{r} = OpSRem %int {c} {m}")
+        self.emit(f"{neg} = OpSLessThan %bool {r} {zero}")
+        self.emit(f"{up} = OpIAdd %int {r} {m}")
+        self.emit(f"{res} = OpSelect %int {neg} {up} {r}")
+        return res
+
     def gather_addr(self, c, n, mode):
         """Texel coordinate c (int id) after the address mode (int, or a uint id) for an axis of n texels (int id):
         wrap: c mod n; mirror: c mod 2n, reflected in the upper half; mirror once: the negative side reflected
         (-1 - c), then clamped; otherwise (clamp, and border modes at run time) clamped to [0, n-1]. As in the
         Vulkan address-mode definitions (and RADV's radv_tex_wrap mapping of them onto SQ_TEX_*). A literal mode
-        emits only the code it needs; a run-time one emits all four and selects."""
+        emits only the code it needs; a run-time one emits all four and selects.
+
+        The modulo is OpSRem plus n when the remainder is negative, not OpSMod: OpSMod already has the divisor's
+        (positive) sign by the SPIR-V spec, but AMD's Windows driver 24.10.24 on a Ryzen 5 7600 iGPU returned
+        all-zero gathers in exactly the ps_gather_wrap cases whose coordinate is negative (SHADER-369), as if it
+        took the dividend's sign; the explicit form is the same value under either reading."""
         zero, one = self.as_int(self.cu(0)), self.as_int(self.cu(1))
         static = isinstance(mode, int)
         want = {mode if mode <= 3 else 2} if static else {0, 1, 2, 3}
@@ -7334,12 +7349,11 @@ class Gen:
             res[2] = self.tmp()
             self.emit(f"{res[2]} = OpExtInst %int %glsl SClamp {c} {zero} {nm1}")
         if 0 in want:
-            res[0] = self.tmp()
-            self.emit(f"{res[0]} = OpSMod %int {c} {n}")
+            res[0] = self.nonneg_mod(c, n, zero)
         if 1 in want:
-            n2, p, hi, rf, lt, res[1] = (self.tmp() for _ in range(6))
+            n2, hi, rf, lt, res[1] = (self.tmp() for _ in range(5))
             self.emit(f"{n2} = OpIAdd %int {n} {n}")
-            self.emit(f"{p} = OpSMod %int {c} {n2}")
+            p = self.nonneg_mod(c, n2, zero)
             self.emit(f"{hi} = OpISub %int {n2} {one}")
             self.emit(f"{rf} = OpISub %int {hi} {p}")
             self.emit(f"{lt} = OpSLessThan %bool {p} {n}")
