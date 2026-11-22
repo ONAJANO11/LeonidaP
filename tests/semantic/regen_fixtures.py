@@ -21,7 +21,7 @@ SHADERS = ("ps_fnan_med3", "ps_fnan_fract",    # float NaN / fract rows measured
            "ps_legacy_mul", "ps_vcc_x2", "ps_flat", "cs_bounds", "cs_fmt_1010102", "cs_w64x_readlane",
            "cs_w64x_writelane", "cs_w64x_bpermute", "cs_w32_permute", "cs_w64x_permute", "cs_w64x_ballot", "cs_w64x_readfirstlane",
            "cs_w64x_load_ballot_load", "cs_w64x_partial", "cs_wave64_ballot", "cs_wm_bfm64", "cs_wm_half_cmp",
-           "cs_wavemask", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
+           "cs_wavemask", "cs_w32_permlane_fi", "cs_cvt_f32_sat", "ps_scc_minmax", "ps_fma_literal", "ps_f16_vop2",
            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap")
 
 

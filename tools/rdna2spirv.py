@@ -3221,6 +3221,22 @@ class Gen:
             self.emit(f"{src} = OpBitwiseOr %uint {row} {nib}")
             r = self.tmp()
             self.g_shuffle(r, v, src)
+            # op_sel:[FI, BOUND_CTRL] (LLVM: llvm.amdgcn.permlane16 <fi> <bound_control> -> op_sel bits 0 and 1).
+            # FI=1 fetches the value of a source lane that is off in EXEC. FI=0 does not: the destination lane keeps
+            # its old value (BOUND_CTRL=0) or gets 0 (BOUND_CTRL=1). Measured on RDNA2 (issue #374).
+            (fi, bc), _ = self.opsel_bits(mods, 2)
+            if not fi:
+                sa, ok, old, r2 = (self.tmp() for _ in range(4))
+                self.emit(f"{sa} = OpSelect %uint {self.active_b()} {self.cu(1)} {self.cu(0)}")
+                act = self.tmp()
+                self.g_shuffle(act, sa, src)
+                self.emit(f"{ok} = OpINotEqual %bool {act} {self.cu(0)}")
+                if bc:
+                    self.emit(f"{r2} = OpSelect %uint {ok} {r} {self.cu(0)}")
+                else:
+                    self.emit(f"{old} = OpCopyObject %uint {self.load_reg('vgpr', a[0]['r'])}")
+                    self.emit(f"{r2} = OpSelect %uint {ok} {r} {old}")
+                r = r2
             self.dst(a[0], r)
         elif op.startswith("buffer_load_dword"):
             self.buffer_load(op, a, mods)
