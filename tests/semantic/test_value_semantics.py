@@ -36,6 +36,12 @@ ISA semantics used (AMD RDNA2 ISA reference, VALU/VOP3/VOP3P chapters):
   v_mad_u32_u16 /       D = S0.lo * S1.lo + S2 mod 2^32, the halves zero- (u16) or sign-extended (i16); op_sel bit
   v_mad_i32_i16           0/1 reads the high half of S0/S1. D is a whole dword (nothing of the old value is kept).
   v_subrev_f16          D.lo = S1.lo - S0.lo; the high half of D is kept in the VOP2 and the VOP3 form.
+  s_pack_xy_b32_b16     D = {S1 half y, S0 half x}, l = bits 15:0, h = bits 31:16.
+  s_sext_i32_i8/i16     D = S0 bits 7:0 / 15:0 sign-extended.
+  s_lshlN_add_u32       D = (S0 << N) + S1, SCC = carry out of bit 31 (N = 1..4).
+  s_absdiff_i32         D = |S0 - S1| of the 32-bit wrapped difference read as signed; SCC = D != 0.
+  s_mul_hi_i32          bits 63:32 of the signed 64-bit product.
+  s_cmov_b32/cmovk_i32  D = SCC ? S0 : D; cmovk's S0 is the 16-bit immediate sign-extended.
   s_*_saveexec_b32/b64, a constant used as a lane mask gives lane L its bit L: of the 32-bit value for a b32 op,
   s_andn2_wrexec_*,       of the 64-bit value for a b64 op (inline constants sign-extended, literals with a zero
   s_mov/s_not/s_and_b64   high word). cs_w32_mask_imm / cs_w64_mask_imm run every lane of a wave (LaneMaskConstants).
@@ -76,6 +82,7 @@ EXPECTED_FMT_1010102 = {0x00: 0x00000000, 0x04: 0x3F800000, 0x08: 0x00000000, 0x
 EXPECTED_SFF_IMM = [0x00000002, 0x00000001, 0x00000014, 0x00000010]
 EXPECTED_VALU16_MAD = [0x00000002, 0x00030002, 0x00008000, 0x00000004]
 EXPECTED_VALU16_SUBREV = [0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800]
+EXPECTED_SALU_PACK_ADD = [0x98846211, 0xFFFFFF8D, 0x83328116, 0xFD3DB108]
 
 
 def _f32_bits(x):
@@ -293,6 +300,52 @@ def reference_valu16_subrev():
             0x42000000 | _half(a - d)]
 
 
+def reference_salu_pack_add():
+    """ps_salu_pack_add (layout in the .asm header), from the RDNA2 ISA pseudocode of each op."""
+    m = 0xFFFFFFFF
+
+    def pack(kind, x, y):                     # s_pack_{ll,lh,hh}_b32_b16: low half from S0, high half from S1
+        lo = x >> 16 if kind[0] == "h" else x & 0xFFFF
+        hi = y >> 16 if kind[1] == "h" else y & 0xFFFF
+        return hi << 16 | lo
+
+    def sext(x, bits):
+        x &= (1 << bits) - 1
+        return (x - (1 << bits) if x >> (bits - 1) else x) & m
+
+    def lshl_add(n, x, y):                    # (D, SCC): SCC = the 33rd bit of the sum (carry out)
+        t = (x << n) + y
+        return t & m, int(t > m)
+
+    def absdiff(x, y):                        # (D, SCC): wrapped difference, then signed abs; SCC = D != 0
+        d = abs(_s((x - y) & m)) & m
+        return d, int(d != 0)
+
+    def mul_hi_i32(x, y):
+        return ((_s(x) * _s(y)) >> 32) & m
+
+    def cmov(scc, src, old):
+        return src if scc else old
+
+    s0, s1 = 0x00020001, 0x00080004
+    w0 = (pack("ll", s0, s1) | pack("lh", s0, s1) << 4 | pack("hh", s0, s1) << 8
+          | (cmov(1, 2, 1) | cmov(0, 2, 1) << 2) << 12 | cmov(0, 3, 9) << 28)
+    a, b = sext(0x000001F6, 8), sext(0xFFFFFF7B, 8)
+    c, d = sext(0xFFFF7FF3, 16), sext(0x00018005, 16)
+    w1 = pack("lh", a, d) ^ pack("lh", b, c)
+    w2 = 0
+    for i, (n, x, y) in enumerate(((1, 3, 16), (2, 0x3FFFFFFF, 5), (3, 5, 10), (4, 0x0FFFFFFF, 19))):
+        r, scc = lshl_add(n, x, y)
+        w2 |= (r | scc << 7) << (8 * i)
+    w3 = 0
+    for i, (x, y) in enumerate(((m - 2, 5), (7, 7), (0x7FFFFFFF, 0x80000000), (9, m - 1))):
+        r, scc = absdiff(x, y)
+        w3 |= r << (4 * i) | scc << (16 + i)
+    w3 |= (mul_hi_i32(0xC0000000, m - 11) & 15) << 20 | (mul_hi_i32(0xC0000000, 12) & 15) << 24
+    w3 |= cmov(1, sext(0xFFF8, 16), 5) & 0xF0000000
+    return [w0 & m, w1, w2, w3]
+
+
 def _isg1_dxbc(elements):
     """A DXBC container with one ISG1 input signature. elements: (register, mask, system value, component type)."""
     payload = bytearray(struct.pack("<II", len(elements), 8))
@@ -342,6 +395,7 @@ class OracleTests(unittest.TestCase):
         self.assertEqual(reference_sff_imm(), EXPECTED_SFF_IMM)
         self.assertEqual(reference_valu16_mad(), EXPECTED_VALU16_MAD)
         self.assertEqual(reference_valu16_subrev(), EXPECTED_VALU16_SUBREV)
+        self.assertEqual(reference_salu_pack_add(), EXPECTED_SALU_PACK_ADD)
 
 
 class TranslatorValueSemantics(unittest.TestCase):
@@ -477,6 +531,13 @@ class TranslatorValueSemantics(unittest.TestCase):
         # SHADER-46: an inline constant or literal is a 32-bit value. Read as a lane mask (all ones or zero from
         # bit 0), s_ff0 of 61 and of 0x0000ffff gave -1; the s_ff1 words guard the path it already got right.
         self.check("ps_sff_imm", EXPECTED_SFF_IMM)
+
+    def test_salu_pack_sext_shift_add_absdiff_mul_hi_cmov(self):
+        # s_pack_ll/lh/hh pick each source half; s_sext_i32_i8/i16 drop the bits above the field; s_lshl1..4_add
+        # set SCC on a carry out of bit 31; s_absdiff_i32 takes the signed abs of the wrapped difference and sets
+        # SCC = D != 0; s_mul_hi_i32 is signed; s_cmov_b32/s_cmovk_i32 move only when SCC is 1 (cmovk
+        # sign-extends its immediate). Every SCC write follows a compare that set the opposite value.
+        self.check("ps_salu_pack_add", EXPECTED_SALU_PACK_ADD)
 
 
 class ReadLog(dict):

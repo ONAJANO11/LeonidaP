@@ -1140,6 +1140,8 @@ def run_suite(a, work: str) -> int:
                 # v_mad_u32_u16 / v_mad_i32_i16 and v_subrev_f16, which had CPU checks only (.asm headers)
                 "ps_valu16_mad": (0x00000002, 0x00030002, 0x00008000, 0x00000004),
                 "ps_valu16_subrev": (0xAAAABC00, 0xAAAAC000, 0xAAAA3C00, 0x42003800),
+                # s_pack_*, s_sext, s_lshlN_add, s_absdiff, s_mul_hi_i32, s_cmov(k) with SCC (.asm header)
+                "ps_salu_pack_add": (0x98846211, 0xFFFFFF8D, 0x83328116, 0xFD3DB108),
                 "ps_w64x_readlane": (0x40000079, 0x40000010, 0x40000064, 0x400000BE),   # same expectation as check.py
             }
             if skip := wide_pixel_skip(name, msg):   # a 64-wide pixel stage the device could not give: nothing to judge
