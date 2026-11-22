@@ -765,7 +765,7 @@ def run_suite(a, work: str) -> int:
         elif name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_exec_const", "cs_w32_lds_u8_d16", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
-                      "cs_w64_mask_detect",
+                      "cs_w64_mask_detect", "cs_imm_mask",
                       "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
@@ -802,6 +802,7 @@ def run_suite(a, work: str) -> int:
                 "cs_wm_bfm64": [16, 8, 8, 40],
                 "cs_wm_scc_rfl": [55, 48],
                 "cs_w64_mask_detect": [48],
+                "cs_imm_mask": [1, 100, 111, 10, 60, 0, 0xFFFFFFFF, 64],
                 "cs_wqm_w64": [20, 4, 12, 8, 1, 0, 15728895, 20],       # cs_wqm_w64.asm / cs_wqm_w32.asm headers
                 "cs_wqm_w32": [12, 1, 4, 0, 8, 15728880, 4, 32],
                 "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
@@ -847,7 +848,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
                                   "cs_w32_lds_u8_d16", "cs_bpermute32", "cs_w32_partial_scmp",
                                   "cs_exec_const", "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
-                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi") and not emulated and not partial
+                                  "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi",
+                                  "cs_imm_mask") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
