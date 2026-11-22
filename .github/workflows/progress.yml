@@ -1,0 +1,80 @@
+name: Source tracker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - runtime/**
+      - tools/**
+      - make_game.py
+      - .github/workflows/progress.yml
+  pull_request:
+    paths:
+      - runtime/**
+      - tools/**
+      - make_game.py
+      - .github/workflows/progress.yml
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-tracker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tools/progress_tracker/requirements.txt
+      - name: Install pinned source parsers
+        run: python -m pip install -r tools/progress_tracker/requirements.txt
+      - name: Test source inventories and rendering
+        run: python -I -W error -m unittest discover -s tools/progress_tracker/tests -v
+      - name: Generate reports without publishing
+        env:
+          PROGRESS_PREVIEW: ${{ runner.temp }}/source-progress
+        run: python -I tools/progress_tracker/run.py --output "$PROGRESS_PREVIEW"
+
+  refresh:
+    if: github.event_name != 'pull_request' && !github.event.repository.fork && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tools/progress_tracker/requirements.txt
+      - name: Install pinned source parsers
+        run: python -m pip install -r tools/progress_tracker/requirements.txt
+      - name: Refresh repository-owned assets
+        run: python -I tools/progress_tracker/run.py
+      - name: Commit successful source snapshot
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/progress
+          if ! git diff --cached --quiet; then
+            git commit -m 'docs: refresh source tracker'
+            git push origin HEAD:main
+          fi

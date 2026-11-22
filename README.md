@@ -36,6 +36,23 @@ happens **on your PC, from your own copy of the game**.
 Discord: https://discord.gg/rexed
 <br>
 
+[![D3D12 bodies](docs/progress/badge-methods.svg)](docs/progress/report.md)
+[![Shader selectors](docs/progress/badge-shader.svg)](docs/progress/report.md)
+[![Runtime bodies](docs/progress/badge-runtime.svg)](docs/progress/report.md)
+[![Asset tool bodies](docs/progress/badge-assets.svg)](docs/progress/report.md)
+[![Last source check](docs/progress/badge-updated.svg)](docs/progress/report.md)
+
+[![Leonida subsystem source inventories](docs/progress/dashboard.svg)](docs/progress/report.md)
+
+<details>
+<summary>Source inventory history</summary>
+
+[![Source inventory history](docs/progress/history.svg)](docs/progress/history.md)
+
+</details>
+
+Automatically generated in this repository from committed source. Different units are tracked separately; source presence is not verified correctness or game completion. [Counting rules](tools/progress_tracker/README.md).
+
 ## Project status
 
 **Early. The game does not boot yet.** Everything that can be done without the game's executable is in place, so

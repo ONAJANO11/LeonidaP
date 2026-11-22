@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "series": [
+    {
+      "rules_id": "11deb513ea3f1ada",
+      "reference": {
+        "url": "https://raw.githubusercontent.com/microsoft/DirectX-Headers/61c7718954ec73dbdd43c723240fe1a0452a3724/include/directx/d3d12.h",
+        "revision": "61c7718954ec73dbdd43c723240fe1a0452a3724",
+        "sha256": "773657b07955f7cdd526fb77049c1d8c5d23679e8cbe9ede90443cd2c93d3fab",
+        "denominator": "SDK inheritance chains excluding IUnknown"
+      },
+      "points": [
+        {
+          "date": "2026-11-21",
+          "revision": "4abd54571b6efa02d97eda4711792fa00b455dc3",
+          "origin": "rescanned",
+          "body": 60,
+          "partial": 8,
+          "noop": 11,
+          "stub": 128,
+          "total": 207,
+          "metrics": {
+            "methods": {
+              "body": 60,
+              "partial": 8,
+              "noop": 11,
+              "stub": 128,
+              "total": 207
+            },
+            "shader": {
+              "body": 10,
+              "partial": 343,
+              "noop": 20,
+              "stub": 0,
+              "total": 373
+            },
+            "shader_py": {
+              "body": 171,
+              "partial": 61,
+              "noop": 0,
+              "stub": 0,
+              "total": 232
+            },
+            "runtime": {
+              "body": 301,
+              "partial": 5,
+              "noop": 4,
+              "stub": 8,
+              "total": 318
+            },
+            "assets": {
+              "body": 554,
+              "partial": 4,
+              "noop": 0,
+              "stub": 0,
+              "total": 558
+            },
+            "exporter": {
+              "body": 5,
+              "partial": 0,
+              "noop": 0,
+              "stub": 0,
+              "total": 5
+            },
+            "developer": {
+              "body": 188,
+              "partial": 9,
+              "noop": 0,
+              "stub": 0,
+              "total": 197
+            }
+          }
+        },
+        {
+          "date": "2026-11-22",
+          "revision": "a161e7b3534f500bc9356d94e590b7dff9d0e71c",
+          "origin": "observed",
+          "body": 74,
+          "partial": 14,
+          "noop": 12,
+          "stub": 107,
+          "total": 207,
+          "metrics": {
+            "methods": {
+              "body": 74,
+              "partial": 14,
+              "noop": 12,
+              "stub": 107,
+              "total": 207
+            },
+            "shader": {
+              "body": 10,
+              "partial": 372,
+              "noop": 19,
+              "stub": 0,
+              "total": 401
+            },
+            "shader_py": {
+              "body": 186,
+              "partial": 65,
+              "noop": 0,
+              "stub": 0,
+              "total": 251
+            },
+            "runtime": {
+              "body": 338,
+              "partial": 5,
+              "noop": 3,
+              "stub": 10,
+              "total": 356
+            },
+            "assets": {
+              "body": 655,
+              "partial": 4,
+              "noop": 0,
+              "stub": 0,
+              "total": 659
+            },
+            "exporter": {
+              "body": 5,
+              "partial": 0,
+              "noop": 0,
+              "stub": 0,
+              "total": 5
+            },
+            "developer": {
+              "body": 446,
+              "partial": 26,
+              "noop": 0,
+              "stub": 3,
+              "total": 475
+            }
+          }
+        }
+      ],
+      "metrics": [
+        {
+          "id": "methods",
+          "title": "D3D12 SDK methods",
+          "unit": "methods"
+        },
+        {
+          "id": "shader",
+          "title": "Shader translator \u00b7 declared selectors",
+          "unit": "selectors"
+        },
+        {
+          "id": "shader_py",
+          "title": "Shader pipeline \u00b7 Python definitions",
+          "unit": "definitions"
+        },
+        {
+          "id": "runtime",
+          "title": "Runtime \u00b7 C++ definitions",
+          "unit": "definitions"
+        },
+        {
+          "id": "assets",
+          "title": "Asset tools \u00b7 Python and C# definitions",
+          "unit": "definitions"
+        },
+        {
+          "id": "exporter",
+          "title": "Asset exporter \u00b7 command branches",
+          "unit": "commands"
+        },
+        {
+          "id": "developer",
+          "title": "Other Python tools",
+          "unit": "definitions"
+        }
+      ],
+      "unmeasured_history": [
+        {
+          "date": "2026-11-20",
+          "revision": "bd2dd1c874bb649fe84b6308f667de8812327e3f",
+          "reason": "Generated D3D12 interface list not found in runtime/CMakeLists.txt"
+        }
+      ]
+    }
+  ],
+  "current_rules_id": "11deb513ea3f1ada"
+}
