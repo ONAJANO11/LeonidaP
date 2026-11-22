@@ -21,6 +21,10 @@ per_vertex_inputs says whether the device can run a pixel shader with PerVertexK
 docs/design.md): the fragmentShaderBarycentric feature, and a driver other than MoltenVK, whose SPIR-V to MSL
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
+
+vertex_in_supported_stages says whether subgroup operations are supported in the vertex stage (subgroupSupportedStages).
+MoltenVK leaves the vertex bit out (a Metal vertex function has no SIMD-group lane); where it is false, the shaders are
+translated with --no-vertex-subgroups.
 """
 import ctypes
 import json
@@ -40,6 +44,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 100
 VK_DRIVER_ID_MOLTENVK = 14
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+VK_SHADER_STAGE_VERTEX_BIT = 0x1
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -206,6 +211,7 @@ def query() -> dict:
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_supported = bool(supported_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+        vertex_supported = bool(supported_stages & VK_SHADER_STAGE_VERTEX_BIT)
         can_require_64 = (sgc and lo <= 64 <= hi and compute_required and mesh_required and
                           compute_supported and mesh_supported)
         has_default_64 = subgroup_size == 64 and compute_supported and mesh_supported
@@ -221,6 +227,7 @@ def query() -> dict:
             "mesh_in_supported_stages": mesh_supported,
             "native64": bool(can_require_64 or has_default_64),
             "per_vertex_inputs": per_vertex,
+            "vertex_in_supported_stages": vertex_supported,
         }
     finally:
         vk.vkDestroyInstance(inst, None)

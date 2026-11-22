@@ -69,6 +69,12 @@ MESH_COMPUTE = False
 # room for the halves of params 0..(29 - P) / 2; Gen.export skips the ones that would land on its own params.
 F16_HALVES = False
 F16_HALF_TOP = 30
+# --no-vertex-subgroups: for devices whose subgroupSupportedStages has no vertex bit (MoltenVK: a Metal vertex function
+# has no SIMD-group lane, and SPIRV-Cross stops with "Subgroup builtins are not available in this type of function").
+# A run-time V# in a VS then leaves the ADD_TID_ENABLE lane out of the index (Gen.buffer_address), which is exact while
+# the bit is clear, so a VS that fetches through one declares no subgroup builtin; a literal V# with the bit set is
+# Unsupported. The VS's own wave operations (readlane, ballot, mbcnt, ...) still need subgroups in the vertex stage.
+NO_VERTEX_SUBGROUPS = False
 
 
 def f16_half_location(n, half):
@@ -2053,6 +2059,11 @@ class Gen:
             voff = self.load_reg("vgpr", vregs[1] if "idxen" in mods else vregs[0])
         # ADD_TID_ENABLE adds the lane within the wave (thread_id[5:0]) to the index, swizzled or linear (ISA table
         # 33 and the Ring/stream-out column of table 36, which is linear with add_tid); the bounds check sees it too
+        if self.stage == "vs" and NO_VERTEX_SUBGROUPS:
+            # No vertex lane on this device: a run-time V# takes lane 0, exact while its ADD_TID_ENABLE is clear
+            if tid:
+                raise Unsupported("ADD_TID_ENABLE in a VS under --no-vertex-subgroups (no vertex subgroup lane)")
+            tid = False
         if tid is not False:
             lane = self.wave_lane()
             if tid is None:                   # lane * the run-time bit
@@ -11012,8 +11023,13 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--no-vertex-subgroups", action="store_true",
+                    help="for devices without subgroup operations in the vertex stage (MoltenVK): a VS's run-time "
+                         "V# leaves the ADD_TID_ENABLE lane out of the buffer index instead of reading "
+                         "SubgroupLocalInvocationId (exact while the bit is clear; a literal V# with it is refused)")
     a = ap.parse_args()
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES
+    global NO_VERTEX_SUBGROUPS
     FMA_KHR = a.fma == "khr"
     STRUCTURED = not a.dispatch_loop
     WAVE64_EMULATE = a.wave64_emulate
@@ -11022,6 +11038,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    NO_VERTEX_SUBGROUPS = a.no_vertex_subgroups
     if a.merge:
         import glob as _gl, json as _js
         merged = {}

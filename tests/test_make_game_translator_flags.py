@@ -150,7 +150,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the four flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None):
+    def run_main(self, *extra_argv, per_vertex=None, vertex_subgroups=None):
         argv = ["make_game.py", "--stages", "shaders", *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
@@ -158,6 +158,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_emulate", return_value=False), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_vertex_subgroups", return_value=vertex_subgroups), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
                 mock.patch("make_game.log"):
@@ -180,6 +181,16 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_no_vertex_subgroups_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the vertex stage has no subgroup operations (MoltenVK), not where
+        it has them or can't tell; asked for explicitly, it is on everywhere. It composes with the f16 fallback."""
+        self.assertEqual(self.run_main(vertex_subgroups=False), (("--no-vertex-subgroups",),) * 2)
+        self.assertEqual(self.run_main(vertex_subgroups=True), ((), ()))
+        self.assertEqual(self.run_main("--no-vertex-subgroups", vertex_subgroups=True),
+                         (("--no-vertex-subgroups",),) * 2)
+        self.assertEqual(self.run_main(per_vertex=False, vertex_subgroups=False),
+                         (("--f16-interp-fallback", "--no-vertex-subgroups"),) * 2)
 
 
 if __name__ == "__main__":

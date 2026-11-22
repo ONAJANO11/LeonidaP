@@ -210,6 +210,16 @@ MoltenVK can't convert to Metal ("PerVertexKHR decoration is not supported in MS
 on or off; `build.py` (for `check.py`) translates with the flag only when that variable is `1`. `ms_f16_pack` also runs
 on a Mac with `LEONIDA_MESH_COMPUTE=1 LEONIDA_W64_EMULATE=1`.
 
+## Macs: vertex shaders without subgroups
+
+MoltenVK supports subgroup operations in compute, fragment and tessellation-control shaders, not in vertex shaders: a
+Metal vertex function has no SIMD-group lane. A VS that reads a buffer through a run-time V# would otherwise use the
+subgroup lane for `ADD_TID_ENABLE`, and its pipeline fails with "Subgroup builtins are not available in this type of
+function" (`vs_m15` in `vk_pipeline_check`). `make_game.py` and `run_gpu_tests.py` ask `tools/vk_subgroup_info.py`
+(`vertex_in_supported_stages`) and translate with `--no-vertex-subgroups` where it is false (`docs/design.md`,
+"Vertex shaders without subgroups"). `LEONIDA_NO_VERTEX_SUBGROUPS=1` or `0` forces it on or off; `build.py` takes only
+`1`.
+
 ## GPUs without VK_KHR_maintenance8 (NVIDIA Pascal and older)
 
 `ps_texoff` and `ps_texoff_implicit` sample with a run-time texel offset, which needs `VK_KHR_maintenance8`;

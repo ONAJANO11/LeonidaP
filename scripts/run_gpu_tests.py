@@ -286,6 +286,37 @@ def _device_per_vertex():
     return _PER_VERTEX[0]
 
 
+def no_vertex_subgroups() -> bool:
+    """LEONIDA_NO_VERTEX_SUBGROUPS=1 (or 0): translate with --no-vertex-subgroups, so a VS that reads a buffer through a
+    run-time V# declares no subgroup builtin. Unset, it is on where the device has no subgroup operations in the vertex
+    stage: tools/vk_subgroup_info.py reports vertex_in_supported_stages false (MoltenVK)."""
+    v = (os.environ.get("LEONIDA_NO_VERTEX_SUBGROUPS") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_vertex_subgroups() is False
+
+
+_VERTEX_SUBGROUPS = []
+
+
+def _device_vertex_subgroups():
+    """vertex_in_supported_stages from tools/vk_subgroup_info.py for the device the tests run on (cached), or None."""
+    if not _VERTEX_SUBGROUPS:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            # The driver may log to stdout after the JSON line, so take the last line that is a JSON object.
+            line = next((ln for ln in reversed(r.stdout.splitlines()) if ln.lstrip().startswith("{")), "")
+            answer = json.loads(line).get("vertex_in_supported_stages")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        _VERTEX_SUBGROUPS.append(answer)
+    return _VERTEX_SUBGROUPS[0]
+
+
 def w64_emulated() -> bool:
     # Wave64 emulation on: the suite runs every wave64 check without asking for a 64-wide
     # subgroup, matching check.py (W64_EMULATED). Accepts "1"/"true"/"yes"/"on" and tolerates
@@ -710,6 +741,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--bary-fallback")
         if f16_interp_fallback():   # *_f16 interps from decoded-half inputs, no PerVertexKHR (MoltenVK)
             cmd.append("--f16-interp-fallback")
+        if no_vertex_subgroups():   # a VS's run-time V# without the subgroup lane (MoltenVK: no vertex subgroups)
+            cmd.append("--no-vertex-subgroups")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py

@@ -317,7 +317,8 @@ class JobsHandlingTest(unittest.TestCase):
                             with patch("make_game.log"):
                                 with patch("make_game.shaders") as mock_shaders, \
                                         patch("make_game.wave64_emulate", return_value=True) as probe, \
-                                        patch("make_game.runtime_gpu_per_vertex", return_value=None):
+                                        patch("make_game.runtime_gpu_per_vertex", return_value=None), \
+                                        patch("make_game.runtime_gpu_vertex_subgroups", return_value=None):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     probe.assert_called_once_with("auto")

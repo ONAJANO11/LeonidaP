@@ -127,6 +127,8 @@ def translate_tests(work, names):
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)
         cmd.append("--f16-interp-fallback")
+    if os.environ.get("LEONIDA_NO_VERTEX_SUBGROUPS") == "1":   # VS without subgroup builtins (MoltenVK)
+        cmd.append("--no-vertex-subgroups")
     if os.environ.get("LEONIDA_TEXOFF_FALLBACK") == "1":   # texel offsets without VK_KHR_maintenance8
         cmd.append("--texel-offset-fallback")
     return subprocess.run(cmd).returncode

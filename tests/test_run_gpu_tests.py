@@ -303,5 +303,34 @@ class Wave32LaneDumps(unittest.TestCase):
                 self.assertIsNone(rgt.narrow_subgroup_skip(out))
 
 
+class NoVertexSubgroups(unittest.TestCase):
+    """--no-vertex-subgroups: LEONIDA_NO_VERTEX_SUBGROUPS decides, else vk_subgroup_info's vertex_in_supported_stages."""
+
+    def device(self, stdout):
+        """The device answer for vk_subgroup_info.py printing `stdout`, with the cache cleared before and after."""
+        rgt._VERTEX_SUBGROUPS.clear()
+        try:
+            with patch.object(rgt.subprocess, "run", return_value=SimpleNamespace(stdout=stdout, returncode=0)):
+                return rgt._device_vertex_subgroups()
+        finally:
+            rgt._VERTEX_SUBGROUPS.clear()
+
+    def test_device_answer(self):
+        self.assertIs(self.device('{"vertex_in_supported_stages": false}\n'), False)
+        self.assertIs(self.device('{"vertex_in_supported_stages": true}\n'), True)
+        # MoltenVK can log after the JSON line; an old vk_subgroup_info without the key, or no answer, is unknown
+        self.assertIs(self.device('{"vertex_in_supported_stages": false}\n[mvk-info] Destroyed VkInstance\n'), False)
+        self.assertIsNone(self.device('{"native64": false}\n'))
+        self.assertIsNone(self.device(""))
+
+    def test_environment_overrides_the_device(self):
+        for value, device, want in (("1", True, True), ("on", None, True), ("0", False, False), ("off", False, False),
+                                    ("", False, True), ("", True, False), ("", None, False)):
+            with self.subTest(value=value, device=device), \
+                    patch.dict(rgt.os.environ, {"LEONIDA_NO_VERTEX_SUBGROUPS": value}), \
+                    patch.object(rgt, "_device_vertex_subgroups", return_value=device):
+                self.assertIs(rgt.no_vertex_subgroups(), want)
+
+
 if __name__ == "__main__":
     unittest.main()
