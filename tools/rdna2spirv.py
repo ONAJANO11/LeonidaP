@@ -1218,7 +1218,8 @@ class Gen:
         addr = V#.base + soffset + inst_offset + (offen ? vaddr : 0) + (idxen ? vindex * V#.stride : 0), byte exact.
         Each dword is loaded only when it is in range per the V#'s OOB_SELECT (buffer_address; docs/design.md, Buffer
         bounds checking): for modes 0 and 3 dword i ends inside the stride / num_records, else it is 0 and memory is
-        not read; modes 1 and 2 check the index / num_records once. Inactive lanes don't load."""
+        not read; modes 1 and 2 check the index / num_records once. An INVALID V# format zeroes all active results
+        without reading memory. Inactive lanes don't load."""
         if any(m in mods for m in ("lds", "tfe")) or "format" in op:
             raise Unsupported(op + " form")
         n = 1 if op.endswith("dword") else int(op.rsplit("x", 1)[1])
@@ -1249,7 +1250,7 @@ class Gen:
                 out.append(v)
             return out
 
-        if raw_parts is None:               # literal mode 1/2: one check for the whole load
+        if raw_parts is None:               # literal mode 1/2 or INVALID: one check for the whole load
             cond = self.tmp()
             self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
             phis = guarded(cond, range(n))
@@ -2052,9 +2053,10 @@ class Gen:
             3 RAW:                    offs + 4k + 4 > num_records (idx * stride is not part of the check)
         A V# word3 that an s_mov_b32 wrote earlier in the block (`sgpr_imm`) folds to one of these; a run-time one
         selects with OpSelect. elem="fmt" is for typed loads and stores: the whole element (its format's size, from the
-        instruction's fixed_fmt, a literal word3 or the V# at run time) must end inside. parts=True adds a 4th element for buffer_load: a function k -> in-range bool id for
-        dword k (modes 0 and 3, and a run-time V#), or None when the literal mode is 1 or 2 (every dword shares
-        in_bounds). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy.
+        instruction's fixed_fmt, a literal word3 or the V# at run time) must end inside. parts=True is for raw MUBUF
+        loads and stores: FORMAT=0 suppresses every dword, and the next element is a function k -> in-range bool id
+        for dword k (modes 0 and 3, and a run-time V#), or None when every dword shares in_bounds (literal mode 1/2
+        or literal FORMAT=0). Multi-dword loads are per dword for mode 3 (measured, RX 6800); mode 0 is by analogy.
         A swizzled V# (SWIZZLE_ENABLE) gets the RDNA2 ISA's swizzled buffer_offset, ADD_TID_ENABLE adds the wave lane
         to idx, and mode 3 checks like mode 0 when swizzled with a stride (ISA table 35). Every tuple ends with `step`:
         None when consecutive dwords of the access are 4 bytes apart, else the id of that distance (4 * index_stride
@@ -2179,6 +2181,15 @@ class Gen:
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
+        format_ok = None
+        if parts:
+            # Raw opcodes supply the data layout and use identity selectors. The descriptor still gates access.
+            if lit3 is None:
+                fmt, format_ok = self.tmp(), self.tmp()
+                self.emit(f"{fmt} = OpBitFieldUExtract %uint {d3} {self.cu(12)} {self.cu(7)}")
+                self.emit(f"{format_ok} = OpINotEqual %bool {fmt} {self.cu(0)}")
+            elif (lit3 >> 12 & 0x7F) == 0:
+                return addr, d3, "%false", None, step
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
         # idx (0 without idxen) < num_records and num_records != 0 do not depend on the dword; the two end checks do
@@ -2257,7 +2268,12 @@ class Gen:
 
         def check(k):
             """in-range bool of dword k of the access (k = 0: the first dword)."""
-            return check_end(4 * k + 4)
+            in_b = check_end(4 * k + 4)
+            if format_ok is None:
+                return in_b
+            ok = self.tmp()
+            self.emit(f"{ok} = OpLogicalAnd %bool {format_ok} {in_b}")
+            return ok
 
         if elem == "fmt":
             # a typed element is all or nothing and ends at its size (measured, gfx1150: 32_32_32_32 at off 20 of 32

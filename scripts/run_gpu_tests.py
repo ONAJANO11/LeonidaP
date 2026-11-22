@@ -41,6 +41,7 @@ from check import (WAVE32_LANE_DUMPS, WAVE32_LANE_ENV, bitmask_perm_narrow_skip,
 from check import PIXEL_VERTEX, interp_f16_high_problem, ij_computed_problem   # pixel producers and checks
 from check import GET_LOD_TESTS, STORE_WORDS, get_lod_test, store_words_problem   # TEST-184: image atomics and queries
 from check import wide_pixel_skip   # ps_w64x_readlane: judged only where the fragment stage was required 64-wide
+from check import MUBUF_FMT0_WORDS
 
 
 def make_dxbc(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -803,7 +804,7 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32"):
+                      "cs_buf_swizzle", "cs_mubuf_fmt0", "cs_cmpx_class_f32"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 is per-lane and needs no particular subgroup width either.
@@ -823,6 +824,7 @@ def run_suite(a, work: str) -> int:
                 # swizzled MUBUF addressing and ADD_TID_ENABLE (lanes 0 and 1 store; derivation in the .asm header)
                 "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED0028, 0, 0xBEEF0000,
                                    0xBEEF0001],
+                "cs_mubuf_fmt0": MUBUF_FMT0_WORDS,
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
             }[name]
             words = dump_words(msg)

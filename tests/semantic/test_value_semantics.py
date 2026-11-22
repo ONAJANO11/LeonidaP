@@ -667,5 +667,17 @@ class LaneMaskConstants(unittest.TestCase):
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
 
 
+class RawBufferInvalidFormat(unittest.TestCase):
+    def test_loads_and_stores(self):
+        spv = support.translate_fixture("cs_mubuf_fmt0", fssm=CS_BOUNDS_FSSM)
+        memory = ReadLog({a: 0xEEEEEEEE for a in range(0, 0x100, 4)})
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        # Each descriptor pair reads byte 64 only through FORMAT=22, then the output V# reads the store targets.
+        want = [0, 0xEEEEEEEE, 0xEEEEEEEE, 0x12345678] * 2
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in want])
+        self.assertEqual(memory.reads, [64, 64, 68, 72, 76, 80])
+
+
 if __name__ == "__main__":
     unittest.main()
