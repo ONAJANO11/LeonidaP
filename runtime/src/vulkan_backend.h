@@ -10,6 +10,7 @@
 #endif
 #include "vulkan_replay.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -22,6 +23,27 @@
 
 namespace leonida {
 
+// The memory types to try for an allocation of `size` bytes, best first: those with `required | preferred`, then
+// those with only `required`. A type whose heap is smaller than the allocation is left out, as the allocation would
+// break VUID-vkAllocateMemory-pAllocateInfo-01713 (some drivers still return VK_SUCCESS). Without Resizable BAR the
+// heap of DEVICE_LOCAL | HOST_VISIBLE memory is typically 256 MiB or less, so a larger host-visible allocation falls
+// through to system memory. A heap that is big enough but already partly used is left to the driver: a failed
+// vkAllocateMemory moves on to the next type.
+inline std::vector<std::uint32_t> memory_type_order(const VkPhysicalDeviceMemoryProperties& memory,
+                                                    std::uint32_t type_bits, VkMemoryPropertyFlags required,
+                                                    VkMemoryPropertyFlags preferred, VkDeviceSize size) {
+    std::vector<std::uint32_t> order;
+    for (const VkMemoryPropertyFlags flags : {required | preferred, required}) {
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            const VkMemoryType& type = memory.memoryTypes[i];
+            if (!(type_bits & (1u << i)) || (type.propertyFlags & flags) != flags) continue;
+            if (type.heapIndex >= memory.memoryHeapCount || memory.memoryHeaps[type.heapIndex].size < size) continue;
+            if (std::find(order.begin(), order.end(), i) == order.end()) order.push_back(i);
+        }
+    }
+    return order;
+}
+
 struct VulkanDeviceFunctions {
 #define LEONIDA_VK_DEVICE_FUNCTIONS(X)                                                                         \
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer)         \
@@ -33,7 +55,11 @@ struct VulkanDeviceFunctions {
     X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateBuffer) X(vkDestroyBuffer)                  \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory)  \
     X(vkUnmapMemory) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)  \
-    X(vkCmdResolveImage) X(vkCreateSampler) X(vkDestroySampler)                                                \
+    X(vkCmdResolveImage) X(vkCmdBindPipeline) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateShaderModule)   \
+    X(vkDestroyShaderModule) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines)  \
+    X(vkDestroyPipeline) X(vkGetBufferDeviceAddress) X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer)        \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetPrimitiveTopology) X(vkCmdSetStencilReference)            \
+    X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines)                      X(vkCreateSampler) X(vkDestroySampler)                                                                     \
     X(vkCmdBeginConditionalRenderingEXT) X(vkCmdEndConditionalRenderingEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -53,7 +79,9 @@ struct VulkanDeviceFunctions {
                vkDestroyImage && vkGetImageMemoryRequirements && vkBindImageMemory && vkCreateBuffer &&
                vkDestroyBuffer && vkGetBufferMemoryRequirements && vkBindBufferMemory && vkAllocateMemory &&
                vkFreeMemory && vkMapMemory && vkUnmapMemory && vkCmdCopyBuffer && vkCmdCopyBufferToImage &&
-               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage;
+               vkCmdCopyImageToBuffer && vkCmdCopyImage && vkCmdResolveImage && vkCmdBindPipeline &&
+               vkCmdPushConstants && vkCmdDispatch && vkCreateShaderModule && vkDestroyShaderModule &&
+               vkCreatePipelineLayout && vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline;
     }
 };
 
@@ -77,6 +105,36 @@ public:
         replay_.copy_image_to_buffer = vk.vkCmdCopyImageToBuffer;
         replay_.copy_image = vk.vkCmdCopyImage;
         replay_.resolve_image = vk.vkCmdResolveImage;
+        replay_.bind_pipeline = vk.vkCmdBindPipeline;
+        replay_.push_constants = vk.vkCmdPushConstants;
+        replay_.dispatch = vk.vkCmdDispatch;
+        replay_.compute_pipeline = [this](std::uintptr_t id) -> const ComputePipeline* {
+            const auto it = pipelines_.find(id);
+            return it == pipelines_.end() ? nullptr : &it->second;
+        };
+        replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
+        replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
+        replay_.set_viewport = vk.vkCmdSetViewport;
+        replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
+        replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
+        replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
+        replay_.draw = vk.vkCmdDraw;
+        replay_.draw_indexed = vk.vkCmdDrawIndexed;
+        replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
+            const auto it = graphics_pipelines_.find(id);
+            return it == graphics_pipelines_.end() ? nullptr : &it->second;
+        };
+        // Called with mutex_ held. A linear search: fine for the first frames, an interval map when it shows.
+        replay_.buffer_at = [this](std::uint64_t va, std::uint64_t size, VkBuffer& buffer, VkDeviceSize& offset) {
+            for (const auto& [id, b] : resources_) {
+                if (b.image || !b.buffer || va < b.va || va - b.va >= b.size || size > b.size - (va - b.va)) continue;
+                buffer = b.buffer;
+                offset = b.buffer_offset + (va - b.va);
+                return true;
+            }
+            return false;
+        };
         if (conditional_rendering) {  // a driver may hand out these pointers even when the extension is off
             replay_.begin_conditional_rendering = vk.vkCmdBeginConditionalRenderingEXT;
             replay_.end_conditional_rendering = vk.vkCmdEndConditionalRenderingEXT;
@@ -125,6 +183,31 @@ public:
         resources_.erase(it);
     }
 
+    // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
+    void set_heap_base(std::uint64_t heap_base) {
+        std::lock_guard lock(mutex_);
+        replay_.heap_base = heap_base;
+    }
+    std::uint64_t heap_base() {
+        std::lock_guard lock(mutex_);
+        return replay_.heap_base;
+    }
+
+    // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        pipelines_[id] = pipeline;
+    }
+    void remove_pipeline(std::uintptr_t id) {
+        std::lock_guard lock(mutex_);
+        pipelines_.erase(id);
+        graphics_pipelines_.erase(id);
+    }
+    void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline) {
+        std::lock_guard lock(mutex_);
+        graphics_pipelines_[id] = pipeline;
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(mutex_);
@@ -147,6 +230,7 @@ public:
 
 private:
     friend class VulkanQueue;
+    friend class VulkanPresenter;
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
@@ -179,6 +263,8 @@ private:
     std::mutex mutex_;  // resources, tracker and views; held while a queue prepares and emits
     std::mutex submit_mutex_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
+    std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     LayoutTracker tracker_;
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
     std::function<bool(VkCommandBuffer)> bindless_prepare_;

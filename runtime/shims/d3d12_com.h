@@ -14,6 +14,16 @@
 
 #include "../src/vulkan_backend.h"
 
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "../src/root_signature.h"
+
+namespace leonida {
+class VulkanPresenter;
+}
+
 namespace rt::d3d12 {
 
 // `device` (optional) is what the object's GetDevice returns; the object holds a reference to it.
@@ -38,6 +48,13 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    bool presentation = false;  // VK_KHR_surface + VK_KHR_win32_surface on the instance, VK_KHR_swapchain on the device
+    // bufferDeviceAddress enabled: buffers and shader-visible heaps then live in the GPU address arena and have
+    // console VAs (docs section 3.3); without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
+    bool buffer_device_address = false;
+    // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
+    // LEONIDA_SHADERS environment variable.
+    std::string shader_dir;
     // Enabled: runtimeDescriptorArray, the dynamic indexing of sampled- and storage-image arrays, and update after
     // bind for sampled images, storage images and storage buffers. The device then keeps the bindless set 0 of
     // the translated shaders (docs section 3.4), and texture views and samplers are put in it as they are
@@ -81,6 +98,48 @@ std::uint32_t device_max_push_constants_size(ID3D12Device* device);
 // the uniform-buffer fallback for the 16-byte tail (heap/code base).
 bool device_push_constants_need_fallback(ID3D12Device* device);
 
+// Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
+// presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
+class WindowPresenter {
+public:
+    WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter);
+    ~WindowPresenter();
+    WindowPresenter(const WindowPresenter&) = delete;
+    WindowPresenter& operator=(const WindowPresenter&) = delete;
+
+    // `back_buffer` is a colour texture in D3D12's PRESENT state. sync_interval 0 presents without vsync.
+    // S_OK also covers a skipped present while the window is minimised.
+    HRESULT present(ID3D12Resource* back_buffer, UINT sync_interval);
+    VkExtent2D extent() const;
+    std::uint64_t presented() const;
+
+private:
+    IUnknown* device_;
+    std::unique_ptr<leonida::VulkanPresenter> presenter_;
+};
+
+// Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
+std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
+
+// Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read, as
+// rt::rootsig::pack() lays them out (docs section 3.5). Built when a Vulkan device creates the root signature.
+struct RootArgumentLayout {
+    struct Parameter {
+        rt::rootsig::ParamType type;
+        std::uint32_t user_offset;     // first dword; unused for a parameter with no dwords
+        std::uint32_t constant_count;  // constants only
+    };
+    std::vector<Parameter> parameters;
+};
+
+// For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a
+// compute pipeline state (0: not a compute PSO of a Vulkan device).
+const RootArgumentLayout* root_signature_layout(ID3D12RootSignature* signature);
+std::uintptr_t compute_pipeline_id(ID3D12PipelineState* pipeline);
+std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
+
+// The size of every descriptor slot (GetDescriptorHandleIncrementSize), for handle ranges.
+inline constexpr UINT descriptor_size = 32;
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.

@@ -3,6 +3,7 @@
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -92,10 +93,128 @@ public:
         if (!command_allocator || command_allocator->type() != type_) return E_INVALIDARG;
         if (!list_.reset()) return E_FAIL;  // D3D12 resets only closed lists
         invalid_ = false;
-        front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
-        stencil_ref_set_ = false;
-        if (state) stub("ID3D12GraphicsCommandList::Reset(initial pipeline state)");
+        reset_state(state);  // Reset returns every list state to its default
         return S_OK;
+    }
+
+    // Root signatures, pipeline state and root arguments. The arguments are packed into the 32 user-data dwords
+    // the translated shaders read (root_signature.h; docs section 3.5); a draw or dispatch records a copy.
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* signature) override {
+        bind_root(compute_, signature);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* signature) override {
+        bind_root(graphics_, signature);
+    }
+
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* state) override { set_pipeline(state); }
+
+    // The bound heaps matter to direct heap indexing, which is still open (section 3.4); tables carry their VAs.
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT, ID3D12DescriptorHeap* const*) override {}
+
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT index, UINT value, UINT offset) override {
+        constants(compute_, index, 1, &value, offset);
+    }
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) override {
+        constants(compute_, index, count, data, offset);
+    }
+    void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(compute_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        address(compute_, index, table.ptr, rt::rootsig::ParamType::Table);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT index, UINT value, UINT offset) override {
+        constants(graphics_, index, 1, &value, offset);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT index, UINT count, const void* data, UINT offset) override {
+        constants(graphics_, index, count, data, offset);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT index, D3D12_GPU_VIRTUAL_ADDRESS va) override {
+        address(graphics_, index, va, rt::rootsig::ParamType::Descriptor);
+    }
+    void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT index, D3D12_GPU_DESCRIPTOR_HANDLE table) override {
+        address(graphics_, index, table.ptr, rt::rootsig::ParamType::Table);
+    }
+
+    void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override {
+        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+    }
+
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override { reset_state(state); }
+
+    // Graphics state. Draws record a copy of it (command_list.h, Draw).
+    void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        topology_ = u(topology);
+    }
+
+    void STDMETHODCALLTYPE IASetVertexBuffers(UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) override {
+        if (std::uint64_t(start) + count > vertex_buffers_.size()) return check(false);
+        for (UINT i = 0; i < count; ++i)
+            vertex_buffers_[start + i] = views ? leonida::VertexBufferView{views[i].BufferLocation, views[i].SizeInBytes,
+                                                                          views[i].StrideInBytes}
+                                               : leonida::VertexBufferView{};
+    }
+
+    void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
+        index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
+                      : leonida::IndexBufferView{};
+    }
+
+    void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
+        if (!count || !viewports) return;
+        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
+        const D3D12_VIEWPORT& v = viewports[0];
+        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+    }
+
+    void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
+        if (!count || !rects) return;
+        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
+        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+    }
+
+    // D3D12 reads render-target and depth descriptors here, so their views are copied now.
+    void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
+                                              const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
+        render_targets_.assign(count, {});
+        for (UINT i = 0; i < count && targets; ++i) {
+            const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
+            if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
+        }
+        depth_ = depth && depth->ptr ? *reinterpret_cast<const leonida::TargetView*>(depth->ptr) : leonida::TargetView{};
+    }
+
+    void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT factor[4]) override {
+        blend_factor_ = factor ? std::array<float, 4>{factor[0], factor[1], factor[2], factor[3]}
+                               : std::array<float, 4>{1, 1, 1, 1};  // null means { 1, 1, 1, 1 }
+    }
+
+    void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
+        front_stencil_ref_ = back_stencil_ref_ = reference;
+        stencil_ref_set_ = true;
+    }
+
+    void STDMETHODCALLTYPE DrawInstanced(UINT vertices, UINT instances, UINT first_vertex, UINT first_instance) override {
+        record_draw(false, vertices, instances, first_vertex, 0, first_instance);
+    }
+
+    void STDMETHODCALLTYPE DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index, INT base_vertex,
+                                                UINT first_instance) override {
+        record_draw(true, indices, instances, first_index, base_vertex, first_instance);
     }
 
     void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* command_list) override {
@@ -234,16 +353,12 @@ public:
                                         stencil, to_rects(count, rects)));
     }
 
-    // GCL8. Vulkan can set the two faces independently with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT /
-    // BACK_BIT), but that state only matters when a pipeline uses it, and this layer has no pipeline or draw path
-    // yet. Retain the values for that path and report that nothing consumed them, rather than emit a call whose
-    // effect no later command can observe.
+    // GCL8. Each draw applies the two faces with vkCmdSetStencilReference(VK_STENCIL_FACE_FRONT_BIT / BACK_BIT).
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override {
         if (list_.closed()) return check(false);
         front_stencil_ref_ = front;
         back_stencil_ref_ = back;
         stencil_ref_set_ = true;
-        stub("ID3D12GraphicsCommandList8::OMSetFrontAndBackStencilRef (recorded; no pipeline path applies it)");
     }
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
@@ -274,11 +389,101 @@ private:
         if (!ok) invalid_ = true;
     }
 
+    struct RootState {
+        const RootArgumentLayout* layout = nullptr;
+        std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+    };
+
+    // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here.
+    void bind_root(RootState& state, ID3D12RootSignature* signature) {
+        state.layout = root_signature_layout(signature);
+        state.data = {};
+        if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
+    }
+
+    // The parameter, if it exists and has the expected type; null after recording an invalid call.
+    const RootArgumentLayout::Parameter* parameter(RootState& state, UINT index, rt::rootsig::ParamType type) {
+        if (!state.layout || index >= state.layout->parameters.size() ||
+            state.layout->parameters[index].type != type) {
+            check(false);
+            return nullptr;
+        }
+        return &state.layout->parameters[index];
+    }
+
+    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
+    void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
+        if (dword < rt::rootsig::kMaxUserSgprs)
+            state.data[dword] = value;
+        else
+            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+    }
+
+    void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
+        const RootArgumentLayout::Parameter* p = parameter(state, index, rt::rootsig::ParamType::Constants);
+        if (!p) return;
+        if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
+        const auto* values = static_cast<const std::uint32_t*>(data);
+        for (UINT i = 0; i < count; ++i) write(state, p->user_offset + offset + i, values[i]);
+    }
+
+    void address(RootState& state, UINT index, std::uint64_t va, rt::rootsig::ParamType type) {
+        const RootArgumentLayout::Parameter* p = parameter(state, index, type);
+        if (!p) return;
+        write(state, p->user_offset, std::uint32_t(va));
+        write(state, p->user_offset + 1, std::uint32_t(va >> 32));
+    }
+
     D3D12_COMMAND_LIST_TYPE type_;
     leonida::CommandList list_;
     bool invalid_ = false;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
+    RootState compute_;
+    RootState graphics_;
+    std::uintptr_t compute_pipeline_ = 0;
+    std::uintptr_t graphics_pipeline_ = 0;
+    std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
+    std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
+    leonida::IndexBufferView index_{};
+    leonida::Viewport viewport_{};
+    leonida::Rect scissor_{};
+    std::vector<leonida::TargetView> render_targets_;
+    leonida::TargetView depth_{};
+    std::array<float, 4> blend_factor_{1, 1, 1, 1};
+
+    void set_pipeline(ID3D12PipelineState* state) {
+        compute_pipeline_ = compute_pipeline_id(state);
+        graphics_pipeline_ = graphics_pipeline_id(state);
+        if (state && !compute_pipeline_ && !graphics_pipeline_)
+            stub("ID3D12GraphicsCommandList::SetPipelineState(pipeline from another device)");
+    }
+
+    void reset_state(ID3D12PipelineState* state) {
+        front_stencil_ref_ = back_stencil_ref_ = 0;
+        stencil_ref_set_ = false;
+        compute_ = {};
+        graphics_ = {};
+        topology_ = 0;
+        vertex_buffers_ = {};
+        index_ = {};
+        viewport_ = {};
+        scissor_ = {};
+        render_targets_.clear();
+        depth_ = {};
+        blend_factor_ = {1, 1, 1, 1};
+        set_pipeline(state);
+    }
+
+    // A draw needs a graphics pipeline, a graphics root signature and a topology.
+    void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
+                           {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
+                           blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
+                           base_vertex, first_instance};
+        check(list_.draw(draw));
+    }
     bool stencil_ref_set_ = false;
 };
 

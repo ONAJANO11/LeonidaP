@@ -267,7 +267,7 @@ int main() {
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
 
         list->Barrier(1, &group);
-        list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
+        list->SetMarker(0, nullptr, 0);  // not implemented: reported once by its generated stub, recording continues
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
 
