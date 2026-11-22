@@ -1734,8 +1734,13 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
                 vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, p.staging, 1, &p.staged[0]);
+                // The buffer's write before its read, and every earlier transfer write before the destination's
+                // write: without WRITE on the destination side, synchronization validation reports a
+                // write-after-write on vkCmdCopyBufferToImage (the 3x3 mip into the 6x6 one at (4, 4), BC1 and
+                // BC7, on an RTX 5080 and a Radeon iGPU; found and checked by @Vonsek on #860).
                 detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                       VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
                 vk.copy_buffer_to_image(command_buffer, p.staging, p.binding.image, dst_layout, 1, &p.staged[1]);
             } else if (!p.image_copies.empty()) {
                 const VkImageLayout src_layout = detail::copy_layout(
