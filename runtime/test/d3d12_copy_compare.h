@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../shims/d3d12_com.h"
+#include "xs_pc_list.h"
 
 namespace copycmp {
 
@@ -172,6 +173,7 @@ struct Run {
                            d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))) &&
                check_setup("CreateCommandList", d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p,
                                                                      nullptr, IID_PPV_ARGS(&list.p))) &&
+               (use_pc_list(list.p), true) &&
                check_setup("CreateFence", d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)));
     }
     // Starts another scenario on the same queue: the list and allocator are reset (a list that failed at Close can be).
@@ -182,6 +184,7 @@ struct Run {
             allocator.reset();
             device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p));
             device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr, IID_PPV_ARGS(&list.p));
+            use_pc_list(list.p);
         } else if (used) {
             allocator->Reset();
             list->Reset(allocator.p, nullptr);

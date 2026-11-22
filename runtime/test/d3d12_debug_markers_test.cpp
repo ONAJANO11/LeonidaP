@@ -8,6 +8,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_pc_list.h"
 
 #include <cstdint>
 #include <cstring>
@@ -121,8 +122,10 @@ int run_markers(ID3D12Device* device) {
     EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                IID_PPV_ARGS(&first.p))));
+    use_pc_list(first.p);
     EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                IID_PPV_ARGS(&second.p))));
+    use_pc_list(second.p);
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     // Metadata 0: UTF-16, terminated (the size counts the terminator); 1: ANSI, cut at `size`; 2: a PIX3 blob.
@@ -244,6 +247,7 @@ int run_private_data(ID3D12Device* device) {
     EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                IID_PPV_ARGS(&list.p))));
+    use_pc_list(list.p);
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
     D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};

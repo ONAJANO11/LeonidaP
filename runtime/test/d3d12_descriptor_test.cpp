@@ -21,6 +21,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_pc_list.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -1114,6 +1115,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
         EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                                    IID_PPV_ARGS(&list.p))));
+        use_pc_list(list.p);
         for (UINT f = 0; f < 2; ++f) {
             D3D12_TEXTURE_COPY_LOCATION to{}, from{};
             to.pResource = byte_textures[f].p;

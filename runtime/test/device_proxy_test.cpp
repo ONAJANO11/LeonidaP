@@ -7,6 +7,7 @@
 //             hidden return pointer in RDX, so slot 14 wraps it)
 //   slot 62  CreateComputePipelineState
 //   slot 76  resource creation with an Xbox layout word (0x101)
+//   slot 8/36 CreateCommandQueue/CreateFence (return queue and fence proxies that run GPU work)
 // Slot 9 on the device is CreateCommandAllocator on the PC vtable and must still forward, which proves the handle
 // getters were not wedged into the device slots. Console output also shows the proxy's first-call slot log.
 #include <windows.h>
@@ -102,6 +103,151 @@ bool load_compute_shader(ComPtr<ID3DBlob>& bytecode) {
     }
     check(SUCCEEDED(hr) && bytecode, "trivial compute shader compiles (cs_5_0)");
     return SUCCEEDED(hr) && bytecode;
+}
+
+// Console command-list slots (docs/d3d12_command_objects.md section 3.5a), called by index as a console-compiled
+// caller does. On the PC list these indices are other methods (32 SetComputeRootDescriptorTable, 53 EndQuery).
+using ListGetDeviceFn = HRESULT(WINAPI*)(void*, REFIID, void**);
+using ListCloseFn = HRESULT(WINAPI*)(void*);
+using ListCopyBufferFn = void(WINAPI*)(void*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
+using ListBarrierFn = void(WINAPI*)(void*, UINT, const D3D12_RESOURCE_BARRIER*);
+using ListSetHeapsFn = void(WINAPI*)(void*, UINT, ID3D12DescriptorHeap* const*);
+using ListClearUintFn = void(WINAPI*)(void*, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                      ID3D12Resource*, const UINT*, UINT, const D3D12_RECT*);
+using ListUnmeasuredFn = std::uint64_t(WINAPI*)(void*);
+
+ComPtr<ID3D12Resource> committed_buffer(ID3D12Device* device, D3D12_HEAP_TYPE type, D3D12_RESOURCE_FLAGS flags,
+                                        D3D12_RESOURCE_STATES state) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = type;
+    D3D12_RESOURCE_DESC desc = buffer_desc();
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Width = 256;
+    desc.Flags = flags;
+    ComPtr<ID3D12Resource> buffer;
+    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                    IID_PPV_ARGS(buffer.GetAddressOf()));
+    return buffer;
+}
+
+// Slot 12 wraps the list in the console order: a UAV clear (console 53) through a heap proxy bound at console 32,
+// a barrier (26) and a copy (15) into a readback buffer, Close (9), then executed and read back.
+void test_console_list(ID3D12Device* device, ID3D12CommandAllocator* allocator, ID3D12DescriptorHeap* gpu_heap) {
+    check(rt::d3d12_xs::device_slot_overridden(12), "device slot 12 wraps CreateCommandList");
+    check(rt::d3d12_xs::device_slot_overridden(51), "device slot 51 wraps CreateCommandList1");
+    check(rt::d3d12_xs::list_slot_pc_slot(26) == 26 && rt::d3d12_xs::list_slot_pc_slot(32) == 28 &&
+              rt::d3d12_xs::list_slot_pc_slot(53) == 49 && rt::d3d12_xs::list_slot_pc_slot(61) == 59 &&
+              rt::d3d12_xs::list_slot_pc_slot(27) == ~0u && rt::d3d12_xs::list_slot_pc_slot(85) == ~0u,
+          "the console list map is the measured one");
+
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(queue.GetAddressOf()));
+    ComPtr<ID3D12Fence> fence;
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.GetAddressOf()));
+    ComPtr<ID3D12Resource> uav = committed_buffer(device, D3D12_HEAP_TYPE_DEFAULT,
+                                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ComPtr<ID3D12Resource> readback = committed_buffer(device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_DESCRIPTOR_HEAP_DESC cpu_heap_desc{};
+    cpu_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    cpu_heap_desc.NumDescriptors = 1;
+    ComPtr<ID3D12DescriptorHeap> cpu_heap;
+    device->CreateDescriptorHeap(&cpu_heap_desc, IID_PPV_ARGS(cpu_heap.GetAddressOf()));
+    check(queue && fence && uav && readback && cpu_heap, "console list: queue, fence, buffers and heaps created");
+    if (!queue || !fence || !uav || !readback || !cpu_heap) return;
+
+    // Handles in the Xbox RAX form from the heap proxies; the same UAV in the shader-visible and the CPU heap.
+    void** gpu_heap_vtbl = *reinterpret_cast<void***>(gpu_heap);
+    void** cpu_heap_vtbl = *reinterpret_cast<void***>(cpu_heap.Get());
+    const D3D12_CPU_DESCRIPTOR_HANDLE visible_cpu = reinterpret_cast<GetCpuHandleFn>(gpu_heap_vtbl[9])(gpu_heap);
+    const D3D12_GPU_DESCRIPTOR_HANDLE visible_gpu = reinterpret_cast<GetGpuHandleFn>(gpu_heap_vtbl[10])(gpu_heap);
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu_only =
+        reinterpret_cast<GetCpuHandleFn>(cpu_heap_vtbl[9])(cpu_heap.Get());
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc{};
+    uav_desc.Format = DXGI_FORMAT_R32_UINT;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav_desc.Buffer.NumElements = 64;
+    device->CreateUnorderedAccessView(uav.Get(), nullptr, &uav_desc, visible_cpu);
+    device->CreateUnorderedAccessView(uav.Get(), nullptr, &uav_desc, cpu_only);
+
+    const unsigned long device_refs = rt::d3d12_xs::device_proxy_ref_count(device);
+    ComPtr<ID3D12GraphicsCommandList> list;
+    HRESULT hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                           IID_PPV_ARGS(list.GetAddressOf()));
+    check(SUCCEEDED(hr) && list, "slot 12 creates a command list");
+    if (!list) return;
+    check(rt::d3d12_xs::is_list_proxy(list.Get()), "slot 12 returns a console-order list proxy");
+    ID3D12CommandList* real_list = rt::d3d12_xs::list_proxy_real_list(list.Get());
+    check(real_list != nullptr && !rt::d3d12_xs::is_list_proxy(real_list), "list proxy exposes its PC list");
+    check(rt::d3d12_xs::device_proxy_ref_count(device) == device_refs + 1, "list holds one device proxy reference");
+    if (!real_list) return;
+
+    ID3D12CommandList* same = nullptr;
+    hr = list->QueryInterface(__uuidof(ID3D12CommandList), reinterpret_cast<void**>(&same));
+    check(SUCCEEDED(hr) && same == list.Get(), "list QueryInterface(ID3D12CommandList) returns the proxy");
+    if (same) same->Release();
+    ID3D12CommandQueue* not_a_list = nullptr;
+    hr = list->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&not_a_list));
+    check(hr == E_NOINTERFACE && !not_a_list, "list QueryInterface refuses a non-list IID");
+
+    void** vtbl = *reinterpret_cast<void***>(list.Get());
+    void* list_device = nullptr;
+    hr = reinterpret_cast<ListGetDeviceFn>(vtbl[7])(list.Get(), __uuidof(ID3D12Device), &list_device);
+    check(SUCCEEDED(hr) && list_device == device, "list slot 7 GetDevice returns the device proxy");
+    if (list_device) static_cast<IUnknown*>(list_device)->Release();
+
+    rt::d3d12_xs::reset_device_proxy_stats();
+    check(reinterpret_cast<ListUnmeasuredFn>(vtbl[27])(list.Get()) == static_cast<std::uint32_t>(E_NOTIMPL),
+          "console list slot 27 (not measured) returns E_NOTIMPL");
+    check(reinterpret_cast<ListUnmeasuredFn>(vtbl[141])(list.Get()) == static_cast<std::uint32_t>(E_NOTIMPL),
+          "console list slot 141 (console only) returns E_NOTIMPL");
+    check(rt::d3d12_xs::list_slot_hits(27) == 1 && rt::d3d12_xs::list_slot_first_call_seen(141),
+          "refused list slots are counted");
+
+    ID3D12DescriptorHeap* heaps[] = {gpu_heap};
+    reinterpret_cast<ListSetHeapsFn>(vtbl[32])(list.Get(), 1, heaps);
+    const UINT values[4] = {0x12345678u, 0, 0, 0};
+    reinterpret_cast<ListClearUintFn>(vtbl[53])(list.Get(), visible_gpu, cpu_only, uav.Get(), values, 0, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = uav.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    reinterpret_cast<ListBarrierFn>(vtbl[26])(list.Get(), 1, &barrier);
+    reinterpret_cast<ListCopyBufferFn>(vtbl[15])(list.Get(), readback.Get(), 0, uav.Get(), 0, 256);
+    hr = reinterpret_cast<ListCloseFn>(vtbl[9])(list.Get());
+    check(SUCCEEDED(hr), "console list slot 9 closes the list");
+    check(rt::d3d12_xs::list_slot_hits(32) == 1 && rt::d3d12_xs::list_slot_hits(53) == 1 &&
+              rt::d3d12_xs::list_slot_hits(15) == 1,
+          "forwarded list slots are counted");
+
+    // As the title does: the list proxy to the queue proxy, whose slot 10 hands the host queue the PC list.
+    check(rt::d3d12_xs::is_queue_proxy(queue.Get()), "console list: the queue is a queue proxy");
+    ID3D12CommandList* const console_lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, console_lists);
+    queue->Signal(fence.Get(), 1);
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    fence->SetEventOnCompletion(1, done);
+    WaitForSingleObject(done, 10000);
+    CloseHandle(done);
+
+    std::uint32_t words[64] = {};
+    void* mapped = nullptr;
+    const D3D12_RANGE read{0, sizeof(words)};
+    if (SUCCEEDED(readback->Map(0, &read, &mapped)) && mapped) {
+        std::memcpy(words, mapped, sizeof(words));
+        readback->Unmap(0, nullptr);
+    }
+    bool all = true;
+    for (const std::uint32_t word : words) all = all && word == values[0];
+    check(all, "console slots 32/53/26/15 cleared the UAV and copied it back (0x12345678 in all 64 words)");
+
+    list.Reset();
+    check(rt::d3d12_xs::device_proxy_ref_count(device) == device_refs, "list release drops its device reference");
 }
 
 }  // namespace
@@ -363,6 +509,35 @@ int main() {
                                                          nullptr, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                          &iid_resource, &proxy_out);
         check(FAILED(hr) && proxy_out == nullptr, "slot 76 nulls its output for a null description");
+    }
+
+    if (heap && allocator) test_console_list(device.Get(), allocator.Get(), heap.Get());
+    // Slots 8 and 36 on the device the shim made: a title gets queue and fence proxies, and they run GPU work.
+    {
+        using CreateQueueFn = HRESULT(WINAPI*)(void*, const D3D12_COMMAND_QUEUE_DESC*, const IID*, void**);
+        using CreateFenceFn = HRESULT(WINAPI*)(void*, UINT64, D3D12_FENCE_FLAGS, const IID*, void**);
+        void** vtable = *reinterpret_cast<void***>(device.Get());
+        const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+        const IID iid_queue = __uuidof(ID3D12CommandQueue);
+        const IID iid_fence = __uuidof(ID3D12Fence);
+        ComPtr<ID3D12CommandQueue> queue;
+        ComPtr<ID3D12Fence> fence;
+        hr = reinterpret_cast<CreateQueueFn>(vtable[8])(device.Get(), &queue_desc, &iid_queue,
+                                                        reinterpret_cast<void**>(queue.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_queue_proxy(queue.Get()), "slot 8 returns a queue proxy");
+        hr = reinterpret_cast<CreateFenceFn>(vtable[36])(device.Get(), 0, D3D12_FENCE_FLAG_NONE, &iid_fence,
+                                                         reinterpret_cast<void**>(fence.GetAddressOf()));
+        check(SUCCEEDED(hr) && rt::d3d12_xs::is_fence_proxy(fence.Get()), "slot 36 returns a fence proxy");
+        if (queue && fence) {
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            check(event && SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
+                      SUCCEEDED(fence->SetEventOnCompletion(1, event)) && WaitForSingleObject(event, 5000) == 0,
+                  "the queue proxy signals the fence proxy on the GPU");
+            if (event) CloseHandle(event);
+            ComPtr<ID3D12Device> owner;
+            check(SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) && owner.Get() == device.Get(),
+                  "the queue proxy's GetDevice is the device the shim returned");
+        }
     }
 
     // Hold a reference to the PC device so the final check can prove the proxy's Release balances its own.
