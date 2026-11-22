@@ -33,8 +33,8 @@ TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES)
+         + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and ps_ssharp
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -156,6 +156,7 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "texture_mode_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -610,6 +611,35 @@ class GetLodChecks(unittest.TestCase):
         self.assertIn("exit 1", result)
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(check.get_lod_test(tmp, tmp, "ps_get_lod"), "missing vk_texture_test" + check.EXE)
+
+
+class TextureModeChecks(unittest.TestCase):
+    """The TEXTURE_MODES shaders run vk_texture_test in their mode, from the directory with the shaders."""
+
+    def run_mode(self, answer, name="ps_sample_c_lz"):
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vs_ids", name):
+                (Path(tmp) / f"{shader}.spv").touch()
+            with patch.object(check, "run", return_value=answer) as run:
+                problem = check.texture_mode_test("tools", tmp, name)
+            self.assertEqual(run.call_args.args[1], check.TEXTURE_MODES[name])
+            self.assertEqual(run.call_args.kwargs["cwd"], tmp)
+            self.assertTrue(Path(run.call_args.args[0]).is_absolute())
+        return problem
+
+    def test_passed_is_ok(self):
+        self.assertEqual(self.run_mode((0, "ok -> pixels.raw\nvk_texture_test dref: PASSED (4096 pixels)\n")), "")
+
+    def test_failure_and_missing_passed_fail(self):
+        problem = self.run_mode((1, "vk_texture_test dref: FAILED, 0 pixels wrong in the f32 result and 2048 in the d16"))
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("FAILED", problem)
+        self.assertTrue(self.run_mode((0, "ok -> pixels.raw\n")))
+
+    def test_unsupported_device_skips(self):
+        problem = self.run_mode((77, "unsupported: no Vulkan physical device\n"))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no Vulkan physical device", problem)
 
 
 class TexelOffsetChecks(unittest.TestCase):
