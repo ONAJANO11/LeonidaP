@@ -69,6 +69,7 @@ method, scope and caveats. No game data is included.
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
+| [buffer_formats.md](buffer_formats.md) | Every GFX10 buffer data format a V# or MTBUF can name, loaded and stored, measured on a Radeon 880M (RDNA3.5, not RDNA2): 1.33 million validated elements, 0 mismatches; SCALED stores convert as NORM, float stores round toward zero. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |
 | [fspx.md](fspx.md) | `FSPX`, the FidelityFX DLL's native compute programs (its shaders' `ACCC` part): directory as the DLL reads it, kind-0 dispatch state, the hash prologue, `gfx1030` for its `v_dot4` code; 13 of 29 translate with `tools/fspx_unpack.py`. |
 | [embedded_shaders.md](embedded_shaders.md) | DXBC containers embedded in the package's DLLs: 52 in `XboxBvhBuilder.dll` (console `FSSM` via the `XDAT`/`XBCH` record; 42/52 pass `spirv-val` today) and 29 `ACCC`/`FSPX` in the FidelityFX upscaler; the scan/extract tool and the four rules still missing. |
