@@ -37,6 +37,18 @@ static_assert(leonida::barrier_end_only == D3D12_RESOURCE_BARRIER_FLAG_END_ONLY)
 static_assert(leonida::clear_depth == D3D12_CLEAR_FLAG_DEPTH);
 static_assert(leonida::clear_stencil == D3D12_CLEAR_FLAG_STENCIL);
 static_assert(leonida::texture_barrier_discard == D3D12_TEXTURE_BARRIER_FLAG_DISCARD);
+namespace vrs = leonida::d3d12_shading_rate;
+static_assert(vrs::rate_1x1 == D3D12_SHADING_RATE_1X1 && vrs::rate_1x2 == D3D12_SHADING_RATE_1X2);
+static_assert(vrs::rate_2x1 == D3D12_SHADING_RATE_2X1 && vrs::rate_2x2 == D3D12_SHADING_RATE_2X2);
+static_assert(vrs::rate_2x4 == D3D12_SHADING_RATE_2X4 && vrs::rate_4x2 == D3D12_SHADING_RATE_4X2);
+static_assert(vrs::rate_4x4 == D3D12_SHADING_RATE_4X4);
+static_assert(vrs::combiner_passthrough == D3D12_SHADING_RATE_COMBINER_PASSTHROUGH);
+static_assert(vrs::combiner_override == D3D12_SHADING_RATE_COMBINER_OVERRIDE);
+static_assert(vrs::combiner_min == D3D12_SHADING_RATE_COMBINER_MIN);
+static_assert(vrs::combiner_max == D3D12_SHADING_RATE_COMBINER_MAX);
+static_assert(vrs::combiner_sum == D3D12_SHADING_RATE_COMBINER_SUM);
+static_assert(vrs::valid_combiner(vrs::combiner_passthrough) && vrs::valid_combiner(vrs::combiner_sum));
+static_assert(!vrs::valid_combiner(5) && !vrs::valid_combiner(9) && !vrs::valid_combiner(0xffffffffu));
 static_assert(leonida::d3d12_sync::none == D3D12_BARRIER_SYNC_NONE);
 static_assert(leonida::d3d12_sync::all == D3D12_BARRIER_SYNC_ALL);
 static_assert(leonida::d3d12_sync::draw == D3D12_BARRIER_SYNC_DRAW);

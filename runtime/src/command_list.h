@@ -204,6 +204,33 @@ constexpr std::uint32_t query_result_size(std::uint32_t query_type) {
     }
 }
 
+// D3D12_SHADING_RATE: log2(width) << 2 | log2(height), the encoding VK_KHR_fragment_shading_rate attachments use
+// too. D3D12_SHADING_RATE_COMBINER: the order of VkFragmentShadingRateCombinerOpKHR, with sum (adding log2 sizes)
+// where Vulkan has mul (multiplying sizes).
+namespace d3d12_shading_rate {
+inline constexpr std::uint32_t rate_1x1 = 0x0;
+inline constexpr std::uint32_t rate_1x2 = 0x1;
+inline constexpr std::uint32_t rate_2x1 = 0x4;
+inline constexpr std::uint32_t rate_2x2 = 0x5;
+inline constexpr std::uint32_t rate_2x4 = 0x6;
+inline constexpr std::uint32_t rate_4x2 = 0x9;
+inline constexpr std::uint32_t rate_4x4 = 0xa;
+inline constexpr std::uint32_t combiner_passthrough = 0;
+inline constexpr std::uint32_t combiner_override = 1;
+inline constexpr std::uint32_t combiner_min = 2;
+inline constexpr std::uint32_t combiner_max = 3;
+inline constexpr std::uint32_t combiner_sum = 4;
+
+inline constexpr bool valid_rate(std::uint32_t rate) {
+    return rate == rate_1x1 || rate == rate_1x2 || rate == rate_2x1 || rate == rate_2x2 || rate == rate_2x4 ||
+           rate == rate_4x2 || rate == rate_4x4;
+}
+
+inline constexpr bool valid_combiner(std::uint32_t combiner) {
+    return combiner <= combiner_sum;
+}
+} // namespace d3d12_shading_rate
+
 // A view captured by value while recording: the CPU descriptor slot may be rewritten after the call.
 struct TargetView {
     ResourceId resource;
@@ -409,6 +436,11 @@ struct Draw {
     std::uint32_t first;  // first vertex or first index
     std::int32_t base_vertex;
     std::uint32_t first_instance;
+    // RSSetShadingRate and RSSetShadingRateImage (d3d12_shading_rate): the base rate, the two combiners, and the
+    // screen-space rate image (0: none). The defaults are D3D12's: 1x1, passthrough, no image.
+    std::uint32_t shading_rate = d3d12_shading_rate::rate_1x1;
+    std::array<std::uint32_t, 2> shading_rate_combiners{};
+    ResourceId shading_rate_image = 0;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.

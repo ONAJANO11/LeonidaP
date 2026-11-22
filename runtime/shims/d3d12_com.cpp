@@ -173,10 +173,10 @@ public:
     // reports it.
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
-        if (list_.queries_open()) invalid_ = true;
+        if (list_.queries_open()) check(false);
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
-        return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
+        return d3d12_trace::result(method, error_);
     }
 
     HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) override {
@@ -189,7 +189,7 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
-        invalid_ = false;
+        error_ = S_OK;
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         stencil_ref_set_ = false;
@@ -200,7 +200,7 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ExecuteBundle");
         if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
         GraphicsCommandList* bundle = from(command_list);
-        if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->invalid_ ||
+        if (!bundle || bundle->type_ != D3D12_COMMAND_LIST_TYPE_BUNDLE || bundle->error_ != S_OK ||
             !bundle->list_.closed())
             return check(false);
         if (!list_.execute_bundle(bundle->list_)) return check(false);
@@ -274,7 +274,8 @@ public:
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
-    // ClearState returns every piece of list state to its default, as Reset does (stencil references included).
+    // ClearState returns every piece of list state to its default, as Reset does (stencil references and the
+    // shading rate, combiners and rate image included).
     void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* state) override { reset_state(state); }
 
     // Graphics state. Draws record a copy of it (command_list.h, Draw).
@@ -663,6 +664,28 @@ public:
         check(list_.build_acceleration_structure(cmd));
     }
 
+    // GCL5: variable rate shading, applied at each draw through VK_KHR_fragment_shading_rate (vulkan_replay.h).
+    // A null combiner array means {passthrough, passthrough}, as D3D12 documents. As on the host runtime, a rate or
+    // combiner outside its enum makes Close return E_INVALIDARG, and either call on a compute or copy list makes
+    // it return E_FAIL (bundles take both).
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE rate,
+                                            const D3D12_SHADING_RATE_COMBINER* combiners) override {
+        namespace vrs = leonida::d3d12_shading_rate;
+        if (!graphics_list()) return fail(E_FAIL);
+        if (!vrs::valid_rate(u(rate))) return check(false);
+        if (combiners && !(vrs::valid_combiner(u(combiners[0])) && vrs::valid_combiner(u(combiners[1]))))
+            return check(false);
+        shading_rate_ = u(rate);
+        for (std::size_t i = 0; i < shading_rate_combiners_.size(); ++i)
+            shading_rate_combiners_[i] = combiners ? u(combiners[i]) : vrs::combiner_passthrough;
+    }
+
+    // The image is read at each draw, which is when D3D12 requires it to be in SHADING_RATE_SOURCE. Null unbinds it.
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* image) override {
+        if (!graphics_list()) return fail(E_FAIL);
+        shading_rate_image_ = resource_id(image);
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -687,8 +710,19 @@ private:
         return out;
     }
 
+    // Close returns the first invalid call's error, as the host runtime does: E_INVALIDARG for an invalid argument,
+    // E_FAIL for a call the list's type does not take.
     void check(bool ok) {
-        if (!ok) invalid_ = true;
+        if (!ok) fail(E_INVALIDARG);
+    }
+    void fail(HRESULT error) {
+        if (error_ == S_OK) error_ = error;
+    }
+
+    // Direct lists and bundles take graphics calls; compute and copy lists do not. Only the VRS calls check this
+    // so far.
+    bool graphics_list() const {
+        return type_ == D3D12_COMMAND_LIST_TYPE_DIRECT || type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE;
     }
 
     void stop_recording() {
@@ -823,7 +857,7 @@ private:
     D3D12_COMMAND_LIST_TYPE type_;
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
-    bool invalid_ = false;
+    HRESULT error_ = S_OK;  // what Close returns (see check)
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     bool stencil_ref_set_ = false;
@@ -840,6 +874,9 @@ private:
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
     bool blend_factor_set_ = false;
+    std::uint32_t shading_rate_ = leonida::d3d12_shading_rate::rate_1x1;
+    std::array<std::uint32_t, 2> shading_rate_combiners_{};  // passthrough, passthrough
+    leonida::ResourceId shading_rate_image_ = 0;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -879,6 +916,9 @@ private:
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
         blend_factor_set_ = false;
+        shading_rate_ = leonida::d3d12_shading_rate::rate_1x1;
+        shading_rate_combiners_ = {};
+        shading_rate_image_ = 0;
         set_pipeline(state);
     }
 
@@ -891,7 +931,8 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
+                           base_vertex, first_instance, shading_rate_, shading_rate_combiners_,
+                           shading_rate_image_};
         check(list_.draw(draw));
     }
 };

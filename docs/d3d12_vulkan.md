@@ -620,7 +620,8 @@ The compute path, end to end:
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
     topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
     vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
-    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`). The fragment shading rate is dynamic on a
+    device with variable rate shading.
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
@@ -643,12 +644,36 @@ The compute path, end to end:
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
     `maxPushConstantsSize` is below 144 (#224's `push_constants_need_fallback`) has every PSO refused, with the
     limit in the log, until the uniform-buffer tail exists.
+  - **Variable rate shading (D3D-32):** on a device with `VK_KHR_fragment_shading_rate`, replay calls
+    `vkCmdSetFragmentShadingRateKHR` at every draw. A `D3D12_SHADING_RATE` and a Vulkan shading-rate texel share
+    one encoding, `log2(width) << 2 | log2(height)`.
+    - **First combiner:** the per-primitive rate is always 1x1, because `SV_ShadingRate` is not translated. The
+      first combiner is therefore folded on the CPU (override and min give 1x1, the others keep the draw's rate),
+      and Vulkan's first combiner op is `KEEP`. `primitiveFragmentShadingRate` is not needed.
+    - **Second combiner:** passthrough, override, min and max map to `KEEP`, `REPLACE`, `MIN` and `MAX`. Sum
+      maps to `MUL`: multiplying sizes is adding log2 rates, and Vulkan clamps the result to a supported rate.
+    - **No image bound:** the image's rate is 1x1, so the second combiner is folded on the CPU too.
+    - **The image:** an `R8_UINT` 2D texture, single-sampled with one mip. On a tier-2 device such a texture is
+      created with `VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR`, and graphics pipelines carry
+      `VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR`. Before the rendering scope, replay
+      moves the image to `GENERAL` with shading-rate read access (`SHADING_RATE_SOURCE` maps to `GENERAL` in both
+      barrier tables). It is then chained as the scope's `VkRenderingFragmentShadingRateAttachmentInfoKHR`, with
+      a texel the size of the tile reported in `OPTIONS6`. Any other format, a multisampled texture or a volume is
+      refused at replay.
+    - **Pixel shaders that write depth or stencil** (`FragDepth` or `FragStencilRefEXT` in their SPIR-V) are shaded
+      at 1x1, as D3D12 requires. Vulkan would shade them coarsely: both test GPUs report
+      `fragmentShadingRateWithShaderDepthStencilWrites`.
+    - **Without the extension:** the rate and the image are recorded and ignored, and `OPTIONS6` reports no VRS.
 
   The command list keeps the input-assembler, viewport, scissor, render-target (read at `OMSetRenderTargets`, as
-  D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. Each
-  `DrawInstanced` / `DrawIndexedInstanced` records a copy of that state. A draw with no viewport (never set, or
-  unbound with `RSSetViewports(0, …)`) or an empty one rasterizes nothing in D3D12. Such a draw is not recorded,
-  since Vulkan forbids a 0×0 viewport.
+  D3D12 does), blend-factor and stencil-reference state, including CommandList8's front/back references. It also
+  keeps CommandList5's shading rate, combiners and shading-rate image. `Reset` and `ClearState` return those to
+  1x1, passthrough and no image. Null combiners are passthrough. As on the host PC runtime (measured on a Radeon
+  680M, an RTX 3050 and WARP), a rate or combiner outside its enum makes `Close` return `E_INVALIDARG`, either VRS
+  call on a compute or copy list makes it return `E_FAIL`, and the first invalid call in a list decides. At tier 2,
+  bundles take both calls, as direct lists do. Each `DrawInstanced` / `DrawIndexedInstanced` records a copy of
+  that state. A draw with no viewport (never set, or unbound with `RSSetViewports(0, …)`) or an empty one
+  rasterizes nothing in D3D12. Such a draw is not recorded, since Vulkan forbids a 0×0 viewport.
 
   At replay:
   - **Buffers:** vertex and index views resolve to buffers by VA (arena or upload). A view that runs past its
@@ -726,7 +751,14 @@ default-heap buffers are not zero-filled yet; a fence cannot be signalled to a l
 increase; such a signal is reported and dropped); instance step rates above 1 (they need vertex attribute
 divisors); read-only DSVs (the depth image always moves to `DEPTH_STENCIL_ATTACHMENT_OPTIMAL`, which matters once
 depth SRVs are sampled next to a read-only DSV, M2); the index buffer is bound without its view's size
-(`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one).
+(`vkCmdBindIndexBuffer2`, Vulkan 1.4, takes one); `SV_ShadingRate` (per-primitive shading rates); a shading-rate
+image smaller than the render area is not bound (D3D12 reads 1x1 past the image's edge, while Vulkan requires the
+image to cover the render area), so such a draw shades as if no image were bound; the shading-rate image is checked
+at replay rather than at `Close`: one that is not an `R8_UINT` texture, or is multisampled or 3D, fails the list at
+`ExecuteCommandLists`, and one with several mips or array layers is used through mip 0 and layer 0 (the host
+runtime fails `Close` for each of these except a 3D one); on a device that reports VRS tier 1,
+`RSSetShadingRateImage` is accepted, where the host fails `Close` with `E_FAIL` (WARP); other graphics calls on
+compute and copy lists are not refused yet.
 
 Known gaps found in review, not fixed here:
 - **Queues:** every D3D12 queue submits to one `VkQueue`, which runs batches in order. So a queue that waits on a
@@ -1002,6 +1034,26 @@ and any validation error fails them.
 
   The shaders are GLSL written to the translator's contract (`test/glsl/vs_draw.vert`, `vs_fullscreen.vert`,
   `ps_draw.frag`).
+- `d3d12_vrs_test`: variable rate shading (D3D-32), through the proxy. It runs twice: on a Vulkan device with
+  `VK_KHR_fragment_shading_rate`, and on one without it.
+  - **Feature answers:** `OPTIONS6` and `OPTIONS10` are compared with the host PC D3D12 runtime's answers for the
+    same adapter, found by LUID. Without the extension they must report no VRS.
+  - **Draws:** a triangle covers a 64x64 target. Its pixel shader (`test/glsl/ps_vrs.frag`) writes the pixel it ran
+    at, so a coarse pixel shows up as a block of equal values. For each case, every pixel must equal the first
+    pixel of its expected block (so shading is not finer), and that position must lie inside the block (so it is
+    not coarser).
+  - **Cases:**
+    - 1x1 by default, after `Reset` and after `ClearState`.
+    - Every rate, with 2x4, 4x2 and 4x4 clamped to 2x2 where the GPU lacks them.
+    - Each first combiner against the 1x1 per-primitive rate.
+    - A four-quadrant shading-rate image under each second combiner, and with no image bound.
+    - A pixel shader that writes depth (`ps_vrs_depth.frag`), which must stay 1x1.
+    - Without the extension, the rate and the image must be ignored.
+  - **`Close` results:** with the extension, `Close` must return the host runtime's result after a rate or
+    combiner outside its enum, after each call on direct, bundle, compute and copy lists, and after two invalid
+    calls in one list. These need no PSO.
+  - **Limited push constants:** on a device with less than 144 bytes of push constants, PSOs are refused (above),
+    so only the feature answers and the `Close` results are checked there, and the test says so.
 - `d3d12_present_test`: milestone M0. It opens a window and presents 60 frames, each one: reset the list, move
   the back buffer `PRESENT` → `RENDER_TARGET`, clear, move it back, execute, present, signal a fence. It then
   resizes the window and presents 10 more (70 in all), which recreates the swapchain, scales the blit and switches
@@ -1428,6 +1480,20 @@ The trace will enumerate them.
     the host D3D12 runtime on the same adapter (`NVIDIA GeForce RTX 5080`, driver `616.56`, Windows 11): 15/15 feature
     queries compared with `0` mismatches (`MSAA64KBAlignedTextureSupported = TRUE`,
     `SupportedSampleCountsWithNoOutputs = 0x1d`, `LEONIDA_VK_VALIDATION=1` with `0` validation errors).
+- `D3D12_OPTIONS6` and `D3D12_OPTIONS10` (variable rate shading, D3D-32):
+  - **Tier 1:** the device enables `pipelineFragmentShadingRate`.
+  - **Tier 2:** the device also enables `attachmentFragmentShadingRate`, supports
+    `fragmentShadingRateNonTrivialCombinerOps`, and allows an 8x8 or 16x16 texel. The smaller of the two is the
+    reported tile size.
+  - **`AdditionalShadingRatesSupported`:** 2x4, 4x2 and 4x4 are all listed for one sample.
+  - **Sum combiner:** reported when the image is supported and `fragmentShadingRateStrictMultiplyCombiner` holds.
+    Without strict multiplication, Vulkan's `MUL` may turn 1 x 1 into 2.
+  - **Reported FALSE:** per-primitive rates with viewport indexing, mesh-shader per-primitive rates and background
+    processing, because `SV_ShadingRate` is not translated.
+  - **Tier 2 without `SV_ShadingRate`:** tier 2 nominally includes per-primitive rates, but #284's corpus scan
+    finds no shader that writes one.
+  - **Measured:** the answers equal the host D3D12 runtime's on the RTX 3050 (tier 2, tile 16, additional rates,
+    sum) and on the Radeon 680M (tier 2, tile 8, no additional rates, sum). `d3d12_vrs_test` checks this.
 - `D3D12_FEATURE_FORMAT_SUPPORT`: map to `vkGetPhysicalDeviceFormatProperties`; multisample render-target
   and resolve bits also require the format's image-usage/sample-count query to succeed. D3D12's per-format
   rules then apply, as native D3D12 reports them (RX 9070 XT, AMD 26.11.2, and WARP):
@@ -2199,7 +2265,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; plane 0 into the Vulkan swapchain. Call shapes known; slots/layouts **Open**. |
-| VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
+| VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | **Implemented** (D3D-32). `VK_KHR_fragment_shading_rate`: `RSSetShadingRate` maps to `vkCmdSetFragmentShadingRateKHR` at every draw, and the shading-rate image becomes the rendering scope's shading-rate attachment. Replay is in section 3.2 and the `OPTIONS6` answers are in section 4.1. `SV_ShadingRate` is not translated. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
@@ -2576,7 +2642,7 @@ Xodus is LGPL-2.1 and is cited only for its coverage number, not as a code sourc
 | 11 | What should `CheckFeatureSupport` answer for UMA, resource binding tier, mesh tier, RT tier? | **Implemented** (D3D-11). Reports truthful host architecture (discrete desktop GPU: non-UMA), ResourceBindingTier 3 (descriptor indexing / bindless support), 48-bit GPU virtual address support matching the arena, and maps `D3D12_FEATURE_FORMAT_SUPPORT` to Vulkan format properties plus multisample render-target/resolve support and one quality level per supported sample count. |
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
 | 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), desktop AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively. A Radeon 680M on the Windows driver 22.40.84.06 and the earlier Intel Arc entries expose only the core minimum 128 B (`maxPushConstantsSize == 128`), but an Arc B580 on Windows 11 (driver 32.0.101.9175) reports 256 B (#166), so the 128 B figure for Arc depends on the OS or driver; an Arc result on Linux (Mesa ANV) would settle which side it is. `d3d12_vulkan_device_test` accepts either answer and checks that the fallback flag matches it. Below 144 B, the device logs a warning and marks `push_constants_need_fallback`, routing the 16-byte tail (dwords 32..35: heap base and code base) to a uniform-buffer fallback. |
-| 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. |
+| 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. VRS is **implemented** (D3D-32, sections 3.2 and 4.1) whether or not the game calls it; `SV_ShadingRate` is not translated, since no SFI0 declares `SHADING_RATE`. |
 | 14 | Are there PSOs with two code-base stages? | Count from the PSO/shader hash table and the index metadata. If yes, implement per-stage code-base slots (section 5.2). **Per stage, measured** (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). So VS+PS and MS+PS pipelines with two code-base stages are possible; whether any exists depends on which shaders a PSO pairs, which is in the executable, not in `shaders.rpf`. |
 | 15 | Is `ExecuteIndirect` used with signatures Vulkan cannot express directly? | Trace `CreateCommandSignature` and `ExecuteIndirect`; implement simple signatures first, expand the complex ones with compute. The simple signatures are D3D-17 (#313). |
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. |

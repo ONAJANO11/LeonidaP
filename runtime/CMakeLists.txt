@@ -1379,8 +1379,31 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_set0_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_set0_compute COMMAND d3d12_set0_compute_test)
       set_tests_properties(d3d12_set0_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # Variable rate shading (D3D-32): the rate read back from a pixel shader that writes where it ran.
+      set(LEONIDA_TEST_VRS_SHADERS)
+      foreach(source vs_vrs.vert ps_vrs.frag ps_vrs_depth.frag)
+        string(REGEX REPLACE "\\.[a-z]+$" ".spv" output "${CMAKE_CURRENT_BINARY_DIR}/generated/${source}")
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the VRS test shader ${source}"
+          VERBATIM)
+        list(APPEND LEONIDA_TEST_VRS_SHADERS ${output})
+      endforeach()
+      list(GET LEONIDA_TEST_VRS_SHADERS 0 LEONIDA_TEST_VRS_VS)
+      list(GET LEONIDA_TEST_VRS_SHADERS 1 LEONIDA_TEST_VRS_PS)
+      list(GET LEONIDA_TEST_VRS_SHADERS 2 LEONIDA_TEST_VRS_PS_DEPTH)
+      add_executable(d3d12_vrs_test test/d3d12_vrs_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_TEST_VRS_SHADERS})
+      target_link_libraries(d3d12_vrs_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_vrs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VRS_VS_SPV="${LEONIDA_TEST_VRS_VS}"
+                                 LEONIDA_TEST_VRS_PS_SPV="${LEONIDA_TEST_VRS_PS}"
+                                 LEONIDA_TEST_VRS_PS_DEPTH_SPV="${LEONIDA_TEST_VRS_PS_DEPTH}")
+      target_compile_options(d3d12_vrs_test PRIVATE /W4 /permissive- /utf-8)
     else()
-      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test and d3d12_set0_compute_test are not built")
+      message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_vrs_test are not built")
     endif()
 
     # Subgroup size control in PSOs, end to end: runtime/test/shaders/cs_w64x_readlane.asm translated natively and with
