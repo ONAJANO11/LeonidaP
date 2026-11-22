@@ -49,6 +49,7 @@ the channel order of the 10:10:10:2 typed-buffer formats: the names list the cha
 """
 import math
 import os
+import re
 import struct
 import sys
 import unittest
@@ -665,6 +666,62 @@ class LaneMaskConstants(unittest.TestCase):
                word(-2 & m64), word(~0xFF & m64), word(0x3C), bin(0xFF00FF).count("1") | 8 << 8]
         self.assertEqual(w32, self.WANT["cs_w32_mask_imm"][1])
         self.assertEqual(w64, self.WANT["cs_w64_mask_imm"][1])
+
+
+class LdsBitwiseAtomics(unittest.TestCase):
+    """runtime/test/shaders/cs_w32_lds_bitops.asm: ds_and_b32, ds_or_b32, ds_xor_b32, ds_sub_u32 and ds_and_b64 from
+    every lane of one wave32 group on shared LDS words (ds_sub_u32 also EXEC-masked and at per-lane addresses). The
+    GPU words (check.py CS_DUMPS) come from all 32 lanes. spirv_mini_interp keeps LDS per invocation and rejects
+    OpControlBarrier, so the CPU run is lane 0 alone on the fixture without its two s_barrier lines; the same
+    plain-Python reference gives both word lists."""
+
+    WANT = [0xFFFF0000, 0xD5555555, 0xEDCBA987, 0xFFFFFF92, 0xFFFF0000, 0x0000F0F0, 0x360, 0x378]
+    WANT_LANE0 = [0xFFFFFFFE, 0x80000001, 0x12345679, 0x00000063, 0xFFFFFFFE, 0xF0F0F0F0, 0x3E8, 0x3E8]
+
+    @staticmethod
+    def reference(lanes):
+        # The ISA pseudocode, M = M op DATA once per lane L (mod 2^32), with the seeds and data of the .asm.
+        m32 = 0xFFFFFFFF
+        and32, or32, xor32, sub12 = 0xFFFFFFFF, 0x80000000, 0x12345678, 100
+        lo, hi, per_lane = 0xFFFFFFFF, 0xF0F0F0F0, [1000] * 4
+        for L in lanes:
+            and32 &= ~(1 << (L & 15)) & m32
+            or32 |= 1 << (L & 30)
+            xor32 ^= 1 << L
+            if L < 20:                                  # EXEC = 0x000FFFFF
+                sub12 = (sub12 - (L + 1)) & m32
+            lo &= ~(1 << (L & 15)) & m32
+            hi &= ~(1 << ((L & 15) + 16)) & m32
+            per_lane[L & 3] = (per_lane[L & 3] - L) & m32
+        return [and32, or32, xor32, sub12, lo, hi, per_lane[3], per_lane[0]]
+
+    def test_reference(self):
+        self.assertEqual(self.reference(range(32)), self.WANT)
+        self.assertEqual(self.reference([0]), self.WANT_LANE0)
+
+    def test_gpu_runners_expect_the_same_words(self):
+        for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
+            with open(os.path.join(support.ROOT, *rel), encoding="utf-8") as f:
+                m = re.search(r'"cs_w32_lds_bitops"\)?[,:]\s*\[([^\]]*)\]', f.read())
+            with self.subTest(file="/".join(rel)):
+                self.assertIsNotNone(m)
+                self.assertEqual([int(v, 0) for v in m.group(1).split(",")], self.WANT)
+
+    def test_translated_shader_lane0(self):
+        sys.path.insert(0, os.path.join(support.ROOT, "runtime", "test", "shaders"))
+        from compute_fixture import compute_header
+        name = "cs_w32_lds_bitops"
+        header = compute_header(os.path.join(support.ROOT, "runtime", "test", "shaders", name + ".asm"))
+        with open(os.path.join(support.ROOT, "tests", "semantic", "fixtures", "disasm", name + ".s"),
+                  encoding="utf-8") as f:
+            lines = [ln for ln in f.read().splitlines()[1:] if ln.strip() and ln.strip() != "s_barrier"]
+        self.assertEqual(len(lines), 69)
+        spv = support.translate_lines(name, lines, fssm=bytes(header))
+        memory = {a: 0xEEEEEEEE for a in range(0, 0x100, 4)}
+        support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0), "%sg_lane": 0},
+                             push_constants=[0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28, memory=memory)
+        self.assertEqual([f"{memory[4 * i]:#010x}" for i in range(8)], [f"{w:#010x}" for w in self.WANT_LANE0])
+        self.assertEqual(set(memory), set(range(0, 0x100, 4)), "nothing written outside the heap")
 
 
 if __name__ == "__main__":
