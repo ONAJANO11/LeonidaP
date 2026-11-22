@@ -2240,7 +2240,12 @@ public:
                                                                : VK_CULL_MODE_NONE;
         // With the negative-height viewport, framebuffer winding matches D3D12's screen-space winding.
         raster.frontFace = r.FrontCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-        raster.depthBiasEnable = r.DepthBias || r.SlopeScaledDepthBias != 0.0f;
+        // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: RSSetDepthBias (GCL9) replaces these values after
+        // creation, so the bias becomes dynamic state set at each draw. It is enabled outright there: D3D12
+        // treats all-zero values as "no bias", which zero factors reproduce exactly, and a dynamic RSSetDepthBias
+        // can turn a zero static bias on.
+        const bool dynamic_depth_bias = desc.Flags & D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+        raster.depthBiasEnable = dynamic_depth_bias || r.DepthBias || r.SlopeScaledDepthBias != 0.0f;
         raster.depthBiasConstantFactor = float(r.DepthBias);
         raster.depthBiasClamp = r.DepthBiasClamp;
         raster.depthBiasSlopeFactor = r.SlopeScaledDepthBias;
@@ -2412,6 +2417,12 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
+        // Before build(0): the dynamic state list reads depth_bias_dynamic, and replay needs the static values
+        // (the default when the list set none) and the device's clamp feature (prepare_draw refuses a clamp it
+        // cannot honour).
+        graphics_.depth_bias = {raster.depthBiasConstantFactor, raster.depthBiasClamp, raster.depthBiasSlopeFactor};
+        graphics_.depth_bias_dynamic = dynamic_depth_bias;
+        graphics_.depth_bias_clamp_supported = device_.info.features.depthBiasClamp == VK_TRUE;
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
@@ -2526,15 +2537,20 @@ private:
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
     VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+        // The stride state stays last: a pipeline without vertex bindings (a full-screen pass that builds its
+        // vertices from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
+        // (VUID-vkCmdDraw-pStrides-04913). Depth bias joins when the PSO was created with
+        // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS: RSSetDepthBias sets it before each draw.
         const Recipe& r = recipe_;
+        static constexpr VkDynamicState fixed_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,  VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        VkDynamicState dynamic_states[std::size(fixed_states) + 2] = {};  // + depth bias, + vertex strides
+        std::uint32_t dynamic_count = 0;
+        for (const VkDynamicState state : fixed_states) dynamic_states[dynamic_count++] = state;
+        if (graphics_.depth_bias_dynamic) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
+        if (!r.bindings.empty()) dynamic_states[dynamic_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         std::vector<VkFormat> colors = graphics_.color_formats;
         for (std::size_t slot = 0; slot < colors.size(); ++slot)
             if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
@@ -2561,7 +2577,7 @@ private:
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
+        dynamic.dynamicStateCount = dynamic_count;
         dynamic.pDynamicStates = dynamic_states;
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};

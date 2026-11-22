@@ -138,11 +138,11 @@ private:
 };
 
 class GraphicsCommandList final
-    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList8Stubs, ID3D12Object, ID3D12DeviceChild,
+    : public Child<GraphicsCommandList, ID3D12GraphicsCommandList9Stubs, ID3D12Object, ID3D12DeviceChild,
                     ID3D12CommandList, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
                     ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList3, ID3D12GraphicsCommandList4,
                     ID3D12GraphicsCommandList5, ID3D12GraphicsCommandList6, ID3D12GraphicsCommandList7,
-                    ID3D12GraphicsCommandList8> {
+                    ID3D12GraphicsCommandList8, ID3D12GraphicsCommandList9> {
 public:
     // {2f8a7c33-91d4-4b6e-8e05-6d3f1a9b2c47}
     static constexpr GUID kTag{0x2f8a7c33, 0x91d4, 0x4b6e, {0x8e, 0x05, 0x6d, 0x3f, 0x1a, 0x9b, 0x2c, 0x47}};
@@ -211,6 +211,10 @@ public:
             front_stencil_ref_ = bundle->front_stencil_ref_;
             back_stencil_ref_ = bundle->back_stencil_ref_;
             stencil_ref_set_ = true;
+        }
+        if (bundle->depth_bias_set_) {
+            depth_bias_ = bundle->depth_bias_;
+            depth_bias_set_ = true;
         }
     }
 
@@ -699,6 +703,16 @@ public:
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
     }
 
+    // GCL9. The values take effect on pipelines created with D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS and
+    // persist across SetPipelineState, as D3D12's other dynamic state does; ClearState and Reset restore the
+    // pipeline's own values.
+    void STDMETHODCALLTYPE RSSetDepthBias(FLOAT bias, FLOAT clamp, FLOAT slope) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList9::RSSetDepthBias");
+        if (list_.closed()) return check(false);
+        depth_bias_ = {bias, clamp, slope};
+        depth_bias_set_ = true;
+    }
+
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
 private:
@@ -876,6 +890,8 @@ private:
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
     bool blend_factor_set_ = false;
+    leonida::DepthBias depth_bias_{};
+    bool depth_bias_set_ = false;
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -915,6 +931,8 @@ private:
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
         blend_factor_set_ = false;
+        depth_bias_ = {};
+        depth_bias_set_ = false;
         set_pipeline(state);
     }
 
@@ -926,8 +944,8 @@ private:
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
         leonida::Draw draw{graphics_pipeline_, graphics_.data, render_targets_, depth_,
                            {vertex_buffers_.begin(), vertex_buffers_.end()}, index_, topology_, viewport_, scissor_,
-                           blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first,
-                           base_vertex, first_instance};
+                           blend_factor_, front_stencil_ref_, back_stencil_ref_, depth_bias_, depth_bias_set_,
+                           indexed, count, instances, first, base_vertex, first_instance};
         check(list_.draw(draw));
     }
 };

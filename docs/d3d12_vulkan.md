@@ -146,6 +146,7 @@ The command-list surface maps to the IR as follows:
 | `IASetVertexBuffers` / `IASetIndexBuffer` / `IASetPrimitiveTopology` | state; bind arena buffer + offset, dynamic topology |
 | `RSSetViewports` / `RSSetScissorRects` | state; dynamic viewport/scissor |
 | `OMSetRenderTargets` / `OMSetBlendFactor` / `OMSetStencilRef` | state; rendering scope and dynamic state |
+| `RSSetDepthBias` (GCL9) | state; `vkCmdSetDepthBias` before the next draw, on dynamic-depth-bias PSOs |
 | `DrawInstanced` / `DrawIndexedInstanced` | command with a state snapshot |
 | `Dispatch` / `DispatchMesh` | command with a state snapshot |
 | `Copy*` / `Resolve*` / `Clear*` | copy/clear command |
@@ -624,7 +625,12 @@ The compute path, end to end:
   - **Fixed-function state:** rasterizer, blend and depth-stencil state map one to one. Viewport, scissor,
     topology, stencil references and the blend factor are dynamic, and so are vertex strides when the pipeline has
     vertex bindings. A pipeline without them (a full-screen pass from `SV_VertexID`) does not declare the stride
-    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`).
+    state, since nothing would set it (`VUID-vkCmdDraw-pStrides-04913`). Depth bias joins them as
+    `vkCmdSetDepthBias` on a PSO created with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS`: `RSSetDepthBias`
+    (GCL9; the console `RSSetDepthBiasX`'s public form) replaces the RasterizerState values, persists across
+    `SetPipelineState` as D3D12's other dynamic state does, and is restored to the PSO's values by `Reset` and
+    `ClearState`. Without the flag the pipeline keeps its static bias and the call has no effect, as in D3D12.
+    `IASetIndexBufferStripCutValue`, the other GCL9 method, stays with the primitive-restart work (D3D-57).
   - **Logic ops** come from `RenderTarget[0]`, as in D3D12, and apply to every target (Vulkan has one per
     pipeline; it skips float formats). **`DepthClipEnable = FALSE`** is depth clamping: D3D12 clamps output depth
     to the viewport's range anyway.
@@ -636,7 +642,9 @@ The compute path, end to end:
   - **Features:** independent blend state, wireframe fill, a depth-bias clamp, SRC1 blend factors, logic ops and
     disabled depth clipping need `independentBlend`, `fillModeNonSolid`, `depthBiasClamp`, `dualSrcBlend`, `logicOp`
     and `depthClamp`. The standalone device enables those the GPU has and reports them in
-    `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused with a log.
+    `VulkanDeviceInfo::features`. A PSO that needs a missing one is refused with a log. A dynamic depth-bias clamp
+    the PSO itself does not carry is checked at replay: the submission is refused rather than handed to a driver
+    without the feature.
   - **Shader features:** the standalone device also enables `shaderInt64` (declared by 25,803 of 26,503 index
     entries), `shaderFloat64`, `shaderInt16`, `shaderClipDistance` and `shaderCullDistance` where the GPU has them.
     Without one, `vkCreateShaderModule` reports the capability (`VUID-VkShaderModuleCreateInfo-pCode-08740`). The
