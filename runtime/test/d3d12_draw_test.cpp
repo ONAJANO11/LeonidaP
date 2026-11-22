@@ -84,9 +84,11 @@ int main() {
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256), second_pixels(size * 256);
     std::vector<std::uint8_t> strip16_pixels(size * 256), strip32_pixels(size * 256), strip_nocut_pixels(size * 256);
+    std::vector<std::uint8_t> step2_pixels(size * 256), step1_pixels(size * 256);
     std::vector<std::uint8_t> msaa_full_pixels(size * 256), msaa_half_pixels(size * 256);
     bool ran_msaa = false;
     const bool logic_op = d.enabled.logicOp == VK_TRUE;
+    const bool has_divisor = d.vertex_attribute_divisor;
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -100,6 +102,7 @@ int main() {
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
         Ref<ID3D12Device> device;
@@ -469,6 +472,64 @@ int main() {
             }
         }
 
+        // Instance step rate > 1 (VK_KHR/EXT_vertex_attribute_divisor).
+        if (has_divisor) {
+            const std::uint8_t inst_colors[2][4] = {{255, 0, 0, 255}, {255, 0, 255, 255}};
+            void* up_ptr = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &up_ptr)));
+            std::memcpy(static_cast<std::uint8_t*>(up_ptr) + 1024, inst_colors, sizeof(inst_colors));
+            upload->Unmap(0, nullptr);
+
+            const D3D12_INPUT_ELEMENT_DESC step2_elements[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 2},
+            };
+            const D3D12_INPUT_ELEMENT_DESC step1_elements[2] = {
+                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+            };
+            auto step_desc = pso_desc;
+            Ref<ID3D12PipelineState> step2_pso, step1_pso;
+            step_desc.InputLayout = {step2_elements, 2};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&step_desc, IID_PPV_ARGS(&step2_pso.p))));
+            step_desc.InputLayout = {step1_elements, 2};
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&step_desc, IID_PPV_ARGS(&step1_pso.p))));
+
+            const D3D12_VERTEX_BUFFER_VIEW step_vbvs[2] = {vbv, {upload_va + 1024, sizeof(inst_colors), 4}};
+            const float br_offset[2] = {1.0f, -1.0f};
+            UINT64 step_fence = 20;
+            for (UINT pass = 0; pass < 2; ++pass) {
+                EXPECT(SUCCEEDED(allocator->Reset()) &&
+                       SUCCEEDED(list->Reset(allocator.p, pass == 0 ? step2_pso.p : step1_pso.p)));
+                list->ResourceBarrier(1, &to_target);
+                list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                list->SetGraphicsRootSignature(root.p);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->IASetVertexBuffers(0, 2, step_vbvs);
+                list->IASetIndexBuffer(&ibv);
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+                list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+                list->DrawIndexedInstanced(6, 2, 0, 0, 0);
+                if (pass == 0) {
+                    list->SetGraphicsRoot32BitConstants(0, 2, br_offset, 0);
+                    list->DrawIndexedInstanced(6, 3, 0, 0, 0);
+                }
+                list->ResourceBarrier(1, &to_copy);
+                list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++step_fence;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, step_fence)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(step_fence, nullptr)));
+                auto& dst_buf = pass == 0 ? step2_pixels : step1_pixels;
+                std::memcpy(dst_buf.data(), mapped, dst_buf.size());
+            }
+        }
+
         // Multisampled graphics pipeline (4x MSAA): draw the top-left red quad into a 4x MSAA target and resolve.
         // Full SampleMask (0xFFFFFFFF) writes all 4 samples red; half SampleMask (0x5) writes 2 of 4 samples so the
         // resolved top-left quadrant shifts from (255, 0, 0, 255) to ~50/50 purple (128, 0, 128, 255).
@@ -524,7 +585,7 @@ int main() {
                     std::vector<std::uint8_t>* out;
                 };
                 const MsaaPass ms_passes[] = {{ms_full_pso.p, &msaa_full_pixels}, {ms_half_pso.p, &msaa_half_pixels}};
-                UINT64 ms_fence = 20;
+                UINT64 ms_fence = 25;
                 for (UINT pass = 0; pass < std::size(ms_passes); ++pass) {
                     EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, ms_passes[pass].pso)));
                     if (pass > 0) {
@@ -630,7 +691,7 @@ int main() {
             EXPECT(list->Close() == S_OK);
             queue->ExecuteCommandLists(1, lists);
             EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)) && SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 31)) && SUCCEEDED(fence->SetEventOnCompletion(31, nullptr)));
             const auto* result = static_cast<const std::uint8_t*>(mapped);
             for (UINT row = 0; row < size; ++row) {
                 for (UINT col = 0; col < size; ++col) {
@@ -728,6 +789,35 @@ int main() {
     std::printf("strip cut (0xFFFF & 0xFFFFFFFF): 4096/4096 pixels matched each (no-cut negative control painted %u "
                 "bridge pixels in bottom-left)\n",
                 nocut_bl_red);
+    if (has_divisor) {
+        UINT step1_flipped = 0;
+        for (UINT row = 0; row < size; ++row) {
+            for (UINT col = 0; col < size; ++col) {
+                const bool top = row < size / 2, left = col < size / 2;
+                using Pixel = std::array<std::uint8_t, 4>;
+                const Pixel want2 = top && left     ? Pixel{255, 0, 0, 255}
+                                    : !top && !left ? Pixel{255, 0, 255, 255}
+                                                    : Pixel{0, 0, 255, 255};
+                const std::uint8_t* got2 = step2_pixels.data() + row * 256 + col * 4;
+                if (!std::equal(want2.begin(), want2.end(), got2) && mismatches++ < 6)
+                    std::fprintf(stderr, "step-rate 2 pixel (%u,%u): got %u,%u,%u,%u want %u,%u,%u,%u\n", col, row,
+                                 got2[0], got2[1], got2[2], got2[3], want2[0], want2[1], want2[2], want2[3]);
+                if (top && left) {
+                    const std::uint8_t* got1 = step1_pixels.data() + row * 256 + col * 4;
+                    const Pixel want1{255, 0, 255, 255};
+                    if (!std::equal(want1.begin(), want1.end(), got1) && mismatches++ < 6)
+                        std::fprintf(stderr, "step-rate 1 control (%u,%u): got %u,%u,%u,%u want 255,0,255,255\n", col,
+                                     row, got1[0], got1[1], got1[2], got1[3]);
+                    if (std::memcmp(got1, got2, 4) != 0) ++step1_flipped;
+                }
+            }
+        }
+        EXPECT(!mismatches);
+        EXPECT(step1_flipped == (size / 2) * (size / 2));
+        std::printf("instance step rate 2: 4096/4096 pixels matched (step-rate 1 control flipped %u/%u top-left "
+                    "pixels from red to magenta)\n",
+                    step1_flipped, (size / 2) * (size / 2));
+    }
     if (ran_msaa) {
         UINT half_changed = 0;
         for (UINT row = 0; row < size; ++row) {
