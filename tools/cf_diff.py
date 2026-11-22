@@ -16,7 +16,7 @@ Shapes (each nests, up to --depth):
   sloop     uniform counter loop closed by s_cbranch_scc1                              (natural loop)
   vloop     per-lane trip counts: break mask, s_andn2 exec, s_cbranch_execnz          (LLVM SI_LOOP)
   irr       two-entry cycle on uniform SCC branches                                   (irreducible graph)
-  sccmask   s_and/andn2/or/xor of VCC and EXEC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
+  sccmask   s_and/andn2/or/xor of VCC and EXEC, or s_not of VCC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
 (vloop also closes some loops with s_cbranch_scc1 on the SCC of its s_andn2 exec.)
 Bodies mix integer VALU and SALU ops with "probes": v11 = v11 * 33 + K at each site, so v11 records which sites
@@ -127,10 +127,10 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "vccz", "sif", "sloop", "vloop", "vloop", "irr",
                          "sccmask", "csel"))
         if kind == "sccmask":
-            return ("sccmask", self.cmp(), r.choice(("and", "andn2", "or", "xor")),
+            return ("sccmask", self.cmp(), r.choice(("and", "andn2", "or", "xor", "not")),
                     r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
         if kind == "csel":
-            return ("csel", self.cmp(), r.choice(("and", "andn2", "or", "xor")), r.choice(SREGS))
+            return ("csel", self.cmp(), r.choice(("and", "andn2", "or", "xor", "not")), r.choice(SREGS))
         if kind == "if":
             return ("if", self.cmp(), r.random() < 0.7, [self.probe()] + self.block(depth))
         if kind == "ifelse":
@@ -198,6 +198,12 @@ class Emitter:
 
     def place(self, label):
         self.items.append(("label", label))
+
+    def mask_logic(self, logic, dst):
+        """A mask op on VCC (and EXEC): s_<logic> dst, vcc, exec, or s_not dst, vcc (SOP1)."""
+        if logic == "not":
+            return f"s_not_{self.b()} {dst}, {self.vcc()}"
+        return f"s_{logic}_{self.b()} {dst}, {self.vcc()}, {self.exec_()}"
 
     def vcmp(self, c, dst=None):
         cc, ty, k, v = c
@@ -321,14 +327,14 @@ class Emitter:
             _, c, logic, mnemonic, body = n
             tmp, end = self.sreg(50), self.label()
             self.vcmp(c)
-            self.ins(f"s_{logic}_{w} {tmp}, {self.vcc()}, {ex}")
+            self.ins(self.mask_logic(logic, tmp))
             self.br(mnemonic, end)
             self.nodes(body)
             self.place(end)
         elif kind == "csel":
             _, c, logic, sr = n
             self.vcmp(c)
-            self.ins(f"s_{logic}_{w} {self.sreg(50)}, {self.vcc()}, {ex}")
+            self.ins(self.mask_logic(logic, self.sreg(50)))
             self.ins(f"s_cselect_b32 s{sr}, s{sr}, 17")
         elif kind == "vloop":
             _, (src, mask, scc_exit), brk, body = n

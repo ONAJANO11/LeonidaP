@@ -1741,16 +1741,17 @@ class Gen:
         self.emit(f"OpStore %scc {z}")
 
     def scc_logic(self, a, r):
-        """SCC of a 32-bit bitwise SOP2 (s_and/or/xor/andn2/orn2/nand/nor/xnor_b32): D != 0. In a wave32 program
-        an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
+        """SCC of a 32-bit bitwise op (SOP2 s_and/or/xor/andn2/orn2/nand/nor/xnor_b32, SOP1 s_not_b32): D != 0.
+        In a wave32 program an operation on lane masks (a source holds one, or it writes EXEC) has the whole wave's mask as D, so SCC
         is the vote of scc_from_mask, as for the _b64 forms. Until 2026-11-22 it was this lane's bit instead:
         `s_and_b32 s0, vcc_lo, exec_lo; s_cbranch_scc0` skipped the block in the lanes whose own bit was 0
         although the wave runs it, and a loop closed by `s_andn2_b32 exec_lo, ...; s_cbranch_scc1` let each lane
         leave on its last iteration, before the wave did (tools/cf_diff.py, FUZZ-8). In a wave64 program the
         same op works on one half of a mask (lanes 0-31 or 32-63), whose SCC would be a vote of that half only;
-        that case still takes the lane's bit and is not covered by the fuzzer yet."""
+        that case still takes the lane's bit and is not covered by the fuzzer yet. s_not_b32 had its own SCC and
+        kept the lane's bit until 2026-11-22 (reported in #477; 0 uses whose SCC is read in the corpus)."""
         writes_exec = a[0]["k"] == "special" and a[0].get("t", "").startswith("exec")
-        if not self.wave64 and (writes_exec or self.holds_lane_mask(a[1]) or self.holds_lane_mask(a[2])):
+        if not self.wave64 and (writes_exec or any(self.holds_lane_mask(x) for x in a[1:3])):
             self.scc_from_mask(r)
         else:
             self.scc_nonzero(r)
@@ -3330,9 +3331,7 @@ class Gen:
             r = self.tmp()
             self.emit(f"{r} = OpNot %uint {x}")
             self.dst(a[0], r)
-            z = self.tmp()
-            self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(r)} {self.cu(1)} {self.cu(0)}")
-            self.emit(f"OpStore %scc {z}")
+            self.scc_logic(a, r)
         elif op in ("s_cmp_eq_u64", "s_cmp_lg_u64"):
             # 64-bit compare of masks/pointers: equal iff both halves are equal.
             def halves(s):

@@ -26,6 +26,8 @@ SCC_MASK_CASES = {
     "s_and_b32 + s_cbranch_scc0": [("sccmask", FEW_LANES, "and", "s_cbranch_scc0", [("probe", 11)])],
     "s_xor_b32 + s_cbranch_scc1": [("sccmask", FEW_LANES, "xor", "s_cbranch_scc1", [("probe", 11)])],
     "s_xor_b32 + s_cselect_b32": [("csel", FEW_LANES, "xor", 11)],
+    "s_not_b32 + s_cbranch_scc0": [("sccmask", FEW_LANES, "not", "s_cbranch_scc0", [("probe", 11)])],
+    "s_not_b32 + s_cselect_b32": [("csel", FEW_LANES, "not", 11)],
     "loop closed by s_andn2_b32 exec + s_cbranch_scc1": [
         ("vloop", (0, 3, True), None, [("probe", 9), ("op", "s_add_u32 s10, s10, 1")])],
 }
