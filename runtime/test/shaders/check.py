@@ -143,6 +143,9 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# cs_int_clamp.asm: VOP3 clamp on integer add/sub, wrapped then clamped word per input pair (derivation in its header).
+INT_CLAMP_WORDS = [0x00000000, 0xffffffff, 0x0000000c, 0x0000000c, 0x00000001, 0xffffffff, 0xffffffff, 0x00000000, 0x00000005, 0x00000005, 0xffffffff, 0x00000000, 0xffffffff, 0x00000000, 0x00000005, 0x00000005, 0xffffffff, 0x00000000, 0x80000000, 0x7fffffff, 0x00000002, 0x00000002, 0x7fffffff, 0x80000000, 0x7fffffff, 0x80000000, 0xfffffff9, 0xfffffff9, 0x80000000, 0x7fffffff, 0xbeef0000, 0xbeefffff, 0xbeef000c, 0xbeef000c, 0xbeef0001, 0xbeefffff, 0xbeefffff, 0xbeef0000, 0xbeef0005, 0xbeef0005, 0xbeef8001, 0xbeef0000]
+INT_CLAMP_WORDS = INT_CLAMP_WORDS + [0xEEEEEEEE] * 22
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
@@ -286,14 +289,13 @@ def failure(code, output, lines):
     return f"exit {code}: {details or 'no test output'}"
 
 
-def fmt_1010102_test(tools, spirv, env=None):
-    """Check both packed stores and the untouched tail. The console dump stops at word 7."""
-    want = FMT_1010102_WORDS + [0xEEEEEEEE] * 48
-    with tempfile.TemporaryDirectory(prefix="leonida-fmt-") as tmp:
+def dump_test(tools, spirv, name, want, env=None):
+    """Run `name` on one group with VKC_DUMP and compare the whole 64-word buffer (the console dump stops at word 7)."""
+    with tempfile.TemporaryDirectory(prefix="leonida-dump-") as tmp:
         dump = Path(tmp) / "out.bin"
         # VKC_OUT_WORDS sets a minimum. Pin this dispatch to a single group's 64 words.
         child = dict(os.environ if env is None else env, VKC_DUMP=str(dump), VKC_OUT_WORDS="64")
-        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, "cs_fmt_1010102.spv"),
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), os.path.join(spirv, name + ".spv"),
                         "1", "dump", env=child)
         if code:
             return failure(code, out, 3)
@@ -302,10 +304,15 @@ def fmt_1010102_test(tools, spirv, env=None):
         data = dump.read_bytes()
     if len(data) != 4 * len(want):
         return f"expected {4 * len(want)} dump bytes, got {len(data)}"
-    for i, (expected, got) in enumerate(zip(want, struct.unpack("<64I", data))):
+    for i, (expected, got) in enumerate(zip(want, struct.unpack(f"<{len(want)}I", data))):
         if got != expected:
             return f"word {i}: expected {expected:#010x}, got {got:#010x}"
     return ""
+
+
+def fmt_1010102_test(tools, spirv, env=None):
+    """Check both packed stores and the untouched tail."""
+    return dump_test(tools, spirv, "cs_fmt_1010102", FMT_1010102_WORDS + [0xEEEEEEEE] * 48, env)
 
 
 class Skip(str):
@@ -824,6 +831,7 @@ def main():
     results.append(("cs_cmpx_class_f32", compute_test(tools, spirv, "cs_cmpx_class_f32", "1", "dump",
                                                       expected_words=CMPX_CLASS_WORDS)))
     results.append(("cs_fmt_1010102", fmt_1010102_test(tools, spirv)))
+    results.append(("cs_int_clamp", dump_test(tools, spirv, "cs_int_clamp", INT_CLAMP_WORDS)))
     for name, groups, want in GLOBAL_OFFSET:
         results.append((name, compute_test(tools, spirv, name, groups, "dump", expected_words=want)))
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
