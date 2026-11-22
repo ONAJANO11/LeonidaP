@@ -1,0 +1,461 @@
+// Synthetic texture UAVs through the Vulkan D3D12 device. It has no compute PSOs yet, so dispatch the translated
+// cs_texture_uav.asm through its actual Vulkan set 0. Every read-back texel is also checked against Windows WARP
+// for the UINT cases. Build the shader with runtime/test/shaders/build.py and pass the .spv as argv[1].
+// LEONIDA_VK_VALIDATION=1 enables the Khronos validation layer. No game files are used.
+#include "vk_test_device.h"
+#include "../shims/d3d12_com.h"
+#include "../src/gfx10_descriptors.h"
+#include "d3d12_texture_uav_oracle.h"
+
+#include <wrl/client.h>
+
+#include <array>
+#include <bit>
+#include <fstream>
+#include <span>
+
+#define EXPECT(condition) do { \
+    if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return false; } \
+} while (0)
+
+namespace {
+
+using Microsoft::WRL::ComPtr;
+namespace g = leonida::gfx10;
+constexpr auto uav_heap = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+
+// Numeric values are also the branches selected by cs_texture_uav.asm.
+enum class Kind : UINT { one_d, array, volume, two_d, float_volume, float_array };
+
+D3D12_RESOURCE_DESC texture(Kind kind, UINT layers, DXGI_FORMAT format = DXGI_FORMAT_R32_UINT) {
+    using enum Kind;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = kind == one_d || kind == array || kind == float_array ? D3D12_RESOURCE_DIMENSION_TEXTURE1D :
+                     kind == two_d ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    desc.Width = 8;
+    desc.Height = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : 4;
+    desc.DepthOrArraySize = UINT16(layers);
+    desc.MipLevels = 3;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return desc;
+}
+
+D3D12_UNORDERED_ACCESS_VIEW_DESC uav(Kind kind, UINT mip, UINT first, UINT count,
+                                     DXGI_FORMAT format = DXGI_FORMAT_R32_UINT) {
+    using enum Kind;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = format;
+    switch (kind) {
+    case one_d: view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D; view.Texture1D = {mip}; break;
+    case array:
+    case float_array: view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY; view.Texture1DArray = {mip, first, count}; break;
+    case two_d: view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; view.Texture2D = {mip, 0}; break;
+    default: view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D; view.Texture3D = {mip, first, count}; break;
+    }
+    return view;
+}
+
+struct Push {
+    g::ImageWords key;
+    UINT kind;
+};
+
+class Compute {
+public:
+    explicit Compute(vktest::Device& vk) : vk_(vk) {}
+    ~Compute() {
+        if (pipeline_) vk_.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(vk_.device, pipeline_, nullptr);
+        if (layout_) vk_.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(vk_.device, layout_, nullptr);
+        if (module_) vk_.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(vk_.device, module_, nullptr);
+    }
+
+    bool create(ID3D12Device* device, const char* path) {
+        const auto set_layout = rt::d3d12::bindless_set_layout(device);
+        set_ = rt::d3d12::bindless_set(device);
+        EXPECT(set_layout && set_);
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        EXPECT(file && file.tellg() > 0 && file.tellg() % 4 == 0);
+        std::vector<std::uint32_t> code(std::size_t(file.tellg()) / 4);
+        file.seekg(0);
+        EXPECT(file.read(reinterpret_cast<char*>(code.data()), std::streamsize(code.size() * 4)));
+        VkShaderModuleCreateInfo shader{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        shader.codeSize = code.size() * 4;
+        shader.pCode = code.data();
+        EXPECT(vk_.fn<PFN_vkCreateShaderModule>("vkCreateShaderModule")(vk_.device, &shader, nullptr, &module_) ==
+               VK_SUCCESS);
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 144}; // translated user-data block
+        VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &set_layout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        EXPECT(vk_.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(vk_.device, &layout, nullptr, &layout_) ==
+               VK_SUCCESS);
+        VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline.stage.module = module_;
+        pipeline.stage.pName = "main";
+        pipeline.layout = layout_;
+        EXPECT(vk_.fn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(
+                   vk_.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_) == VK_SUCCESS);
+        return true;
+    }
+
+    bool run(ID3D12Resource* resource, UINT mip, VkExtent3D extent, const Push& push,
+             std::span<const std::uint32_t> input, std::span<std::uint32_t> output) {
+        const bool volume = resource->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const VkImage image = rt::d3d12::vulkan_image(resource);
+        EXPECT(image);
+        void *src = nullptr, *dst = nullptr;
+        const VkBuffer upload = vk_.buffer(input.size_bytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &src);
+        const VkBuffer readback = vk_.buffer(output.size_bytes(), VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dst);
+        EXPECT(upload && readback);
+        std::memcpy(src, input.data(), input.size_bytes());
+
+        EXPECT(vk_.run([&](VkCommandBuffer cb) {
+            const auto barrier = vk_.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+            VkImageMemoryBarrier texture_barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            texture_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            texture_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            texture_barrier.srcQueueFamilyIndex = texture_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            texture_barrier.image = image;
+            texture_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, volume ? 1 : extent.depth};
+            texture_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                    1, &texture_barrier);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, volume ? 1 : extent.depth};
+            copy.imageExtent = {extent.width, extent.height, volume ? extent.depth : 1};
+            vk_.fn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(cb, upload, image, VK_IMAGE_LAYOUT_GENERAL,
+                                                                        1, &copy);
+            texture_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            texture_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            texture_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                    nullptr, 1, &texture_barrier);
+            vk_.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+            vk_.fn<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
+                                                                           0, 1, &set_, 0, nullptr);
+            std::array<std::uint32_t, 36> sgprs{};
+            std::memcpy(sgprs.data(), &push, sizeof(push));
+            vk_.fn<PFN_vkCmdPushConstants>("vkCmdPushConstants")(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                                 sizeof(sgprs), sgprs.data());
+            const UINT dispatch_depth = push.kind == UINT(Kind::one_d) ? 1 : extent.depth;
+            vk_.fn<PFN_vkCmdDispatch>("vkCmdDispatch")(cb, extent.width, extent.height, dispatch_depth);
+            texture_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            texture_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &texture_barrier);
+            vk_.fn<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(cb, image, VK_IMAGE_LAYOUT_GENERAL, readback,
+                                                                        1, &copy);
+            VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_ACCESS_HOST_READ_BIT};
+            barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
+                    nullptr);
+            return true;
+        }));
+        std::memcpy(output.data(), dst, output.size_bytes());
+        return true;
+    }
+
+private:
+    vktest::Device& vk_;
+    VkShaderModule module_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSet set_ = VK_NULL_HANDLE;
+};
+
+bool create_texture(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, ID3D12Resource** resource) {
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+    return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(resource)));
+}
+
+auto read_slot(D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    g::ImageWords words{};
+    std::memcpy(words.data(), reinterpret_cast<const void*>(h.ptr), sizeof(words));
+    return words;
+}
+
+bool flush_descriptors(ID3D12Device* device) {
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    const D3D12_COMMAND_QUEUE_DESC desc{};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                               IID_PPV_ARGS(&list))));
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    return rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::success;
+}
+
+bool rejects_partial_clear(ID3D12Device* device, ID3D12Resource* resource, D3D12_CPU_DESCRIPTOR_HANDLE view) {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                               IID_PPV_ARGS(&list))));
+    const UINT colors[4] = {42, 0, 0, 0};
+    list->ClearUnorderedAccessViewUint({}, view, resource, colors, 0, nullptr);
+    return list->Close() == E_INVALIDARG;
+}
+
+bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_RESOURCE_DESC& shape,
+                D3D12_CPU_DESCRIPTOR_HANDLE source, D3D12_CPU_DESCRIPTOR_HANDLE copy, bool sliced,
+                UINT mip, UINT first, UINT count, bool use_default = false) {
+    const bool volume = kind == Kind::volume || kind == Kind::float_volume;
+    const bool floating = kind == Kind::float_volume || kind == Kind::float_array;
+    const VkExtent3D extent{UINT(shape.Width) >> mip, std::max(1u, shape.Height >> mip),
+                            volume ? std::max(1u, UINT(shape.DepthOrArraySize) >> mip) : shape.DepthOrArraySize};
+    const UINT writable = count == ~0u ? extent.depth - first : count;
+    const auto desc = uav(kind, mip, first, count, floating ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32_UINT);
+    ComPtr<ID3D12Resource> resource;
+    EXPECT(create_texture(device, shape, &resource));
+    device->CreateUnorderedAccessView(resource.Get(), nullptr, use_default ? nullptr : &desc, source);
+    const auto key = read_slot(source);
+    const bool partial = volume && (first || writable != extent.depth);
+    if (partial && !sliced) {
+        EXPECT(key == g::ImageWords{});
+        return true;
+    }
+    g::Image decoded{};
+    EXPECT(g::decode(key, decoded) && decoded.first_mip == mip && decoded.mip_count == 1);
+    EXPECT(bool(key[4] & g::sliced_uav_flag) == partial);
+    EXPECT(key[7] == (partial ? g::sliced_uav_word(first, writable) : 0));
+    EXPECT(!volume || (decoded.depth == shape.DepthOrArraySize && decoded.first_layer == 0 && decoded.layer_count == 1));
+    EXPECT((kind != Kind::array && kind != Kind::float_array) ||
+           (decoded.first_layer == first && decoded.layer_count == writable));
+    device->CopyDescriptorsSimple(1, copy, source, uav_heap);
+    EXPECT(read_slot(copy) == key);
+    if (partial) EXPECT(rejects_partial_clear(device, resource.Get(), copy));
+    if (partial && first > 0) {
+        // A second view of the same volume and mip must not collide with the copied T#.
+        auto other = desc;
+        other.Texture3D.FirstWSlice = 0;
+        device->CreateUnorderedAccessView(resource.Get(), nullptr, &other, source);
+        EXPECT(read_slot(source) != key && g::is_image(read_slot(source)));
+    }
+    EXPECT(flush_descriptors(device));
+
+    std::vector<std::uint32_t> input(extent.width * extent.height * extent.depth);
+    auto bits = [&](UINT value) { return floating ? std::bit_cast<UINT>(float(value)) : value; };
+    for (UINT i = 0; i < input.size(); ++i) input[i] = bits(17 + i);
+    std::vector<std::uint32_t> expected = input, output(input.size()), host(input.size());
+    for (UINT z = first; z < first + writable; ++z)
+        for (UINT y = 0; y < extent.height; ++y)
+            for (UINT x = 0; x < extent.width; ++x) {
+                const UINT i = (z * extent.height + y) * extent.width + x;
+                expected[i] = bits(17 + i + 1000 + x + 16 * y + 256 * (z - first));
+            }
+    EXPECT(compute.run(resource.Get(), mip, extent, {read_slot(copy), UINT(kind)}, input, output));
+    for (UINT i = 0; i < output.size(); ++i) {
+        if (output[i] == expected[i]) continue;
+        std::fprintf(stderr, "kind %u mip %u first %u count %u texel %u: got %#x, expected %#x\n",
+                     UINT(kind), mip, first, count, i, output[i], expected[i]);
+        return false;
+    }
+    if (!floating) {
+        // Some native drivers do not clip out-of-range W accesses to WSize. Compare the documented in-view
+        // D3D12 accesses and independently require Vulkan to preserve every non-view slice, even under overdispatch.
+        EXPECT(uav_oracle::run(shape, use_default ? nullptr : &desc, input, host,
+                               volume ? writable : kind == Kind::one_d ? 1 : 0));
+        EXPECT(output == host);
+    }
+    return true;
+}
+
+bool check_refusals(ID3D12Device* device, D3D12_CPU_DESCRIPTOR_HANDLE slot) {
+    using enum Kind;
+    const auto bad = [&](ID3D12Resource* resource, const D3D12_UNORDERED_ACCESS_VIEW_DESC* view) {
+        std::memset(reinterpret_cast<void*>(slot.ptr), 0x55, sizeof(g::ImageWords));
+        device->CreateUnorderedAccessView(resource, nullptr, view, slot);
+        return read_slot(slot) == g::ImageWords{};
+    };
+    ComPtr<ID3D12Resource> line, layers, depth, typeless, read_only;
+    EXPECT(create_texture(device, texture(one_d, 1), &line));
+    EXPECT(create_texture(device, texture(array, 4), &layers));
+    EXPECT(create_texture(device, texture(volume, 8), &depth));
+    EXPECT(create_texture(device, texture(volume, 8, DXGI_FORMAT_R32_TYPELESS), &typeless));
+    auto shape = texture(one_d, 1);
+    shape.Flags = D3D12_RESOURCE_FLAG_NONE;
+    EXPECT(create_texture(device, shape, &read_only));
+    EXPECT(bad(read_only.Get(), nullptr) && bad(typeless.Get(), nullptr));
+    const auto good = uav(one_d, 0, 0, 1);
+    EXPECT(bad(nullptr, &good) && bad(depth.Get(), &good));
+    for (const auto view : {uav(one_d, 3, 0, 1), uav(one_d, 0, 0, 1, DXGI_FORMAT_R16_FLOAT)})
+        EXPECT(bad(line.Get(), &view));
+    for (const auto view : {uav(array, 0, 4, 1), uav(array, 0, 1, 0), uav(array, 0, 2, 3), uav(array, 3, 0, 1)})
+        EXPECT(bad(layers.Get(), &view));
+    for (const auto view : {uav(volume, 3, 0, 1), uav(volume, 2, 2, 1), uav(volume, 1, 1, 0), uav(volume, 1, 2, 3)})
+        EXPECT(bad(depth.Get(), &view));
+    auto rgba = texture(volume, 4, DXGI_FORMAT_R8G8B8A8_TYPELESS);
+    ComPtr<ID3D12Resource> srgb;
+    EXPECT(create_texture(device, rgba, &srgb));
+    const auto srgb_view = uav(volume, 0, 0, ~0u, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    EXPECT(bad(srgb.Get(), &srgb_view));
+    ComPtr<ID3D12Resource> refused;
+    const auto unsupported = texture(volume, 4, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    EXPECT(!create_texture(device, unsupported, &refused) && !refused);
+    auto invalid_shape = texture(volume, 4);
+    invalid_shape.MipLevels = 8;
+    EXPECT(!create_texture(device, invalid_shape, &refused) && !refused);
+    invalid_shape = texture(one_d, 1);
+    invalid_shape.Width = (1ull << 32) + 8;
+    EXPECT(!create_texture(device, invalid_shape, &refused) && !refused);
+    return true;
+}
+
+bool check_standalone(bool sliced) {
+    ComPtr<ID3D12Device> device;
+    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device))));
+    ComPtr<ID3D12Resource> volume;
+    EXPECT(create_texture(device.Get(), texture(Kind::volume, 8), &volume));
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{uav_heap, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))));
+    const auto slot = heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateUnorderedAccessView(volume.Get(), nullptr, nullptr, slot);
+    EXPECT(g::is_image(read_slot(slot)));
+    const auto view = uav(Kind::volume, 1, 1, 2);
+    device->CreateUnorderedAccessView(volume.Get(), nullptr, &view, slot);
+    EXPECT(read_slot(slot)[7] == (sliced ? g::sliced_uav_word(1, 2) : 0));
+    return true;
+}
+
+bool check_cpu_clear(ID3D12Device* device, vktest::Device& vk, D3D12_CPU_DESCRIPTOR_HANDLE slot) {
+    EXPECT(!rt::d3d12::bindless_set(device));
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                               IID_PPV_ARGS(&list))));
+    ComPtr<ID3D12Resource> image;
+    EXPECT(create_texture(device, texture(Kind::two_d, 1), &image));
+    device->CreateUnorderedAccessView(image.Get(), nullptr, nullptr, slot);
+    EXPECT(g::is_image(read_slot(slot)));
+    const UINT value[] = {42, 0, 0, 0};
+    list->ClearUnorderedAccessViewUint({}, slot, image.Get(), value, 0, nullptr);
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.Get()};
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::success);
+    void* mapped = nullptr;
+    const VkBuffer output = vk.buffer(32 * sizeof(UINT), VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapped);
+    EXPECT(output);
+    EXPECT(vk.run([&](VkCommandBuffer cb) {
+        const VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_ACCESS_TRANSFER_READ_BIT};
+        vk.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+        vk.read_back(cb, rt::d3d12::vulkan_image(image.Get()), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                     8, 4, 1, output, 0);
+        return true;
+    }));
+    const auto* pixels = static_cast<const UINT*>(mapped);
+    EXPECT(std::all_of(pixels, pixels + 32, [](UINT pixel) { return pixel == 42; }));
+
+    // A typeless backing may reinterpret bits in a transfer clear; an unsupported clear must not be submitted.
+    EXPECT(SUCCEEDED(allocator->Reset()));
+    EXPECT(SUCCEEDED(list->Reset(allocator.Get(), nullptr)));
+    ComPtr<ID3D12Resource> volume;
+    EXPECT(create_texture(device, texture(Kind::volume, 4, DXGI_FORMAT_R32_TYPELESS), &volume));
+    const auto view = uav(Kind::volume, 0, 0, ~0u);
+    device->CreateUnorderedAccessView(volume.Get(), nullptr, &view, slot);
+    EXPECT(g::is_image(read_slot(slot)));
+    list->ClearUnorderedAccessViewUint({}, slot, volume.Get(), value, 0, nullptr);
+    EXPECT(SUCCEEDED(list->Close()));
+    queue->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::unsupported);
+    return true;
+}
+
+bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = vk.instance_proc;
+    info.instance = vk.instance;
+    info.physical = vk.physical;
+    info.device = vk.device;
+    info.queue = vk.queue;
+    info.queue_family = vk.family;
+    info.bindless = vk.bindless;
+    info.bindless_partially_bound = vk.partially_bound;
+    info.robust_image_access = vk.robust_image_access;
+    info.sliced_3d_uav = enable_slices && vk.sliced_3d_uav;
+    ComPtr<ID3D12Device> device;
+    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device))));
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{uav_heap, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))));
+    const auto source = heap->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE copy{source.ptr + device->GetDescriptorHandleIncrementSize(uav_heap)};
+    if (!enable_slices) {
+        ComPtr<ID3D12Resource> volume;
+        EXPECT(create_texture(device.Get(), texture(Kind::volume, 8), &volume));
+        device->CreateUnorderedAccessView(volume.Get(), nullptr, nullptr, source);
+        EXPECT(g::is_image(read_slot(source)));
+        const auto view = uav(Kind::volume, 1, 1, 2);
+        device->CreateUnorderedAccessView(volume.Get(), nullptr, &view, source);
+        EXPECT(read_slot(source) == g::ImageWords{});
+        info.bindless = false;
+        ComPtr<ID3D12Device> cpu_only;
+        EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&cpu_only))));
+        ComPtr<ID3D12DescriptorHeap> cpu_heap;
+        EXPECT(SUCCEEDED(cpu_only->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&cpu_heap))));
+        return check_cpu_clear(cpu_only.Get(), vk, cpu_heap->GetCPUDescriptorHandleForHeapStart());
+    }
+
+    using enum Kind;
+    EXPECT(check_refusals(device.Get(), source));
+    Compute compute(vk);
+    EXPECT(compute.create(device.Get(), shader));
+    EXPECT(check_case(device.Get(), compute, one_d, texture(one_d, 1), source, copy, false, 0, 0, 1, true));
+    EXPECT(check_case(device.Get(), compute, one_d, texture(one_d, 1), source, copy, false, 2, 0, 1));
+    EXPECT(check_case(device.Get(), compute, one_d, texture(array, 4), source, copy, false, 1, 0, 1));
+    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 0, 0, 4, true));
+    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 1, 1, 2));
+    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 1, 1, ~0u));
+    EXPECT(check_case(device.Get(), compute, float_array, texture(float_array, 4, DXGI_FORMAT_R32_FLOAT),
+                      source, copy, false, 1, 1, 2));
+    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 0, 0, 8, true));
+    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8, DXGI_FORMAT_R32_TYPELESS), source, copy,
+                      vk.sliced_3d_uav, 1, 1, 2));
+    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 1, 2, ~0u));
+    EXPECT(check_case(device.Get(), compute, float_volume, texture(float_volume, 8, DXGI_FORMAT_R32_FLOAT),
+                      source, copy, vk.sliced_3d_uav, 1, 1, 2));
+    EXPECT(check_case(device.Get(), compute, two_d, texture(two_d, 1), source, copy, false, 1, 0, 1));
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::fprintf(stderr, "usage: d3d12_texture_uav_test <cs_texture_uav.spv>\n");
+        return 2;
+    }
+    vktest::Device vk;
+    if (!vk.create(true)) return 1;
+    VkPhysicalDeviceProperties props{};
+    vk.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(vk.physical, &props);
+    if (!vk.bindless || !vk.robust_image_access || props.limits.maxPushConstantsSize < 144) {
+        std::printf("SKIP: requires bindless descriptors, robustImageAccess and 144 bytes of push constants\n");
+        return vk.validation_errors() ? 1 : 77;
+    }
+    if (!test(vk, argv[1], false) || !test(vk, argv[1], true) || !check_standalone(vk.sliced_3d_uav) ||
+        vk.validation_errors())
+        return 1;
+    if (!vk.sliced_3d_uav) std::printf("SKIP: sliced 3D UAV GPU writes (feature unavailable); rejection verified\n");
+    std::printf("texture UAVs: %u GPU cases (%u compared with WARP), format/range/refusal checks passed\n",
+                vk.sliced_3d_uav ? 12u : 9u, vk.sliced_3d_uav ? 10u : 8u);
+    return 0;
+}

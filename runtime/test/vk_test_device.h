@@ -5,6 +5,7 @@
 
 #include "vulkan_loader.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,8 @@ public:
     bool partially_bound = false;  // and its slots can stay empty
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool sliced_3d_uav = false;    // imageSlicedViewOf3D and robustImageAccess enabled
+    bool robust_image_access = false;
 
     Device() = default;
     Device(const Device&) = delete;
@@ -84,7 +87,7 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() {
+    bool create(bool enable_sliced_3d_uav = false) {
         instance_proc = load_vulkan();
         if (!instance_proc) return false;
         const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(instance_proc(nullptr, "vkCreateInstance"));
@@ -205,6 +208,8 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
+        robust_image_access = features13.robustImageAccess == VK_TRUE;
+        enable13.robustImageAccess = robust_image_access;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
@@ -233,6 +238,8 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.shaderStorageImageReadWithoutFormat = features.features.shaderStorageImageReadWithoutFormat;
+        enable.shaderStorageImageWriteWithoutFormat = features.features.shaderStorageImageWriteWithoutFormat;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -256,6 +263,22 @@ public:
             enable13.pNext = &host_copy;
         }
 
+        const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
+        VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+        if (enable_sliced_3d_uav && robust_image_access &&
+            std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) {
+                return std::strcmp(e.extensionName, sliced_name) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            sliced_3d_uav = sliced.imageSlicedViewOf3D == VK_TRUE;
+            if (sliced_3d_uav) {
+                sliced.pNext = enable13.pNext;
+                enable13.pNext = &sliced;
+            }
+        }
+
         VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
         device_info.queueCreateInfoCount = 1;
         device_info.pQueueCreateInfos = &queue_info;
@@ -263,6 +286,7 @@ public:
         std::vector<const char*> device_extensions;
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (sliced_3d_uav) device_extensions.push_back(sliced_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         if (instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device) != VK_SUCCESS)

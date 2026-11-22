@@ -4539,6 +4539,9 @@ class Gen:
         a16 = "a16" in mods
         d16 = "d16" in mods
         dim = next((m for m in mods if m.startswith("dim:")), "dim:SQ_RSRC_IMG_2D")
+        storage_only = dim == "dim:SQ_RSRC_IMG_1D_ARRAY"
+        if storage_only and (op != "image_load" or d16):
+            raise Unsupported(op + " 1D_ARRAY")
         kinds = {"dim:SQ_RSRC_IMG_2D": ("img2d", "%images", "simg2d", 2, "_ptr_UC_img"),
                  "dim:SQ_RSRC_IMG_2D_ARRAY": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  # Cube: the shader already did face selection (v_cube*), and cube_coords maps (s, t, face) onto a
@@ -4546,26 +4549,31 @@ class Gen:
                  "dim:SQ_RSRC_IMG_CUBE": ("img2da", "%images_arr", "simg2da", 3, "_ptr_UC_imga"),
                  "dim:SQ_RSRC_IMG_1D": ("img1d", "%images_1d", "simg1d", 1, "_ptr_UC_img1"),
                  "dim:SQ_RSRC_IMG_3D": ("img3d", "%images_3d", "simg3d", -3, "_ptr_UC_img3")}
-        if dim not in kinds:
+        if not storage_only and dim not in kinds:
             raise Unsupported(op + " " + dim.split("SQ_RSRC_IMG_")[-1])
-        itype, iarr, stype, ncoord, iptr = kinds[dim]
-        is3d = ncoord == -3          # 3D: three real coordinates (and 3-component gradients)
-        if is3d:
-            ncoord = 3
-            self.uses_tex_3d = True
-        elif ncoord == 3:
-            self.uses_tex_array = True
-        if ncoord == 1:
-            self.uses_tex_1d = True
+        if storage_only:
+            ncoord, is3d = 2, False
+        else:
+            itype, iarr, stype, ncoord, iptr = kinds[dim]
+            is3d = ncoord == -3      # 3D: three real coordinates (and 3-component gradients)
+            if is3d:
+                ncoord = 3
+                self.uses_tex_3d = True
+            elif ncoord == 3:
+                self.uses_tex_array = True
+            if ncoord == 1:
+                self.uses_tex_1d = True
         if is3d and op.endswith("_d"):
             raise Unsupported(op + " 3D gradients")
         dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
         dmask = int(dm.split(":")[1], 0)
         vdata, addr = a[0], self.addr_regs(a[1])
         img_idx = self.desc_lookup_sgpr(a[2], 8)
-        ip, img = self.tmp(), self.tmp()
-        self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
-        self.emit(f"{img} = OpLoad %{itype} {ip}")
+        img = None
+        if not storage_only:
+            ip, img = self.tmp(), self.tmp()
+            self.emit(f"{ip} = OpAccessChain %{iptr} {iarr} {img_idx}")
+            self.emit(f"{img} = OpLoad %{itype} {ip}")
         coords = [self.load_reg("vgpr", r) for r in addr]
         if a16:
             # Non-G16 image_sample_d keeps its gradients in full VGPRs. Only the coordinates
@@ -4599,10 +4607,9 @@ class Gen:
                 iv = self.tmp()
                 self.emit(f"{iv} = OpCompositeConstruct {'%v2int' if ncoord == 2 else '%v3int'} {' '.join(ints)}")
             if dim in self.STORE_DIMS and not d16:
-                self.image_load_typed(dim, self.load_reg("sgpr", a[2]["r"] + 1), iv, img, img_idx, dmask, vdata)
+                self.image_load_typed(dim, a[2]["r"], iv, img, img_idx, dmask, vdata)
                 return
-            res = self.tmp()
-            self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
+            res = self.image_fetch(img, iv, self.cu(0), a[2]["r"] if is3d else None)
             ncomp = bin(dmask).count("1")
         else:
             smp_idx = self.desc_lookup_sgpr(a[3], 4)
@@ -4835,7 +4842,8 @@ class Gen:
     # image_store views: dim -> (index, SPIR-V Dim, arrayed, coordinate count). Bindings 8 + 3 * index + class,
     # class 0 = float, 1 = uint, 2 = sint (Vulkan needs the shader's component type to match the image format).
     STORE_DIMS = {"dim:SQ_RSRC_IMG_2D": (0, "2D", 0, 2), "dim:SQ_RSRC_IMG_2D_ARRAY": (1, "2D", 1, 3),
-                  "dim:SQ_RSRC_IMG_3D": (2, "3D", 0, 3), "dim:SQ_RSRC_IMG_1D": (3, "1D", 0, 1)}
+                   "dim:SQ_RSRC_IMG_3D": (2, "3D", 0, 3), "dim:SQ_RSRC_IMG_1D": (3, "1D", 0, 1),
+                   "dim:SQ_RSRC_IMG_1D_ARRAY": (4, "1D", 1, 2)}
     INT_FORMATS = None          # (uint mask words, sint mask words) over the 512 GFX10 formats
 
     @classmethod
@@ -4868,7 +4876,53 @@ class Gen:
             flags.append(nz)
         return flags
 
-    def image_load_typed(self, dim, t1, iv, img, idx, dmask, vdata):
+    def image_fetch(self, img, coords, lod, volume_tsharp=None):
+        """Float loads normally use a sampled view. Vulkan applies Z slicing to storage views only."""
+        if volume_tsharp is None:
+            res = self.tmp()
+            self.emit(f"{res} = OpImageFetch %v4float {img} {coords} Lod {lod}")
+            return res
+        # Layer-created partial Texture3D UAVs mark T# word 4 and carry the range in word 7 (gfx10_descriptors.h).
+        t4 = self.load_reg("sgpr", volume_tsharp + 4)
+        t7 = self.load_reg("sgpr", volume_tsharp + 7)
+        flag, flag_set, tag, tag_set, sliced = (self.tmp() for _ in range(5))
+        self.emit(f"{flag} = OpBitwiseAnd %uint {t4} {self.cu(0x80000000)}")
+        self.emit(f"{flag_set} = OpINotEqual %bool {flag} {self.cu(0)}")
+        self.emit(f"{tag} = OpBitwiseAnd %uint {t7} {self.cu(0xffc00000)}")
+        self.emit(f"{tag_set} = OpIEqual %bool {tag} {self.cu(0xd7800000)}")
+        self.emit(f"{sliced} = OpLogicalAnd %bool {flag_set} {tag_set}")
+        offset, last, z, relative, absolute, coord = (self.tmp() for _ in range(6))
+        self.emit(f"{offset} = OpBitFieldUExtract %uint {t7} {self.cu(0)} {self.cu(11)}")
+        self.emit(f"{last} = OpBitFieldUExtract %uint {t7} {self.cu(11)} {self.cu(11)}")
+        self.emit(f"{z} = OpCompositeExtract %int {coords} 2")
+        self.emit(f"{relative} = OpBitcast %uint {z}")
+        self.emit(f"{absolute} = OpIAdd %int {z} {self.as_int(offset)}")
+        self.emit(f"{coord} = OpSelect %int {sliced} {absolute} {z}")
+        in_slice, not_sliced, valid = (self.tmp() for _ in range(3))
+        self.emit(f"{in_slice} = OpULessThanEqual %bool {relative} {last}")
+        in_view = in_slice
+        if lod != self.cu(0):
+            base_mip, in_view = self.tmp(), self.tmp()
+            self.emit(f"{base_mip} = OpIEqual %bool {lod} {self.as_int(self.cu(0))}")
+            self.emit(f"{in_view} = OpLogicalAnd %bool {in_slice} {base_mip}")
+        self.emit(f"{not_sliced} = OpLogicalNot %bool {sliced}")
+        self.emit(f"{valid} = OpLogicalOr %bool {not_sliced} {in_view}")
+        body, miss, end = (self.tmp() + s for s in ("_fetch", "_oob", "_end"))
+        adjusted, texel, zero, result = (self.tmp() for _ in range(4))
+        self.emit(f"OpSelectionMerge {end} None")
+        self.emit(f"OpBranchConditional {valid} {body} {miss}")
+        self.emit(f"{body} = OpLabel")
+        self.emit(f"{adjusted} = OpCompositeInsert %v3int {coord} {coords} 2")
+        self.emit(f"{texel} = OpImageFetch %v4float {img} {adjusted} Lod {lod}")
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{miss} = OpLabel")
+        self.emit(f"{zero} = OpCompositeConstruct %v4float %f0 %f0 %f0 %f0")
+        self.emit(f"OpBranch {end}")
+        self.emit(f"{end} = OpLabel")
+        self.emit(f"{result} = OpPhi %v4float {texel} {body} {zero} {miss}")
+        return result
+
+    def image_load_typed(self, dim, tsharp, iv, img, idx, dmask, vdata):
         """image_load with the image's numeric type decided at run time (T# FORMAT): UINT/SINT formats are read
         through the uint/sint storage views (OpImageRead, read-without-format), everything else through the float
         sampled view (OpImageFetch, as before). Vulkan requires the view's component type to match the format, so a
@@ -4877,8 +4931,7 @@ class Gen:
         di = self.STORE_DIMS[dim][0]
         self.uses_store_views.add(di)
         self.uses_store_reads = True
-        is_u, is_s = self.fmt_int_flags(t1)
-        act = self.active_b()
+        is_u, is_s = self.fmt_int_flags(self.load_reg("sgpr", tsharp + 1))
         L = {k: self.tmp() + "_" + k for k in ("s", "rest", "e2", "u", "f", "e3")}
 
         def write(v4u):
@@ -4898,7 +4951,6 @@ class Gen:
             self.emit(f"{b} = OpBitcast %v4uint_st {r}")
             write(b)
 
-        _ = act
         self.emit(f"OpSelectionMerge {L['e2']} None")
         self.emit(f"OpBranchConditional {is_s} {L['s']} {L['rest']}")
         self.emit(f"{L['s']} = OpLabel")
@@ -4911,10 +4963,13 @@ class Gen:
         read(1, "%v4uint_st")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
-        res, b = self.tmp(), self.tmp()
-        self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {self.cu(0)}")
-        self.emit(f"{b} = OpBitcast %v4uint_st {res}")
-        write(b)
+        if img is None:
+            read(0, "%v4float")
+        else:
+            res = self.image_fetch(img, iv, self.cu(0), tsharp if di == 2 else None)
+            b = self.tmp()
+            self.emit(f"{b} = OpBitcast %v4uint_st {res}")
+            write(b)
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")
@@ -4963,6 +5018,11 @@ class Gen:
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(vals)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
+        if di >= 2:  # no writes to the shared fallback on a missing 3D or 1D-family UAV
+            found, store = self.tmp(), self.tmp()
+            self.emit(f"{found} = OpINotEqual %bool {idx} {self.cu(0)}")
+            self.emit(f"{store} = OpLogicalAnd %bool {act} {found}")
+            act = store
         L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
 
         def write(cls, texel):
@@ -5008,12 +5068,12 @@ class Gen:
                 raise Unsupported("image_load_mip coords")
             idx = self.desc_lookup_sgpr(a[2], 8)
             self.uses_tex_3d = True
-            ip, img, iv, res = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            ip, img, iv = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_img3 %images_3d {idx}")
             self.emit(f"{img} = OpLoad %img3d {ip}")
             xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
             self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
-            self.emit(f"{res} = OpImageFetch %v4float {img} {iv} Lod {xs[3]}")
+            res = self.image_fetch(img, iv, xs[3], a[2]["r"])
             dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
             dmask, out = int(dm.split(":")[1], 0), 0
             for c in range(4):
@@ -5033,30 +5093,31 @@ class Gen:
             coords = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:3]]
             if len(coords) < 3:
                 raise Unsupported(op + " coords")
-            iv, ip, tp, old, safe = (self.tmp() for _ in range(5))
+            iv, ip, tp, old, found, run = (self.tmp() for _ in range(6))
             self.emit(f"{iv} = OpCompositeConstruct %v3int {coords[0]} {coords[1]} {coords[2]}")
             self.emit(f"{ip} = OpAccessChain %_ptr_UC_simg3 %simages3d {idx}")
             val = self.load_reg("vgpr", vdata["r"])
+            self.emit(f"{found} = OpINotEqual %bool {idx} {self.cu(0)}")
+            self.emit(f"{run} = OpLogicalAnd %bool {self.active_b()} {found}")
+            do, skip, end = (self.tmp() + suffix for suffix in ("_do", "_skip", "_end"))
+            self.emit(f"OpSelectionMerge {end} None")
+            self.emit(f"OpBranchConditional {run} {do} {skip}")
+            self.emit(f"{do} = OpLabel")
+            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
             if op == "image_atomic_cmpswap":
                 cmpv = self.load_reg("vgpr", vdata["r"] + 1)
-                act = self.active_b()
-                do, end = self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"OpSelectionMerge {end} None")
-                self.emit(f"OpBranchConditional {act} {do} {end}")
-                self.emit(f"{do} = OpLabel")
-                self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
                 self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
-                if "glc" in mods:
-                    self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
-                self.emit(f"OpBranch {end}")
-                self.emit(f"{end} = OpLabel")
-                return
-            spv, neutral = self.IMG_ATOMICS[op]
-            self.emit(f"{tp} = OpImageTexelPointer %_ptr_Image_uint {ip} {iv} {self.cu(0)}")
-            self.emit(f"{safe} = OpSelect %uint {self.active_b()} {val} {self.cu(neutral)}")
-            self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {safe}")
+            else:
+                spv, _ = self.IMG_ATOMICS[op]
+                self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{skip} = OpLabel")
+            self.emit(f"OpBranch {end}")
+            self.emit(f"{end} = OpLabel")
             if "glc" in mods:
-                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
+                result = self.tmp()
+                self.emit(f"{result} = OpPhi %uint {old} {do} {self.cu(0)} {skip}")
+                self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, result)
             return
         if op == "image_store":
             self.image_store(a, mods, dim)
@@ -5791,7 +5852,7 @@ def assemble(gen):
         caps.append("Float64")
     if gen.uses_store_views:
         caps.append("StorageImageWriteWithoutFormat")     # shaderStorageImageWriteWithoutFormat
-        if 3 in gen.uses_store_views:
+        if gen.uses_store_views.intersection((3, 4)):
             caps.append("Image1D")
         if gen.uses_store_reads:
             caps.append("StorageImageReadWithoutFormat")     # shaderStorageImageReadWithoutFormat

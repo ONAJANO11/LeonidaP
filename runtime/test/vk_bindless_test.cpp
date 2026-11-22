@@ -430,22 +430,8 @@ int main(int argc, char** argv) {
     CHECK(submit());
 
     // Does a set with these flags fit the device? Every binding is visible to every stage.
-    constexpr std::uint32_t sampled_total = 4096 + 1024 + 256 + 256, sampler_total = 1024, storage_total = 1024 + 13 * 256;
     const auto fits = [&](const BindlessFeatures& f) {
-        const VkPhysicalDeviceLimits& l = props.properties.limits;
-        if (f.update_after_bind)
-            return props12.maxPerStageDescriptorUpdateAfterBindSampledImages >= sampled_total &&
-                   props12.maxPerStageDescriptorUpdateAfterBindSamplers >= sampler_total &&
-                   props12.maxPerStageDescriptorUpdateAfterBindStorageImages >= storage_total &&
-                   props12.maxPerStageUpdateAfterBindResources >= sampled_total + sampler_total + storage_total + 1 &&
-                   props12.maxDescriptorSetUpdateAfterBindSampledImages >= sampled_total &&
-                   props12.maxDescriptorSetUpdateAfterBindSamplers >= sampler_total &&
-                   props12.maxDescriptorSetUpdateAfterBindStorageImages >= storage_total;
-        return l.maxPerStageDescriptorSampledImages >= sampled_total && l.maxPerStageDescriptorSamplers >= sampler_total &&
-               l.maxPerStageDescriptorStorageImages >= storage_total &&
-               l.maxPerStageResources >= sampled_total + sampler_total + storage_total + 1 &&
-               l.maxDescriptorSetSampledImages >= sampled_total && l.maxDescriptorSetSamplers >= sampler_total &&
-               l.maxDescriptorSetStorageImages >= storage_total;
+        return leonida::bindless::layout_fits(props.properties.limits, props12, f.update_after_bind);
     };
 
     unsigned mismatches = 0, runs = 0;

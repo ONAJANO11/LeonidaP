@@ -37,6 +37,23 @@ def cvt_answer(env, wrong_for=None):
     return 0, "out[0..7] = " + " ".join(map(str, words + [0xEEEEEEEE] * 6)) + "\n"
 
 
+class TextureUavCheck(unittest.TestCase):
+    def test_windows_requires_a_real_successful_executable(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(check.os, "name", "nt"):
+            exe = check.os.path.join(tmp, "d3d12_texture_uav_test" + check.EXE)
+            self.assertIn("missing", check.texture_uav_test(tmp, tmp))
+            with open(exe, "wb"):
+                pass
+            spv = check.os.path.join(tmp, "cs_texture_uav.spv")
+            with patch.object(check, "run", return_value=(0, "matched")) as run:
+                self.assertEqual(check.texture_uav_test(tmp, tmp), "")
+                run.assert_called_once_with(exe, spv)
+            with patch.object(check, "run", return_value=(77, "SKIP: missing features")):
+                self.assertIsInstance(check.texture_uav_test(tmp, tmp), check.Skip)
+            with patch.object(check, "run", return_value=(1, "bad texel")):
+                self.assertIn("bad texel", check.texture_uav_test(tmp, tmp))
+
+
 class Wave64Checks(unittest.TestCase):
     def run_checks(self, wavemask, ballot, *, missing_ballot=False, emulated=False):
         def harness(_tool, shader, *args, env=None):

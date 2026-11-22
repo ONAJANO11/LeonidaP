@@ -146,6 +146,17 @@ inline ImageWords encode(const Image& image) {
 // TYPE names an image, so these eight dwords are a T# and not a V# followed by something else.
 inline constexpr bool is_image(const ImageWords& words) { return detail::get(words[3], 28, 4) >= 8; }
 
+// The layer's own metadata in a synthetic T#: partial volume UAVs that would otherwise share the same key
+// need distinct keys. Translated float image_load also uses this for the sampled fetch path (Vulkan only
+// applies slicing to storage descriptors). WORD4[31] is reserved on GFX10/GFX103 and distinguishes these
+// descriptors from hardware ones, where WORD7 can contain a metadata address. DEPTH and BASE_ARRAY stay
+// unchanged. D3D12 depth is at most 2048, so count - 1 and offset fit 11 bits.
+inline constexpr std::uint32_t sliced_uav_flag = 0x80000000;
+inline constexpr std::uint32_t sliced_uav_tag = 0xD7800000;
+inline constexpr std::uint32_t sliced_uav_word(std::uint32_t offset, std::uint32_t count) {
+    return sliced_uav_tag | ((count - 1) << 11) | offset;
+}
+
 // False when the dwords are not an image descriptor, or a field contradicts another: a reserved DST_SEL, a last
 // level or layer before the first, or a cube whose layers are not whole cubes.
 inline bool decode(const ImageWords& words, Image& out) {

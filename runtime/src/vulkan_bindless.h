@@ -8,8 +8,9 @@
 //            2  the descriptor hash table     1        7  3D r32ui storage images    256
 //            3  sampled 2D-array images    1024        8 + 3 * dimension + class     256 each:
 //            4  2D r32ui storage images    1024           storage images by component class
-//   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D (the translator's STORE_DIMS); class: 0 = float, 1 = uint, 2 = sint.
-// The counts are those of runtime/test/vk_pipeline_check.cpp, which creates every translated shader against them.
+//   dimension: 0 = 2D, 1 = 2D array, 2 = 3D, 3 = 1D, 4 = 1D array (storage only);
+//   class: 0 = float, 1 = uint, 2 = sint. These are the translator's STORE_DIMS indices.
+// runtime/test/vk_pipeline_check.cpp uses these same counts.
 //
 // A shader turns a T# or S# into an index through the hash table (descriptor_table.h) and uses that index in
 // whichever binding the instruction calls for: the sampled array of the image's dimension, or one of its storage
@@ -44,7 +45,7 @@
 namespace leonida {
 
 // The translator's image dimensions; the values are its STORE_DIMS indices. A cube is a 2D array of six layers.
-enum class ImageDimension : std::uint32_t { dim_2d = 0, dim_2d_array = 1, dim_3d = 2, dim_1d = 3 };
+enum class ImageDimension : std::uint32_t { dim_2d = 0, dim_2d_array = 1, dim_3d = 2, dim_1d = 3, dim_1d_array = 4 };
 
 // Storage views of one image by the component type a shader reads or writes it with (the translator picks by the
 // T# format at run time). r32ui is for the atomic instructions, whose image type is R32ui (2D and 3D only).
@@ -70,11 +71,11 @@ struct Binding {
 
 inline constexpr std::uint32_t table_binding = 2;
 inline constexpr std::uint32_t sampler_binding = 1;
-inline constexpr std::uint32_t storage_indices = 256;  // what every storage array of bindings 8-19 holds
+inline constexpr std::uint32_t storage_indices = 256;  // what every storage array of bindings 8-22 holds
 inline constexpr std::uint32_t no_binding = 0xffffffffu;
 
 // Indexed by binding number.
-inline constexpr std::array<Binding, 20> bindings = {{
+inline constexpr std::array<Binding, 23> bindings = {{
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
@@ -85,10 +86,12 @@ inline constexpr std::array<Binding, 20> bindings = {{
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
 }};
 
 constexpr std::uint32_t sampled_binding(ImageDimension dimension) {
-    constexpr std::uint32_t by_dimension[] = {0, 3, 6, 5};
+    constexpr std::uint32_t by_dimension[] = {0, 3, 6, 5, no_binding};
     return by_dimension[std::uint32_t(dimension)];
 }
 
@@ -102,7 +105,44 @@ constexpr std::uint32_t r32ui_binding(ImageDimension dimension) {
 }
 
 // How many images of a dimension the set holds, the fallback included.
-constexpr std::uint32_t image_capacity(ImageDimension dimension) { return bindings[sampled_binding(dimension)].count; }
+constexpr std::uint32_t image_capacity(ImageDimension dimension) {
+    const auto binding = sampled_binding(dimension);
+    return binding == no_binding ? storage_indices : bindings[binding].count;
+}
+
+constexpr std::uint32_t descriptor_count(VkDescriptorType type) {
+    std::uint32_t count = 0;
+    for (auto binding : bindings)
+        if (binding.type == type) count += binding.count;
+    return count;
+}
+
+// All bindings are visible to every stage. Update-after-bind and ordinary layouts have separate limits.
+inline bool layout_fits(const VkPhysicalDeviceLimits& limits, const VkPhysicalDeviceVulkan12Properties& indexed,
+                        bool update_after_bind) {
+    constexpr auto sampled = descriptor_count(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+    constexpr auto samplers = descriptor_count(VK_DESCRIPTOR_TYPE_SAMPLER);
+    constexpr auto storage = descriptor_count(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    constexpr auto buffers = descriptor_count(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    constexpr auto total = sampled + samplers + storage + buffers;
+    if (update_after_bind) {
+        return sampled <= std::min(indexed.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                                   indexed.maxDescriptorSetUpdateAfterBindSampledImages) &&
+               samplers <= std::min(indexed.maxPerStageDescriptorUpdateAfterBindSamplers,
+                                    indexed.maxDescriptorSetUpdateAfterBindSamplers) &&
+               storage <= std::min(indexed.maxPerStageDescriptorUpdateAfterBindStorageImages,
+                                   indexed.maxDescriptorSetUpdateAfterBindStorageImages) &&
+               buffers <= std::min(indexed.maxPerStageDescriptorUpdateAfterBindStorageBuffers,
+                                   indexed.maxDescriptorSetUpdateAfterBindStorageBuffers) &&
+               total <= std::min(indexed.maxPerStageUpdateAfterBindResources,
+                                 indexed.maxUpdateAfterBindDescriptorsInAllPools);
+    }
+    return sampled <= std::min(limits.maxPerStageDescriptorSampledImages, limits.maxDescriptorSetSampledImages) &&
+           samplers <= std::min(limits.maxPerStageDescriptorSamplers, limits.maxDescriptorSetSamplers) &&
+           storage <= std::min(limits.maxPerStageDescriptorStorageImages, limits.maxDescriptorSetStorageImages) &&
+           buffers <= std::min(limits.maxPerStageDescriptorStorageBuffers, limits.maxDescriptorSetStorageBuffers) &&
+           total <= limits.maxPerStageResources;
+}
 
 } // namespace bindless
 
@@ -172,6 +212,7 @@ public:
     std::uint32_t add_image(ImageDimension dimension, VkImageView sampled, VkImageLayout sampled_layout,
                             const StorageViews& storage = {}) {
         const bool stores = storage.as_float || storage.as_uint || storage.as_sint || storage.r32ui;
+        if (!stores && bindless::sampled_binding(dimension) == bindless::no_binding) return 0;
         auto& used = image_used_[std::uint32_t(dimension)];
         const std::uint32_t low_end = std::min(std::uint32_t(used.size()), bindless::storage_indices);
         std::uint32_t index = stores ? 0 : allocate(used, low_end, std::uint32_t(used.size()));
@@ -323,7 +364,7 @@ private:
         VkDescriptorImageInfo info;
     };
 
-    static constexpr std::uint32_t dimensions = 4, classes = 3;
+    static constexpr std::uint32_t dimensions = 5, classes = 3;
 
     // The first free index in [begin, end), marked used; 0 when there is none.
     static std::uint32_t allocate(std::vector<std::uint8_t>& used, std::uint32_t begin, std::uint32_t end) {
@@ -387,9 +428,10 @@ private:
         constexpr VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_1D};
         constexpr VkFormat formats[classes] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
         // dimension -> (index into types, view type)
-        constexpr std::uint32_t type_of[dimensions] = {0, 0, 1, 2};
+        constexpr std::uint32_t type_of[dimensions] = {0, 0, 1, 2, 2};
         constexpr VkImageViewType view_types[dimensions] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY,
-                                                            VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_1D};
+                                                             VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_1D,
+                                                             VK_IMAGE_VIEW_TYPE_1D_ARRAY};
         for (std::uint32_t t = 0; t < 3; ++t) {
             for (std::uint32_t c = 0; c < classes; ++c) {
                 VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -542,8 +584,9 @@ private:
     void write_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
                      const StorageViews& storage) {
         const std::uint32_t sampled_at = bindless::sampled_binding(dimension);
-        queue(sampled_at, index,
-              sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
+        if (sampled_at != bindless::no_binding)
+            queue(sampled_at, index,
+                  sampled ? VkDescriptorImageInfo{VK_NULL_HANDLE, sampled, sampled_layout} : fallback_info(sampled_at));
         const auto store = [&](std::uint32_t binding, VkImageView view) {
             if (binding == bindless::no_binding || index >= bindless::bindings[binding].count) return;
             queue(binding, index,

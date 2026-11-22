@@ -326,11 +326,19 @@ private:
             g::Image image{};
             if (!g::decode(words, image)) return false;
             const bool volume = image.type == g::ImageType::image_3d;
+            if (volume && (words[4] & g::sliced_uav_flag)) {
+                // Transfer clears operate on a whole 3D mip, not a storage image view. Refuse instead of
+                // overwriting slices outside the UAV; a sliced clear needs a separate replay path.
+                stub("ClearUnorderedAccessView of a partial 3D mip");
+                return false;
+            }
             out.buffer = false;
             out.format = std::uint32_t(descriptor_format(image.format, image.swizzle));
             out.mip = image.first_mip;
             out.first_layer = volume ? 0 : image.first_layer;  // a 3D view clears every slice of its mip
             out.layer_count = volume ? 1 : image.layer_count;
+            out.exact_clear_format = volume || image.type == g::ImageType::image_1d ||
+                                     image.type == g::ImageType::image_1d_array;
             return out.format != VK_FORMAT_UNDEFINED;
         }
         g::BufferWords buffer_words{};

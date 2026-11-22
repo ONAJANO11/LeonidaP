@@ -588,6 +588,20 @@ def clip_test(tools, spirv, name):
     return ""
 
 
+def texture_uav_test(tools, spirv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, os.path.join(spirv, "cs_texture_uav.spv"))
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -629,6 +643,8 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    if os.path.isfile(os.path.join(spirv, "cs_texture_uav.spv")):
+        results.append(("cs_texture_uav", texture_uav_test(tools, spirv)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:

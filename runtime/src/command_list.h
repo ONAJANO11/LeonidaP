@@ -320,6 +320,7 @@ struct UavView {
     std::uint32_t mip;           // texture
     std::uint32_t first_layer;
     std::uint32_t layer_count;
+    bool exact_clear_format = false; // newly exposed 1D/3D UAVs: do not clear via a different backing format
 };
 
 // ClearUnorderedAccessViewUint / ...Float; the resource must be in unordered_access state at execution. values are

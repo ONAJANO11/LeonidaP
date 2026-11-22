@@ -354,7 +354,7 @@ side inwards:
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D, 3D and multisampled textures; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+shader-resource views of 1D, 3D and multisampled textures; depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect, and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
@@ -362,10 +362,9 @@ aspect, in its float-typed sampled arrays like other UINT views; descriptors the
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
-feature, each logged and approximated; the storage arrays hold 255 images a dimension; nothing writes through a
-storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
-level); the set is flushed at every `ExecuteCommandLists` whether or not earlier lists are still running, and a
-flush that erases keys or moves the table to a larger buffer should wait for them, or one of their lookups can
+feature, each logged and approximated; the storage arrays hold 255 images a dimension; the set is flushed at every
+`ExecuteCommandLists` whether or not earlier lists are still running, and a flush that erases keys or moves the
+table to a larger buffer should wait for them, or one of their lookups can
 miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
 
 Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
@@ -501,6 +500,10 @@ and any validation error fails them.
     this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
     a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
     destroyed, from the view's own bytes.
+- `d3d12_texture_uav_test` (D3D-78): creates 1D, 1D-array, 3D and 2D control UAVs through the D3D12 device,
+  checks rejected descriptors, copies descriptors between slots, and dispatches a translated hand-written
+  shader on the actual set 0. It reads back every texel; the UINT cases also run on Windows WARP.
+  The tests dispatch past the selected array/W range, so writes to an adjacent layer or slice fail the check.
 
 **Open:** whether the game uses command-list flags, bundles, or `ExecuteCommandLists` with many lists at once. All
 are supported by the IR; the trace will show which are hot.
@@ -627,6 +630,23 @@ The layer's descriptor model:
 - View creation maps `D3D12_SRV_DIMENSION`/`D3D12_UAV_DIMENSION` to `VkImageViewType`, the mip and layer ranges,
   sample count, and `D3D12_SHADER_COMPONENT_MAPPING` to `VkComponentMapping`. `ResourceMinLODClamp` needs
   `VK_EXT_image_view_min_lod`; log if the device lacks it instead of silently ignoring the clamp.
+- D3D-78: a `Texture1DArray` UAV gets a 1D-array view with the requested array subrange and storage bindings
+  20–22 (float, UINT, SINT); `ArraySize = UINT_MAX` selects the remaining layers. A non-array `Texture1D`
+  view of a 1D array selects layer 0, as checked on native D3D12. A `Texture3D` UAV gets a 3D view with a single mip
+  and Vulkan array range `{0, 1}`.
+  A partial W range requires `VK_EXT_image_sliced_view_of_3d` and `robustImageAccess` on the logical device:
+  `VkImageViewSlicedCreateInfoEXT` rebases storage-image Z to `FirstWSlice` and limits it to `WSize` (UINT_MAX
+  means the remaining mip depth). It does not slice the sampled view. Word 7 of the generated T# distinguishes
+  partial views in the hash table and rebases the translator's float fetch path; see the contract in `docs/design.md`.
+  Without those features a partial W view is logged and left null, not made writable across the whole mip.
+  These new dimensions require storage-write-without-format support for the typed view format and, when the
+  translator reads through the storage binding, storage-read-without-format as well.
+  `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
+  cannot target a slice interval or guarantee preserving the reinterpreted bits.
+  Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
+  Hardware D3D12 on the RTX 4090 and UHD 770 clipped typed writes to the view's W range; WARP 10.0.26100.9818
+  rebased the view but did not clip writes past a finite `WSize`. The regression compares in-range writes with WARP
+  and checks preservation of out-of-range slices independently.
 - Set 0 is a fixed bindless layout. The GPU tests use 4096 sampled 2D images, 1024 samplers, 1024 2D-array
   images, 256 1D, 256 3D, 1024 storage images and 256 per storage dimension/class; start there and grow by
   recreating the set at a frame boundary. Use `UPDATE_AFTER_BIND` and `PARTIALLY_BOUND` so a new view does not

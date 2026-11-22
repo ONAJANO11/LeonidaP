@@ -67,6 +67,17 @@ python -I runtime/test/shaders/build.py <out dir>
 python -I runtime/test/shaders/check.py <out dir> <folder with the test programs>
 ```
 
+The Windows runner includes the D3D-78 UAV readback and WARP comparison. To run it separately:
+
+```powershell
+python -I runtime/test/shaders/build.py runtime/build/uav-shaders cs_texture_uav
+$env:LEONIDA_VK_VALIDATION = "1"
+runtime/build/d3d12_texture_uav_test.exe runtime/build/uav-shaders/spirv/cs_texture_uav.spv
+```
+
+Use the actual configuration subfolder for the executable with a multi-config generator. Devices without sliced
+3D views can still run the 1D, array and whole-mip cases; the test checks that partial views are refused.
+
 ## GPUs with 32-wide subgroups (NVIDIA, Intel, Apple)
 
 The game's shaders are mostly wave64. A GPU that can't run 64-wide compute subgroups skips the wave64 tests
