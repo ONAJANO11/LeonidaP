@@ -541,6 +541,8 @@ def dotnet_sdk_ok() -> bool:
         r = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
+    if r.returncode != 0:
+        return False
     return any(int(m) >= 8 for m in re.findall(r"^(\d+)\.", r.stdout, re.M))
 
 

@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -351,6 +352,44 @@ class ToolchainDetectionTest(PreflightTestBase):
     def test_need_failure_exits_with_hint(self):
         self.assert_fails(make_game.need, "ghost_compiler", "Please install it.",
                           match="'ghost_compiler' was not found on PATH. Please install it.")
+
+
+class DotnetSdkDetectionTest(unittest.TestCase):
+    def test_sdk_8_or_newer_is_accepted(self):
+        for listing in (
+            "8.0.100 [/usr/share/dotnet/sdk]\n",
+            "7.0.400 [/usr/share/dotnet/sdk]\n9.0.101 [/usr/share/dotnet/sdk]\n",
+        ):
+            with self.subTest(listing=listing), \
+                 mock.patch("make_game.shutil.which", return_value="dotnet"), \
+                 mock.patch("make_game.subprocess.run", return_value=mock.Mock(returncode=0, stdout=listing)):
+                self.assertTrue(make_game.dotnet_sdk_ok())
+
+    def test_sdk_below_8_or_empty_listing_is_rejected(self):
+        for listing in ("7.0.410 [/usr/share/dotnet/sdk]\n", ""):
+            with self.subTest(listing=listing), \
+                 mock.patch("make_game.shutil.which", return_value="dotnet"), \
+                 mock.patch("make_game.subprocess.run", return_value=mock.Mock(returncode=0, stdout=listing)):
+                self.assertFalse(make_game.dotnet_sdk_ok())
+
+    def test_failed_command_with_sdk_like_stdout_is_rejected(self):
+        with mock.patch("make_game.shutil.which", return_value="dotnet"), \
+             mock.patch("make_game.subprocess.run", return_value=mock.Mock(
+                 returncode=1, stdout="8.0.100 [/usr/share/dotnet/sdk]\n")):
+            self.assertFalse(make_game.dotnet_sdk_ok())
+
+    def test_missing_dotnet_returns_false_without_running_command(self):
+        with mock.patch("make_game.shutil.which", return_value=None), \
+             mock.patch("make_game.subprocess.run") as run:
+            self.assertFalse(make_game.dotnet_sdk_ok())
+            run.assert_not_called()
+
+    def test_subprocess_failures_return_false(self):
+        for error in (OSError("dotnet not executable"), subprocess.TimeoutExpired("dotnet", 60)):
+            with self.subTest(error=type(error).__name__), \
+                 mock.patch("make_game.shutil.which", return_value="dotnet"), \
+                 mock.patch("make_game.subprocess.run", side_effect=error):
+                self.assertFalse(make_game.dotnet_sdk_ok())
 
 
 class PreflightPrerequisiteTest(PreflightTestBase):
