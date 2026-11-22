@@ -55,6 +55,12 @@ cmake --build runtime/build/linux --parallel
 
 On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 
+The test programs and `scripts/run_gpu_tests.py` should come from the same commit. Some checks tolerate an older
+binary (`unpinned_subgroup_skip`), but mixing them can report false failures in the compute tests: 28 `cs_*`
+failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` script and `48ad23f` binaries, where
+either matching pair is clean. If you cannot build locally, the `runtime-windows` artifact of the Runtime workflow
+belongs to the commit that built it; check that commit out as well.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
@@ -84,6 +90,11 @@ Use the actual configuration subfolder for the executables with a multi-config g
 case reports SKIP without WARP or a sufficiently capable Vulkan device; failed translation, a missing test
 executable on Windows, and readback mismatches fail the runner. Devices without sliced 3D views still run the 1D,
 array and whole-mip cases and check that partial views are refused.
+
+CTest runs the same D3D-78 descriptor creation, copy, range/refusal and clear checks with `--descriptors-only`.
+That mode requires Vulkan, but not a translated shader or WARP. The GPU runner still exercises dispatch and readback.
+Use `--filter cs_imgload_mip` to check 2D `image_load_mip` on FLOAT (UNORM), UINT and SINT sampled views with
+both full-width and D16 loads; mip 0 contains decoy data and mip 1 holds the expected texels.
 
 ## The Windows runtime on Linux, under Wine or Proton
 

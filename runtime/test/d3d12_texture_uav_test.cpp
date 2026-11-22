@@ -11,6 +11,7 @@
 
 #include <array>
 #include <bit>
+#include <cstring>
 #include <fstream>
 #include <span>
 
@@ -221,7 +222,7 @@ bool rejects_partial_clear(ID3D12Device* device, ID3D12Resource* resource, D3D12
     return list->Close() == E_INVALIDARG;
 }
 
-bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_RESOURCE_DESC& shape,
+bool check_case(ID3D12Device* device, Compute* compute, Kind kind, const D3D12_RESOURCE_DESC& shape,
                 D3D12_CPU_DESCRIPTOR_HANDLE source, D3D12_CPU_DESCRIPTOR_HANDLE copy, bool sliced,
                 UINT mip, UINT first, UINT count, bool use_default = false) {
     const bool volume = kind == Kind::volume || kind == Kind::float_volume || kind == Kind::atomic_volume;
@@ -273,6 +274,7 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
         EXPECT(!(srv_key[4] & g::volume_uav_flag) && srv_key[7] == 0 && srv_key != read_slot(copy));
     }
     EXPECT(flush_descriptors(device));
+    if (!compute) return true;  // CTest exercises the complete descriptor setup, without translated SPIR-V.
 
     std::vector<std::uint32_t> input(extent.width * extent.height * extent.depth);
     auto bits = [&](UINT value) { return floating ? std::bit_cast<UINT>(float(value)) : value; };
@@ -289,7 +291,7 @@ bool check_case(ID3D12Device* device, Compute& compute, Kind kind, const D3D12_R
                 else
                     expected[i] = bits(initial + add + (kind == Kind::float_volume && x % 2 == 0 ? initial : 0));
             }
-    EXPECT(compute.run(resource.Get(), mip, extent, {read_slot(copy), UINT(kind)}, input, output));
+    EXPECT(compute->run(resource.Get(), mip, extent, {read_slot(copy), UINT(kind)}, input, output));
     for (UINT i = 0; i < output.size(); ++i) {
         if (output[i] == expected[i]) continue;
         std::fprintf(stderr, "kind %u mip %u first %u count %u texel %u: got %#x, expected %#x\n",
@@ -452,26 +454,27 @@ bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
     using enum Kind;
     EXPECT(check_refusals(device.Get(), source));
     Compute compute(vk);
-    EXPECT(compute.create(device.Get(), shader));
-    EXPECT(check_case(device.Get(), compute, one_d, texture(one_d, 1), source, copy, false, 0, 0, 1, true));
-    EXPECT(check_case(device.Get(), compute, one_d, texture(one_d, 1), source, copy, false, 2, 0, 1));
-    EXPECT(check_case(device.Get(), compute, one_d, texture(array, 4), source, copy, false, 1, 0, 1));
-    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 0, 0, 4, true));
-    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 1, 1, 2));
-    EXPECT(check_case(device.Get(), compute, array, texture(array, 4), source, copy, false, 1, 1, ~0u));
-    EXPECT(check_case(device.Get(), compute, float_array, texture(float_array, 4, DXGI_FORMAT_R32_FLOAT),
+    if (shader) EXPECT(compute.create(device.Get(), shader));
+    auto* dispatch = shader ? &compute : nullptr;
+    EXPECT(check_case(device.Get(), dispatch, one_d, texture(one_d, 1), source, copy, false, 0, 0, 1, true));
+    EXPECT(check_case(device.Get(), dispatch, one_d, texture(one_d, 1), source, copy, false, 2, 0, 1));
+    EXPECT(check_case(device.Get(), dispatch, one_d, texture(array, 4), source, copy, false, 1, 0, 1));
+    EXPECT(check_case(device.Get(), dispatch, array, texture(array, 4), source, copy, false, 0, 0, 4, true));
+    EXPECT(check_case(device.Get(), dispatch, array, texture(array, 4), source, copy, false, 1, 1, 2));
+    EXPECT(check_case(device.Get(), dispatch, array, texture(array, 4), source, copy, false, 1, 1, ~0u));
+    EXPECT(check_case(device.Get(), dispatch, float_array, texture(float_array, 4, DXGI_FORMAT_R32_FLOAT),
                       source, copy, false, 1, 1, 2));
-    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 0, 0, 8, true));
-    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8, DXGI_FORMAT_R32_TYPELESS), source, copy,
+    EXPECT(check_case(device.Get(), dispatch, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 0, 0, 8, true));
+    EXPECT(check_case(device.Get(), dispatch, volume, texture(volume, 8, DXGI_FORMAT_R32_TYPELESS), source, copy,
                       vk.sliced_3d_uav, 1, 1, 2));
-    EXPECT(check_case(device.Get(), compute, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 1, 2, ~0u));
-    EXPECT(check_case(device.Get(), compute, float_volume, texture(float_volume, 8, DXGI_FORMAT_R32_FLOAT),
+    EXPECT(check_case(device.Get(), dispatch, volume, texture(volume, 8), source, copy, vk.sliced_3d_uav, 1, 2, ~0u));
+    EXPECT(check_case(device.Get(), dispatch, float_volume, texture(float_volume, 8, DXGI_FORMAT_R32_FLOAT),
                       source, copy, vk.sliced_3d_uav, 1, 1, 2));
-    EXPECT(check_case(device.Get(), compute, atomic_volume, texture(atomic_volume, 8),
+    EXPECT(check_case(device.Get(), dispatch, atomic_volume, texture(atomic_volume, 8),
                       source, copy, vk.sliced_3d_uav, 1, 0, 4));
-    EXPECT(check_case(device.Get(), compute, atomic_volume, texture(atomic_volume, 8),
+    EXPECT(check_case(device.Get(), dispatch, atomic_volume, texture(atomic_volume, 8),
                       source, copy, vk.sliced_3d_uav, 1, 1, 2));
-    EXPECT(check_case(device.Get(), compute, two_d, texture(two_d, 1), source, copy, false, 1, 0, 1));
+    EXPECT(check_case(device.Get(), dispatch, two_d, texture(two_d, 1), source, copy, false, 1, 0, 1));
     return true;
 }
 
@@ -479,7 +482,7 @@ bool test(vktest::Device& vk, const char* shader, bool enable_slices) {
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: d3d12_texture_uav_test <cs_texture_uav.spv>\n");
+        std::fprintf(stderr, "usage: d3d12_texture_uav_test <cs_texture_uav.spv>|--descriptors-only\n");
         return 2;
     }
     vktest::Device vk;
@@ -490,21 +493,29 @@ int main(int argc, char** argv) {
         return 77;
     }
     if (status != vktest::DeviceStatus::ready) return 1;
+    const char* shader = std::strcmp(argv[1], "--descriptors-only") == 0 ? nullptr : argv[1];
     VkPhysicalDeviceProperties props{};
     vk.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(vk.physical, &props);
-    if (!vk.bindless || !vk.robust_image_access || props.limits.maxPushConstantsSize < 144) {
-        std::printf("SKIP: requires bindless descriptors, robustImageAccess and 144 bytes of push constants\n");
+    if (!vk.bindless || !vk.robust_image_access || (shader && props.limits.maxPushConstantsSize < 144)) {
+        std::printf("SKIP: requires bindless descriptors and robustImageAccess%s\n",
+                    shader ? " and 144 bytes of push constants" : "");
         return vk.validation_errors() ? 1 : 77;
     }
-    const auto warp = uav_oracle::prepare();
-    if (warp == uav_oracle::Status::unavailable) {
-        std::printf("SKIP: no D3D12 WARP adapter\n");
-        return vk.validation_errors() ? 1 : 77;
+    if (shader) {
+        const auto warp = uav_oracle::prepare();
+        if (warp == uav_oracle::Status::unavailable) {
+            std::printf("SKIP: no D3D12 WARP adapter\n");
+            return vk.validation_errors() ? 1 : 77;
+        }
+        if (warp != uav_oracle::Status::ready) return 1;
     }
-    if (warp != uav_oracle::Status::ready) return 1;
-    if (!test(vk, argv[1], false) || !test(vk, argv[1], true) || !check_standalone(vk.sliced_3d_uav) ||
+    if (!test(vk, shader, false) || !test(vk, shader, true) || !check_standalone(vk.sliced_3d_uav) ||
         vk.validation_errors())
         return 1;
+    if (!shader) {
+        std::puts("texture UAV descriptors: creation, copy, range/refusal and clear checks passed");
+        return 0;
+    }
     if (!vk.sliced_3d_uav) std::printf("SKIP: sliced 3D UAV GPU writes (feature unavailable); rejection verified\n");
     std::printf("texture UAVs: %u GPU cases (%u compared with WARP), format/range/refusal checks passed\n",
                 vk.sliced_3d_uav ? 14u : 10u, vk.sliced_3d_uav ? 10u : 8u);

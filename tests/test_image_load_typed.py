@@ -86,8 +86,9 @@ class Module:
             out.append((rid, chain[1], self.defs[load[0]][1]))
         return out
 
-    def value(self, x, word1, index):
-        """Evaluate the uint/bool id x given the T#'s word 1 and the bindless index of the lookup."""
+    def value(self, x, word1, index, regs=None):
+        """Evaluate the format selection or volume guard, optionally supplying a test's SGPR/VGPR words."""
+        get = lambda y: self.value(y, word1, index, regs)
         if x in ("%true", "%false"):
             return x == "%true"
         op, a = self.defs[x]
@@ -100,14 +101,27 @@ class Module:
         if op == "OpLoad":
             ptr_op, p = self.defs[a[1]]
             assert ptr_op == "OpAccessChain", ptr_op
-            if p[1] == "%sgpr":
-                assert self.value(p[2], word1, index) == 1, "only T# word 1 is read"
+            if p[1] in ("%sgpr", "%vgpr"):
+                r = get(p[2])
+                if regs is not None:
+                    return regs[p[1], r]
+                assert (p[1], r) == ("%sgpr", 1), "only T# word 1 is read"
                 return word1
             var_op, v = self.defs[p[1]]
             assert var_op == "OpVariable" and v[1] == "Private", (var_op, v)
             words = self.defs[v[2]][1][1:]            # OpConstantComposite %fmt_mask_arr <words>
-            return self.value(words[self.value(p[2], word1, index)], word1, index)
-        u = [self.value(y, word1, index) for y in a[1:]]
+            return get(words[get(p[2])])
+        if op == "OpCompositeExtract":
+            return get(a[1])[int(a[2])]
+        if op == "OpCompositeInsert":
+            result = list(get(a[2]))
+            result[int(a[3])] = get(a[1])
+            return tuple(result)
+        u = [get(y) for y in a[1:]]
+        if op == "OpCompositeConstruct":
+            return tuple(u)
+        if op == "OpBitcast":
+            return u[0]
         if op == "OpBitFieldUExtract":
             return (u[0] >> u[1]) & ((1 << u[2]) - 1)
         if op == "OpShiftRightLogical":
@@ -116,8 +130,20 @@ class Module:
             return u[0] & u[1]
         if op == "OpINotEqual":
             return u[0] != u[1]
+        if op == "OpIEqual":
+            return u[0] == u[1]
+        if op == "OpIAdd":
+            return (u[0] + u[1]) & 0xffffffff
+        if op == "OpULessThanEqual":
+            return u[0] <= u[1]
+        if op == "OpSelect":
+            return u[1] if u[0] else u[2]
         if op == "OpLogicalAnd":
             return u[0] and u[1]
+        if op == "OpLogicalOr":
+            return u[0] or u[1]
+        if op == "OpLogicalNot":
+            return not u[0]
         raise AssertionError(f"unexpected {op} in the branch condition")
 
     def branch(self, word1, index):
@@ -141,6 +167,23 @@ def format_class(fmt):
 
 
 class LoadOnlyShaders(unittest.TestCase):
+    def test_2d_explicit_mip_reaches_every_typed_fetch(self):
+        m = Module(translate(["image_load_mip v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_2D",
+                              "s_waitcnt vmcnt(0)"]))
+        fetches = m.fetches()
+        self.assertEqual({image[0] for _, _, image in fetches}, {"%float", "%uint", "%int"})
+        for rid, var, _ in fetches:
+            self.assertEqual(m.binding[var], 0)
+            operands = m.defs[rid][1]
+            self.assertEqual(operands[-2], "Lod")
+            op, cast = m.defs[operands[-1]]
+            self.assertEqual(op, "OpBitcast")
+            op, load = m.defs[cast[1]]
+            self.assertEqual(op, "OpLoad")
+            op, source = m.defs[load[1]]
+            self.assertEqual((op, source[1]), ("OpAccessChain", "%vgpr"))
+            self.assertEqual(m.value(source[2], 0, 0), 6)
+
     def test_no_storage_image_capability_and_no_storage_binding(self):
         for dim in DIMS:
             with self.subTest(dim=dim):
@@ -211,6 +254,12 @@ def volume_mip_load():
                       "s_waitcnt vmcnt(0)"])
 
 
+def mixed_d16_mip_loads():
+    return translate(["image_load_mip v0, v[4:6], s[8:15] dmask:0x9 dim:SQ_RSRC_IMG_2D unorm d16",
+                      "image_load_mip v3, v[8:11], s[16:23] dmask:0x9 dim:SQ_RSRC_IMG_3D unorm d16",
+                      "s_waitcnt vmcnt(0)"])
+
+
 class TextureUavLoads(unittest.TestCase):
     def test_1d_array_load_uses_only_storage_bindings_and_the_read_feature(self):
         m = Module(uav_array_load())
@@ -237,12 +286,47 @@ class TextureUavLoads(unittest.TestCase):
             self.assertEqual(m.defs[m.defs[rid][1][2]][0], "OpCompositeInsert")
             self.assertTrue(any(op == "OpPhi" and rid in args for _, op, args in m.order))
 
+    def test_mixed_d16_mips_keep_2d_lod_and_only_rebase_tagged_3d(self):
+        m = Module(mixed_d16_mip_loads())
+        self.assertFalse(m.caps & STORAGE_IMAGE_CAPS)
+        self.assertNotIn("OpImageRead", m.text)
+        self.assertEqual(set(m.binding.values()), {0, 1, 2, 6})
+        guards, last = {}, None
+        for rid, op, args in m.order:
+            if op == "OpBranchConditional":
+                last = args[0]
+            elif op == "OpImageFetch":
+                guards[rid] = last
+        regs = {("%vgpr", r): value for r, value in {4: 3, 5: 4, 6: 2, 8: 5, 9: 6, 10: 0, 11: 0}.items()}
+        types = {0: set(), 6: set()}
+        flag, tag = 0x80000000, 0xd7800000 | (1 << 11) | 3    # WSize=2, FirstWSlice=3
+        for rid, var, image in m.fetches():
+            binding = m.binding[var]
+            types[binding].add(image[0])
+            _, (_, _, coords, operand, lod) = m.defs[rid]
+            self.assertEqual(operand, "Lod")
+            if binding == 0:
+                self.assertEqual(m.value(coords, 0, 1, regs), (3, 4))
+                self.assertEqual(m.value(lod, 0, 1, regs), 2)
+                continue
+            for t4, t7, z, level, expected in (
+                (flag, tag, 1, 0, 4), (flag, tag, 2, 0, None), (flag, tag, 0xffffffff, 0, None),
+                (flag, tag, 0, 1, None), (0, tag, 2, 1, 2), (flag, 0, 2, 1, 2), (0, 0, 2, 1, 2),
+            ):
+                with self.subTest(ty=image[0], t4=t4, t7=t7, z=z, level=level):
+                    regs.update({("%sgpr", 20): t4, ("%sgpr", 23): t7, ("%vgpr", 10): z, ("%vgpr", 11): level})
+                    self.assertEqual(m.value(guards[rid], 0, 1, regs), expected is not None)
+                    if expected is not None:
+                        self.assertEqual(m.value(coords, 0, 1, regs), (5, 6, expected))
+                        self.assertEqual(m.value(lod, 0, 1, regs), level)
+        self.assertEqual(types, {0: {"%float", "%uint", "%int"}, 6: {"%float", "%uint", "%int"}})
+
 
 @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
 class Validation(unittest.TestCase):
     def test_spirv_val_accepts_every_dimension(self):
         shaders = {dim: load_shader(dim) for dim in DIMS}
-        shaders.update({"1D_ARRAY": uav_array_load(), "3D_MIP": volume_mip_load()})
+        shaders.update({"1D_ARRAY": uav_array_load(), "3D_MIP": volume_mip_load(), "MIXED_D16_MIP": mixed_d16_mip_loads()})
         with tempfile.TemporaryDirectory() as tmp:
             for dim, text in shaders.items():
                 with self.subTest(dim=dim):
