@@ -313,10 +313,11 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 itself, the twenty bindings the translator declares, with the array
+- **`runtime/src/vulkan_bindless.h`**: set 0 itself, the 23 bindings the translator declares, with the array
   sizes `vk_pipeline_check` uses, and `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind
   binding 2. One set for the device. Details:
-  - An image has one index in its dimension (2D, 2D array, 3D, 1D), the same in every binding of that dimension.
+  - An image view has one index in its dimension (2D, 2D array, 3D, 1D, 1D array), the same in every binding
+    of that dimension. The 1D-array dimension has storage bindings only.
   - The storage arrays are shorter (256), so an image with a storage view gets an index below 256 and a read-only
     one goes above where there is room.
   - Index 0 of every array is a fallback (a 1x1 image of zeros, a nearest clamping sampler), because a miss is
@@ -336,8 +337,8 @@ side inwards:
   written as zero.
 - **Device**: `CreateShaderResourceView` and `CreateUnorderedAccessView` of textures write a T# into the slot,
   `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
-  - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
-    and a shader-resource view of the same mip are one entry.
+  - The key is the descriptor's bytes, so a copied descriptor needs nothing more. An SRV and UAV with identical
+    bytes can share an entry; a partial 3D UAV carries a W-range tag and remains separate from the unsliced SRV.
   - A view the layer cannot show (below) leaves a null descriptor, all zeros, which finds the fallback.
   - A texture is named in its T#s by an address of its own, above 4 GiB and 256 bytes apart, that nothing
     dereferences; its entries leave the set and the table when it is destroyed.
@@ -371,10 +372,7 @@ aspect, in its float-typed sampled arrays like other UINT views; descriptors the
 the execute-time scan of section 3.4 (only descriptors made through the device are registered); static samplers
 of root signatures and the literal S#s of shaders (`literal_samplers` in the index), which are not registered yet;
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
-feature, each logged and approximated; the storage arrays hold 255 images a dimension; the set is flushed at every
-`ExecuteCommandLists` whether or not earlier lists are still running, and a flush that erases keys or moves the
-table to a larger buffer should wait for them, or one of their lookups can
-miss: `BindlessSet::flush_needs_idle()` says when, but the queue cannot yet tell the device that it is idle.
+feature, each logged and approximated; the storage arrays hold 255 images a dimension.
 
 Known gaps: buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do not wait on view
 creation), root signatures, PSOs, draws, volume attachment

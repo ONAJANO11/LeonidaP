@@ -206,6 +206,7 @@ bool flush_descriptors(ID3D12Device* device) {
     EXPECT(SUCCEEDED(list->Close()));
     ID3D12CommandList* lists[] = {list.Get()};
     queue->ExecuteCommandLists(1, lists);
+    // Queue destruction waits for the device-local descriptor upload before the raw Vulkan dispatch.
     return rt::d3d12::last_execute_result(queue.Get()) == leonida::ReplayResult::success;
 }
 
@@ -480,7 +481,12 @@ int main(int argc, char** argv) {
     }
     vktest::Device vk;
     // Exercise Vulkan 1.3 per-format access even on a logical device without the legacy feature bits.
-    if (!vk.create(true, false)) return 1;
+    const auto status = vk.initialize(true, false);
+    if (status == vktest::DeviceStatus::unavailable && !vk.validation_errors()) {
+        std::printf("SKIP: no Vulkan 1.3 device with a graphics queue\n");
+        return 77;
+    }
+    if (status != vktest::DeviceStatus::ready) return 1;
     VkPhysicalDeviceProperties props{};
     vk.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(vk.physical, &props);
     if (!vk.bindless || !vk.robust_image_access || props.limits.maxPushConstantsSize < 144) {
