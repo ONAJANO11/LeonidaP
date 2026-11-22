@@ -2057,14 +2057,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 - **Queries never ended.** D3D12 leaves their result undefined; a Vulkan copy with `WAIT_BIT` would wait for them
   forever. Each heap records on the host which queries were ended, in submission order, and a resolve writes zeros
   (`vkCmdFillBuffer`) for the ones that were not.
-- **Overlapping ordinary occlusion.** On a graphics queue with compute, the replay opens a new physical query
-  whenever the set of active ordinary queries changes. Each logical query keeps a contiguous range in the
-  submission's physical pool. Resolving it sums the 64-bit counts on the GPU, then copies the result to the
-  destination. Both occlusion compute helpers reuse one scratch buffer per queue. Logical results and in-flight
-  submissions retain the pool independently, so later resolves and
-  overwrites can be recorded before the earlier commands complete. `vk_overlapping_occlusion` checks crossing
-  and nested scopes, more than one scratch chunk, alternating binary and ordinary resolves under a predicate,
-  and gated submissions on a GPU.
+- **Overlapping occlusion queries and statistics (D3D-252).** On a graphics queue with compute, the replay opens
+  a new physical query whenever the set of active queries changes. Ordinary and binary occlusion share the one
+  physical pool (both are `VK_QUERY_TYPE_OCCLUSION`, so one physical query is open at a time, and the shared
+  intersection interval is counted by both logical queries); pipeline-statistics queries split the same way into
+  the statistics pool, where every non-timestamp resolve while a query runs also closes and reopens the open
+  segment (D3D-162), for every query open at that point. Each logical query keeps a contiguous range in the
+  submission's pool. Resolving it sums the results on the GPU, then copies them to the destination; a binary
+  resolve normalizes the summed counts to 0 or 1 (`sum_binary_occlusion`, the sum followed by the existing
+  normalize). Both occlusion compute helpers reuse one scratch buffer per queue. Logical results and in-flight
+  submissions retain the pools independently, so later resolves and overwrites can be recorded before the
+  earlier commands complete. `vk_overlapping_occlusion` checks crossing and nested scopes, more than one scratch
+  chunk, alternating binary and ordinary resolves under a predicate, gated submissions, crossing statistics
+  queries against three unsplit references word by word, and an ordinary query around a binary one, on a GPU;
+  `replay_query_predication` pins the segment layouts and the binary sum-and-normalize without a GPU.
 - **Resolves during a pipeline-statistics query** (D3D-162). The helper dispatches above (binary normalisation,
   occlusion sums) and the statistics sum below would count in the application's `CSInvocations` if they ran inside
   its query. So a statistics query that contains a resolve other than a timestamp copy is split. Its counters go to
@@ -2080,8 +2086,9 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
 
 Not implemented yet:
 
-- **Overlapping queries.** Replay refuses overlapping pipeline-statistics queries or occlusion overlaps involving
-  a binary query with `ReplayResult::unsupported`.
+- **Overlapping queries in the single-list `replay()` helper.** It has no segment pool, so a list whose occlusion
+  kinds or statistics queries overlap each other is refused there with `ReplayResult::unsupported`; the batched
+  path above replays them.
 - **Other helper dispatches during a pipeline-statistics query.** Replay still refuses `SetPredication` and
   predicated copies and D24/RGB96 footprint conversions while pipeline statistics are active, since their
   dispatches would change the reported compute-invocation count. The single-list `replay()` helper, which has no
