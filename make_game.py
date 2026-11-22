@@ -34,6 +34,7 @@ import json
 import ntpath
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -98,10 +99,19 @@ def py(tool: str, *args) -> None:
 
 def tool_available(cmd: str) -> bool:
     """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    cmd = cmd.strip().strip('"')
+    cmd = cmd.strip()
     if os.path.isfile(cmd):
         return True
-    head = cmd.split()[0].strip('"') if cmd.split() else ""
+    try:
+        # Preserve backslashes in quoted Windows paths (as tools/mc_command.py does).
+        parts = shlex.split(cmd, posix=os.name != "nt")
+    except ValueError:  # Unbalanced quotes: treat as missing, not a preflight crash.
+        return False
+    if not parts:
+        return False
+    head = parts[0]
+    if os.name == "nt" and len(head) >= 2 and head[0] == head[-1] == '"':
+        head = head[1:-1]
     return bool(head and (shutil.which(head) or os.path.isfile(head)))
 
 

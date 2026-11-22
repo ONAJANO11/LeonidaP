@@ -311,6 +311,34 @@ class ToolchainDetectionTest(PreflightTestBase):
     def test_tool_available_command_with_arguments(self):
         self.assertTrue(make_game.tool_available(f'"{sys.executable}" -I'))
 
+    def test_tool_available_quoted_path_with_spaces_and_arguments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "LLVM Tools")
+            os.makedirs(directory)
+            exe = os.path.join(directory, "llvm-mc.exe")
+            with open(exe, "wb"):
+                pass
+            self.assertTrue(make_game.tool_available(f'"{exe}" --version'))
+            self.assertTrue(make_game.tool_available(exe))
+
+    def test_tool_available_quoted_windows_executable_with_arguments(self):
+        exe = r"C:\Program Files\LLVM\bin\llvm-mc.exe"
+        with mock.patch.object(make_game.os, "name", "nt"), \
+             mock.patch.object(make_game.os.path, "isfile", side_effect=lambda p: p == exe), \
+             mock.patch.object(make_game.shutil, "which", return_value=None):
+            self.assertTrue(make_game.tool_available(f'"{exe}" --version'))
+            self.assertTrue(make_game.tool_available(f'"{exe}"'))
+
+    def test_tool_available_wsl_command_preserves_head(self):
+        with mock.patch.object(make_game.shutil, "which", return_value="/usr/bin/wsl") as which:
+            self.assertTrue(make_game.tool_available("wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"))
+            which.assert_called_once_with("wsl")
+
+    def test_tool_available_malformed_quotes_return_false(self):
+        for platform in ("posix", "nt"):
+            with self.subTest(platform=platform), mock.patch.object(make_game.os, "name", platform):
+                self.assertFalse(make_game.tool_available('"unterminated --version'))
+
     def test_tool_available_shutil_which_lookup(self):
         with mock.patch("shutil.which", return_value=r"C:\bin\custom_tool.exe"):
             self.assertTrue(make_game.tool_available("custom_tool"))
