@@ -607,20 +607,43 @@ public:
     VkSemaphore semaphore() const { return fence_.semaphore(); }
 
     // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    bool claim(UINT64 value) {
-        UINT64 current = highest_.load();
-        while (value > current)
-            if (highest_.compare_exchange_weak(current, value)) return true;
-        std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
-                     static_cast<unsigned long long>(value), static_cast<unsigned long long>(current));
-        return false;
+    // `queue` marks a value a queue will signal from the GPU: a later CPU signal must not overtake it (below).
+    bool claim(UINT64 value, bool queue = false) {
+        std::lock_guard lock(claim_mutex_);
+        if (value <= highest_) {
+            std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
+                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
+            return false;
+        }
+        highest_ = value;
+        if (queue) queued_ = value;
+        return true;
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override { return fence_.completed(); }
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 
+    // vkSignalSemaphore must stay below every signal still pending on the GPU
+    // (VUID-VkSemaphoreSignalInfo-value-03259). A CPU signal above a queue signal the GPU has not reached yet is
+    // held and applied by the waiter thread once the GPU gets there. Until then GetCompletedValue reads the GPU's
+    // progress, where D3D12 would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
-        if (claim(value) && !fence_.signal(value)) return E_FAIL;
+        if (!claim(value)) return S_OK;
+        UINT64 queued;
+        {
+            std::lock_guard lock(claim_mutex_);
+            queued = queued_;
+        }
+        {
+            std::unique_lock lock(mutex_);
+            if (held_.empty() && fence_.completed() >= queued) {  // later CPU signals stay behind held ones
+                lock.unlock();
+                return fence_.signal(value) ? S_OK : E_FAIL;
+            }
+            held_.emplace_back(queued, value);
+            if (!waiter_.joinable()) waiter_ = std::thread([this] { wait_loop(); });
+        }
+        changed_.notify_all();
         return S_OK;
     }
 
@@ -651,14 +674,22 @@ private:
     void wait_loop() {
         std::unique_lock lock(mutex_);
         while (true) {
-            changed_.wait(lock, [this] { return stop_ || !pending_.empty(); });
+            changed_.wait(lock, [this] { return stop_ || !pending_.empty() || !held_.empty(); });
             if (stop_) return;
             UINT64 lowest = UINT64_MAX;
             for (const auto& entry : pending_) lowest = std::min(lowest, entry.first);
+            for (const auto& [after, value] : held_) lowest = std::min(lowest, after);
             lock.unlock();
             fence_.wait(lowest, 10'000'000);  // 10 ms, so destruction is never held up for long
-            const UINT64 done = fence_.completed();
             lock.lock();
+            // Held CPU signals, in the order they were made, once the queue signal before each has completed.
+            while (!held_.empty() && fence_.completed() >= held_.front().first) {
+                if (!fence_.signal(held_.front().second) && fence_.completed() < held_.front().second)
+                    std::fprintf(stderr, "[rt] d3d12: held fence signal %llu failed\n",
+                                 static_cast<unsigned long long>(held_.front().second));
+                held_.erase(held_.begin());
+            }
+            const UINT64 done = fence_.completed();
             // An ANY wait that another fence already satisfied is dropped without waiting for this one.
             std::erase_if(pending_, [done](const auto& entry) {
                 if (entry.second->done()) return true;
@@ -671,10 +702,13 @@ private:
 
     leonida::VulkanFence fence_;
     D3D12_FENCE_FLAGS flags_;
-    std::atomic<UINT64> highest_;
+    std::mutex claim_mutex_;
+    UINT64 highest_;     // the highest value claimed, from either side
+    UINT64 queued_ = 0;  // the highest value a queue will signal
     std::mutex mutex_;
     std::condition_variable changed_;
     std::vector<std::pair<UINT64, std::shared_ptr<FenceWaiter>>> pending_;
+    std::vector<std::pair<UINT64, UINT64>> held_;  // (queue value to reach first, CPU value), in signal order
     std::thread waiter_;
     bool stop_ = false;
 };
@@ -752,7 +786,7 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value)) return d3d12_trace::result(method, S_OK);
+        if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
         return d3d12_trace::result(method, queue_.signal(f->semaphore(), value) ? S_OK : E_FAIL);
     }
 

@@ -467,7 +467,9 @@ creation), root signatures, PSOs, draws, typeless volume RTVs,
 placed resources, `GetGPUVirtualAddress` (the shared buffer arena), depth-stencil resolves,
 the swapchain;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
-increase; such a signal is reported and dropped); the GCL8
+increase; such a signal is reported and dropped), and a CPU `Signal` above a queue `Signal` the GPU has not
+reached yet is held until it has (`vkSignalSemaphore` must stay below every pending signal,
+VUID-VkSemaphoreSignalInfo-value-03259), so `GetCompletedValue` shows it only then; the GCL8
 front/back stencil references are recorded but not applied, because there is no pipeline or draw path for them to
 affect.
 
