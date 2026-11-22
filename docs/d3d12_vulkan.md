@@ -1829,11 +1829,47 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
 
   The access itself is never dropped, so the dependency still covers everything the application named, over a
   slightly larger scope.
-- Render passes: `BeginRenderPass`/`EndRenderPass` map to `vkCmdBeginRendering`/`vkCmdEndRendering` (dynamic
-  rendering). The `D3D12_RENDER_PASS_BEGINNING_ACCESS`/`ENDING_ACCESS` types give the load/store ops and resolve
-  targets. Suspending/resuming passes have no direct Vulkan equivalent; split them into two rendering scopes with
-  the same attachments and `LOAD`/`STORE`. If the game does not use render passes, build a rendering scope per draw
-  from the bound RTVs/DSV and let explicit `Clear*View` calls do the clears.
+- Render passes (D3D-27, implemented subset): `ID3D12GraphicsCommandList4::BeginRenderPass`/`EndRenderPass` are
+  recorded into the command-list IR; every CPU descriptor is copied into it at the call, so rewriting a slot before
+  `ExecuteCommandLists` cannot change the submitted attachments. Replay opens one `vkCmdBeginRendering` scope over
+  the captured RTVs/DSV and closes it at `EndRenderPass`. All layout transitions run **before** `BeginRendering`;
+  a draw inside the scope reuses it, takes its attachments and formats from the pass snapshot (not the stale OM
+  bindings, VUID 08910) and emits no barrier inside the scope (VUID 09553). Colour slots keep their **original OM
+  index**: a NO_ACCESS/NO_ACCESS slot is not resolved or transitioned but stays in the scope with a
+  `VK_NULL_HANDLE` image view (Vulkan 1.3 dynamic rendering leaves such an attachment unwritten) and an UNDEFINED
+  pipeline format, so shader output `SV_Target k` still reaches attachment `k`. `colorAttachmentCount` covers
+  slots 0 through the highest active slot; no passive slot is ever dropped or compacted. A draw in the scope binds a
+  pipeline variant whose `VkPipelineRenderingCreateInfo::colorAttachmentCount` is the **pass** slot count, padding
+  missing PSO RTVs and dropping extra ones with UNDEFINED formats (VUID 06179). Padded and pass-reinterpreted slots
+  disable blending, since their format may lack `VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT` (VUID 06062);
+  fragment writes to output locations above the pass count are discarded as on D3D12, but core Vulkan only guarantees
+  that for null-view padding slots. A two-plane PSO DSV used by a single-plane pass keeps its format on the active
+  plane and sets the other plane UNDEFINED; a pass with depth/stencil testing enabled but that plane inactive runs
+  with defined behaviour (reading a NO_ACCESS plane is undefined on D3D12 too). The pass path requires the pass and
+  PSO depth formats to match exactly; typeless reinterpretation is not supported here. Beginning
+  CLEAR/PRESERVE/DISCARD/NO_ACCESS map to `CLEAR`/`LOAD`/`DONT_CARE`/`DONT_CARE`, ending
+  PRESERVE/DISCARD/NO_ACCESS to `STORE`/`STORE_OP_NONE`/`STORE_OP_NONE`; `VK_ATTACHMENT_STORE_OP_NONE` is defined in
+  Vulkan 1.3 with the `VK_KHR_dynamic_rendering` promotion (not `VK_KHR_load_store_op_none`), so no extension is
+  enabled for it. A beginning NO_ACCESS
+  is a deliberate conservative choice: core Vulkan 1.3 has no "do not load" op (`VK_ATTACHMENT_LOAD_OP_NONE` needs
+  `VK_KHR_load_store_op_none`), so it is DONT_CARE, never LOAD or CLEAR. Depth and stencil have independent activity
+  flags and aspect masks but share one DSV view when both are active (VUID 06085); D24 clears are quantised as
+  elsewhere. With RTVs of different sizes the renderArea is their intersection, so pixels outside the smallest RT
+  are not written (the rule the per-draw path already uses). Between Begin/End only Draw, DebugMarker and
+  EndRenderPass are accepted: barriers, dispatches, copies, resolves, queries (including `BeginQuery`/`EndQuery`),
+  `ExecuteIndirect` and predication are **refused** in preparation, not approximated. An unclosed pass fails
+  `Close`; that error is persisted and surfaced again by `Reset` — deliberately a second signal so a caller that
+  ignores `Close` cannot miss the rejected pass (the query path instead returns S_OK from `Reset`) — and the queue
+  refuses the list before any batch is emitted. `CheckFeatureSupport` still reports `RenderPassesTier = TIER_0`
+  and `RenderPassesValid = FALSE`.
+  **Open:** ending RESOLVE and the `ALLOW_UAV_WRITES`, read-only-depth/stencil and LOCAL access flags are refused
+  with a diagnostic. A pass that ends with RESOLVE is rejected outright: MSAA passes that resolve inside the pass
+  do not run and there is no in-pass workaround; use `ResolveSubresource`/the depth-resolve replay path instead.
+  MSAA/1D/3D attachments and multi-planar formats have no separate dimension/sample check in `prepare_render_pass`;
+  the views RTV/DSV creation can produce are the practical limit, and one that reaches the pass is not specially
+  diagnosed. **SUSPENDING/RESUMING** is refused: Vulkan has `VK_RENDERING_SUSPENDING/RESUMING_BIT` and
+  `VkRenderingAttachmentInfo.resolveMode`, but this layer has no path for them and claims no matching
+  submit-group/flags support.
 
 ### 4.4 Fences, queues and frames in flight
 

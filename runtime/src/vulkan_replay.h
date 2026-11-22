@@ -703,7 +703,37 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // The same pipeline built for a draw inside a rendering scope: the pass fixes both the colour-attachment COUNT
+    // and every slot's format (VUID-vkCmdDraw-colorAttachmentCount-06179 and 08910/08912), and may leave one
+    // depth/stencil plane inactive. UNDEFINED entries mean "no attachment" in core Vulkan 1.3. Null if unavailable.
+    std::function<VkPipeline(const std::vector<VkFormat>& colors, VkFormat depth, VkFormat stencil)>
+        variant_attachments;
 };
+
+// Blend attachments for a pipeline variant whose rendering declaration is `colors`. The PSO declared `base` states
+// by render-target slot and `declared` formats for those slots. A padded slot, an UNDEFINED slot or one reinterpreted
+// by the pass must not carry blendEnable=TRUE, because a format without
+// VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT forbids it (VUID-VkGraphicsPipelineCreateInfo-renderPass-06062).
+// The rest of the state, including colorWriteMask, is kept: when independentBlend is off every attachment must be
+// identical (VUID 00605), so zeroing the mask would trade one validity error for another.
+inline std::vector<VkPipelineColorBlendAttachmentState> variant_blend_states(
+    const std::vector<VkPipelineColorBlendAttachmentState>& base, const std::vector<VkFormat>& colors,
+    const std::vector<VkFormat>& declared) {
+    std::vector<VkPipelineColorBlendAttachmentState> states;
+    states.reserve(colors.size());
+    for (std::size_t slot = 0; slot < colors.size(); ++slot) {
+        if (slot < base.size() && slot < declared.size() && colors[slot] != VK_FORMAT_UNDEFINED &&
+            colors[slot] == declared[slot]) {
+            states.push_back(base[slot]);
+        } else {
+            VkPipelineColorBlendAttachmentState state{};
+            if (!base.empty()) state = slot < base.size() ? base[slot] : base[0];
+            state.blendEnable = VK_FALSE;
+            states.push_back(state);
+        }
+    }
+    return states;
+}
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
 struct ShaderUserData {
@@ -823,7 +853,8 @@ enum class ReplayResult {
     invalid_predication,
     invalid_query,
     invalid_indirect_arguments,
-    unsupported
+    unsupported,
+    invalid_render_pass
 };
 
 namespace detail {
@@ -895,10 +926,30 @@ struct Prepared {
         ResourceId id = 0;
         VkImageSubresourceRange range{};
         VkImageView view = VK_NULL_HANDLE;
+        VkAttachmentLoadOp load = VK_ATTACHMENT_LOAD_OP_LOAD;
+        VkAttachmentStoreOp store = VK_ATTACHMENT_STORE_OP_STORE;
+        VkClearValue clear{};  // render-pass CLEAR attachments
     };
     GraphicsPipeline graphics;
     std::vector<Attachment> colors;  // by slot; id 0 = unbound
     Attachment depth;
+    Attachment stencil;  // render passes: the DSV's stencil aspect, sharing depth's image view
+    // The active BeginRenderPass snapshot, used by draws inside the scope. Original OM slot indices are preserved:
+    // a passive NO_ACCESS slot keeps its index with a null image view and VK_FORMAT_UNDEFINED, so shader output
+    // location k still maps to colour attachment k. Formats come from the captured views, never from the stale OM
+    // binding (Vulkan VUID 08910). Layout transitions happen once, before vkCmdBeginRendering (VUID 09553).
+    struct RenderPassView {
+        std::vector<Attachment> colors;  // by original OM slot; passive slots have a null view
+        Attachment depth;
+        Attachment stencil;
+        bool depth_active = false;
+        bool stencil_active = false;
+        std::vector<VkFormat> color_formats;  // by original OM slot; UNDEFINED for passive slots
+        VkFormat depth_format = VK_FORMAT_UNDEFINED;
+        VkExtent2D area{};
+        std::uint32_t layers = 1;
+    };
+    RenderPassView pass;
     std::vector<VkBuffer> vertex_buffers;
     std::vector<VkDeviceSize> vertex_offsets, vertex_sizes, vertex_strides;
     VkBuffer index_buffer = VK_NULL_HANDLE;
@@ -1008,6 +1059,23 @@ inline VkImageSubresourceRange planes_for_layout(const ResourceBinding& resource
 
 inline VkExtent2D mip_extent(const ResourceBinding& resource, std::uint32_t mip) {
     return {std::max(1u, resource.width >> mip), std::max(1u, resource.height >> mip)};
+}
+
+// D3D12 render-pass accesses to Vulkan load/store ops. A beginning NO_ACCESS is DONT_CARE, never LOAD or CLEAR:
+// core Vulkan 1.3 has no "no load" op (VK_ATTACHMENT_LOAD_OP_NONE needs VK_KHR_load_store_op_none), so this is a
+// deliberate conservative mapping, documented in docs/d3d12_vulkan.md. An ending NO_ACCESS (and DISCARD) stores
+// nothing at all; an ending PRESERVE stores the contents.
+inline VkAttachmentLoadOp render_pass_load(std::uint32_t access) {
+    switch (access) {
+    case d3d12_render_beginning::discard:
+    case d3d12_render_beginning::no_access: return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    case d3d12_render_beginning::clear: return VK_ATTACHMENT_LOAD_OP_CLEAR;
+    default: return VK_ATTACHMENT_LOAD_OP_LOAD;  // preserve
+    }
+}
+
+inline VkAttachmentStoreOp render_pass_store(std::uint32_t access) {
+    return access == d3d12_render_ending::preserve ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_NONE;
 }
 
 inline std::vector<VkClearRect> clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t layers) {
@@ -1678,10 +1746,24 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
 
 namespace detail {
 
-// Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
-// typeless texture is viewed as the format the pipeline renders.
+// A draw inside BeginRenderPass must use the pass's captured attachments, not the OM render targets recorded with
+// the draw (D3D12 ignores the OM bindings while a pass is active). Formats come from the pass snapshot so Vulkan's
+// render-pass/pipeline format agreement (VUID 08910) holds even when a slot was rewritten or is stale.
+struct PassDrawTargets {
+    const std::vector<Prepared::Attachment>* colors = nullptr;
+    const Prepared::Attachment* depth = nullptr;
+    const std::vector<VkFormat>* color_formats = nullptr;
+    VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags depth_aspects = 0;
+    VkExtent2D area{};
+    std::uint32_t layers = 1;
+};
+
+// Resolves a draw's pipeline, attachments and buffers. With `pass` set, the attachments come from the active
+// rendering scope and are not transitioned again here (VUID 09553); otherwise the draw's own OM targets are used.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p) {
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, Prepared& p,
+                          const PassDrawTargets* pass = nullptr) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
@@ -1700,52 +1782,99 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         layers = std::min(layers, range.layerCount);
     };
 
-    p.colors.assign(pipeline->color_formats.size(), {});
-    for (std::size_t slot = 0; slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
-        const TargetView& target = draw.render_targets[slot];
-        if (!target.resource) continue;
-        const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
-        auto& a = p.colors[slot];
-        a.binding = *binding;
-        a.id = target.resource;
-        if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
-        if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
-        ResourceBinding viewed = a.binding;
-        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
-        a.view = vk.image_view(viewed, a.range);
-        if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, target, a.range);
-    }
-    if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
-        const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
-        auto& a = p.depth;
-        a.binding = *binding;
-        a.id = draw.depth.resource;
-        if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
-        if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
-        ResourceBinding viewed = a.binding;
-        viewed.format = pipeline->depth_format;
-        a.view = vk.image_view(viewed, a.range);
-        if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, draw.depth, a.range);
-    }
-    if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
-        p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
-                  std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
-    }
-    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+    if (pass) {
+        p.colors = *pass->colors;
+        if (pass->depth) p.depth = *pass->depth;
+        else p.depth = {};
+        p.stencil = {};
+        p.area = pass->area;
+        p.layers = pass->layers;
+        const std::size_t color_slots = pass->color_formats->size();
+        const std::size_t formats = pipeline->color_formats.size();
+        if (color_slots > 32 || formats > 32) return ReplayResult::unsupported;
+        // The scope fixes the colour-attachment COUNT and every slot's format; the PSO's RTVFormats may have a
+        // different count. Build a variant that declares exactly the pass slots (padding missing RTVs and dropping
+        // extra ones with VK_FORMAT_UNDEFINED), so vkCmdDraw's 06179 count and 08910/08912 format rules both hold.
+        // A slot active in both with two different real formats is a genuine D3D12 mismatch and is refused.
+        std::vector<VkFormat> colors(color_slots, VK_FORMAT_UNDEFINED);
+        bool need_variant = color_slots != formats;
+        for (std::size_t slot = 0; slot < color_slots; ++slot) {
+            const VkFormat pass_format = (*pass->color_formats)[slot];
+            const VkFormat pipe_format = slot < formats ? pipeline->color_formats[slot] : VK_FORMAT_UNDEFINED;
+            if (pass_format != VK_FORMAT_UNDEFINED && pipe_format != VK_FORMAT_UNDEFINED &&
+                pipe_format != pass_format)
+                return ReplayResult::unsupported;
+            colors[slot] = pass_format;
+            if (pipe_format != pass_format) need_variant = true;
+        }
+        // The pass may use only one plane of a two-plane PSO (e.g. a D24S8 DSV with NO_ACCESS stencil). Keep the
+        // shared format on the active plane(s) and make the inactive plane UNDEFINED in the variant (08913/08914).
+        VkFormat depth = VK_FORMAT_UNDEFINED, stencil = VK_FORMAT_UNDEFINED;
+        if (pass->depth_aspects) {
+            if (pipeline->depth_format == VK_FORMAT_UNDEFINED || pipeline->depth_format != pass->depth_format ||
+                ((pass->depth_aspects & ~pipeline->depth_aspects) & depth_stencil_aspects))
+                return ReplayResult::unsupported;
+            if (pass->depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) depth = pipeline->depth_format;
+            if (pass->depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = pipeline->depth_format;
+        }
+        const VkFormat base_depth =
+            (pipeline->depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? pipeline->depth_format : VK_FORMAT_UNDEFINED;
+        const VkFormat base_stencil =
+            (pipeline->depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? pipeline->depth_format : VK_FORMAT_UNDEFINED;
+        if (depth != base_depth || stencil != base_stencil) need_variant = true;
+        if (need_variant) {
+            p.graphics.pipeline = pipeline->variant_attachments ? pipeline->variant_attachments(colors, depth, stencil)
+                                                               : VK_NULL_HANDLE;
+            if (!p.graphics.pipeline) return ReplayResult::unsupported;
+        }
+    } else {
+        p.colors.assign(pipeline->color_formats.size(), {});
+        for (std::size_t slot = 0; slot < draw.render_targets.size() && slot < p.colors.size(); ++slot) {
+            const TargetView& target = draw.render_targets[slot];
+            if (!target.resource) continue;
+            const ResourceBinding* binding = resolve(target.resource);
+            if (!binding) return ReplayResult::unresolved_resource;
+            auto& a = p.colors[slot];
+            a.binding = *binding;
+            a.id = target.resource;
+            if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+            if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
+            ResourceBinding viewed = a.binding;
+            if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
+            a.view = vk.image_view(viewed, a.range);
+            if (!a.view) return ReplayResult::unsupported;
+            shrink(a.binding, target, a.range);
+        }
+        if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
+            const ResourceBinding* binding = resolve(draw.depth.resource);
+            if (!binding) return ReplayResult::unresolved_resource;
+            auto& a = p.depth;
+            a.binding = *binding;
+            a.id = draw.depth.resource;
+            if (!a.binding.image || !(a.binding.aspects & depth_stencil_aspects)) return ReplayResult::invalid_clear;
+            if (!view_range(a.binding, draw.depth, a.binding.aspects, a.range)) return ReplayResult::invalid_subresource;
+            ResourceBinding viewed = a.binding;
+            viewed.format = pipeline->depth_format;
+            a.view = vk.image_view(viewed, a.range);
+            if (!a.view) return ReplayResult::unsupported;
+            shrink(a.binding, draw.depth, a.range);
+        }
+        if (p.area.width == UINT32_MAX) {  // no attachment: the viewport bounds the rendering
+            p.area = {std::uint32_t(std::max(0.0f, draw.viewport.x + draw.viewport.width)),
+                      std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
+        }
+        p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
 
-    // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
-    // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
-    std::uint32_t unbound = 0;
-    for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
-        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
-    if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
-    if (unbound) {
-        p.graphics.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-        if (!p.graphics.pipeline) return ReplayResult::unsupported;
+        // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
+        // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
+        std::uint32_t unbound = 0;
+        for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
+            if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
+        if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+        if (unbound) {
+            p.graphics.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
+            if (!p.graphics.pipeline) return ReplayResult::unsupported;
+        }
     }
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
@@ -1827,6 +1956,93 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
                       VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, stages);
     }
     if (tracker) tracker->set(a.id, range, layout);
+}
+
+// Resolves a BeginRenderPass's descriptors the same way prepare_draw resolves a draw's: the ResourceIds were
+// captured at record time, the bindings are looked up now. Original OM slot indices are preserved: a passive
+// NO_ACCESS slot keeps its index with a null view and VK_FORMAT_UNDEFINED (Vulkan 1.3 dynamic rendering leaves a
+// colour attachment with a null imageView unwritten). Formats are captured from the RTVs (D3D-41's color_view_format).
+// One DSV view serves both depth and stencil (Vulkan VUID 06085), but each plane's activity and aspect are separate.
+template<typename Resolve>
+ReplayResult prepare_render_pass(const BeginRenderPass& pass, Resolve&& resolve, const ReplayFunctions& vk,
+                                 Prepared& p) {
+    if (!vk.image_view || !vk.begin_rendering || !vk.end_rendering) return ReplayResult::unsupported;
+    Prepared::RenderPassView& view = p.pass;
+    p.area = {UINT32_MAX, UINT32_MAX};
+    std::uint32_t layers = UINT32_MAX;
+    const auto shrink = [&](const ResourceBinding& b, const TargetView& t, const VkImageSubresourceRange& range) {
+        const VkExtent2D e = mip_extent(b, t.mip);
+        p.area = {std::min(p.area.width, e.width), std::min(p.area.height, e.height)};
+        layers = std::min(layers, range.layerCount);
+    };
+    // Keep the original OM slot indices: dropping or compacting passive slots would shift shader output location k
+    // onto another attachment. The scope covers slots 0..highest-active; a passive slot stays a placeholder with a
+    // null view and VK_FORMAT_UNDEFINED. Trailing passive slots past the last active one need no attachment at all.
+    std::size_t color_slots = 0;
+    for (std::size_t slot = 0; slot < pass.colors.size(); ++slot)
+        if (pass.active_color_mask & (1u << slot)) color_slots = slot + 1;
+    view.colors.resize(color_slots);
+    view.color_formats.assign(color_slots, VK_FORMAT_UNDEFINED);
+    for (std::size_t slot = 0; slot < color_slots; ++slot) {
+        if (!(pass.active_color_mask & (1u << slot))) continue;  // passive: null view + UNDEFINED format
+        const RenderPassColor& color = pass.colors[slot];
+        const ResourceBinding* binding = resolve(color.view.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        Prepared::Attachment a;
+        a.binding = *binding;
+        a.id = color.view.resource;
+        if (!a.binding.image || a.binding.aspects != VK_IMAGE_ASPECT_COLOR_BIT) return ReplayResult::invalid_clear;
+        if (!view_range(a.binding, color.view, VK_IMAGE_ASPECT_COLOR_BIT, a.range))
+            return ReplayResult::invalid_subresource;
+        const VkFormat format = color_view_format(a.binding, color.view);
+        if (format == VK_FORMAT_UNDEFINED) return ReplayResult::unsupported;
+        ResourceBinding viewed = a.binding;
+        viewed.format = format;
+        a.view = vk.image_view(viewed, a.range);
+        if (!a.view) return ReplayResult::unsupported;
+        a.load = render_pass_load(color.beginning.type);
+        a.store = render_pass_store(color.ending.type);
+        if (a.load == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            a.clear.color = render_target_clear_color(format, color.beginning.color);
+        shrink(a.binding, color.view, a.range);
+        view.color_formats[slot] = format;
+        view.colors[slot] = std::move(a);
+    }
+    if (pass.depth_stencil) {
+        const RenderPassDepthStencil& ds = *pass.depth_stencil;
+        const ResourceBinding* binding = resolve(ds.view.resource);
+        if (!binding) return ReplayResult::unresolved_resource;
+        const VkImageAspectFlags available = binding->aspects & depth_stencil_aspects;
+        if (!binding->image || !available) return ReplayResult::invalid_clear;
+        view.depth_active = pass.depth_active && (available & VK_IMAGE_ASPECT_DEPTH_BIT);
+        view.stencil_active = pass.stencil_active && (available & VK_IMAGE_ASPECT_STENCIL_BIT);
+        if (view.depth_active || view.stencil_active) {
+            Prepared::Attachment& depth = view.depth;
+            Prepared::Attachment& stencil = view.stencil;
+            depth.binding = stencil.binding = *binding;
+            depth.id = stencil.id = ds.view.resource;
+            if (!view_range(*binding, ds.view, available, depth.range)) return ReplayResult::invalid_subresource;
+            stencil.range = depth.range;
+            depth.view = stencil.view = vk.image_view(*binding, depth.range);
+            if (!depth.view) return ReplayResult::unsupported;
+            depth.load = render_pass_load(ds.depth_beginning.type);
+            depth.store = render_pass_store(ds.depth_ending.type);
+            stencil.load = render_pass_load(ds.stencil_beginning.type);
+            stencil.store = render_pass_store(ds.stencil_ending.type);
+            const float depth_value = (binding->depth24_as_float || binding->depth24)
+                                          ? depth24_clear_value(ds.depth_beginning.depth)
+                                          : ds.depth_beginning.depth;
+            depth.clear.depthStencil = {depth_value, ds.depth_beginning.stencil};
+            stencil.clear.depthStencil = {depth_value, ds.stencil_beginning.stencil};
+            shrink(depth.binding, ds.view, depth.range);
+            view.depth_format = binding->format;
+        }
+    }
+    if (p.area.width == UINT32_MAX) return ReplayResult::invalid_render_pass;
+    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+    view.area = p.area;
+    view.layers = p.layers;
+    return ReplayResult::success;
 }
 
 } // namespace detail
@@ -1998,6 +2214,7 @@ template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out) {
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
+    if (list.render_pass_open()) return ReplayResult::invalid_render_pass;
     const auto commands = list.commands();
     out.list = &list;
     out.commands.assign(commands.size(), {});
@@ -2013,6 +2230,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     // While a predicate is set, a whole-view clear is replayed as one rectangle over the view: vkCmdClearColorImage
     // and vkCmdClearDepthStencilImage ignore conditional rendering, vkCmdClearAttachments does not.
     bool predicated = false;
+    bool render_pass = false;  // Begin/End must nest correctly in one list; a Vulkan scope cannot nest either.
+    std::size_t active_pass = SIZE_MAX;  // command index of the open pass; its snapshot drives draws inside it
     constexpr Rect whole_view{0, 0, INT32_MAX, INT32_MAX};
     const auto clear_rects = [&](std::span<const Rect> rects) {
         return predicated && rects.empty() ? std::span<const Rect>(&whole_view, 1) : rects;
@@ -2029,6 +2248,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     for (std::size_t i = 0; i < commands.size(); ++i) {
         const auto& command = commands[i];
         auto& p = out.commands[i];
+        // Vulkan forbids pipelines barriers, dispatches, copies, resolves, query resets and conditional rendering
+        // inside a rendering scope. D3D12 permits recording them between Begin/End, so refuse such a list in this
+        // narrow phase rather than emit invalid commands; the portable transition already runs before BeginRendering.
+        if (render_pass && !std::holds_alternative<Draw>(command) && !std::holds_alternative<EndRenderPass>(command) &&
+            !std::holds_alternative<DebugMarker>(command))
+            return ReplayResult::invalid_render_pass;
         const auto bind = [&](ResourceId id) {
             const ResourceBinding* binding = resolve(id);
             if (binding) p.binding = *binding;
@@ -2448,9 +2673,31 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) return r;
+            if (render_pass) {
+                const auto& view = out.commands[active_pass].pass;
+                const VkImageAspectFlags aspects =
+                    static_cast<VkImageAspectFlags>(view.depth_active ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                    static_cast<VkImageAspectFlags>(view.stencil_active ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+                const detail::PassDrawTargets targets{&view.colors, view.depth_active ? &view.depth : nullptr,
+                                                      &view.color_formats, view.depth_format, aspects,
+                                                      view.area, view.layers};
+                if (const auto r = detail::prepare_draw(*draw, resolve, vk, p, &targets); r != ReplayResult::success)
+                    return r;
+            } else if (const auto r = detail::prepare_draw(*draw, resolve, vk, p); r != ReplayResult::success) {
+                return r;
+            }
+        } else if (const auto* pass = std::get_if<BeginRenderPass>(&command)) {
+            if (render_pass) return ReplayResult::invalid_render_pass;
+            if (const auto r = detail::prepare_render_pass(*pass, resolve, vk, p); r != ReplayResult::success) return r;
+            render_pass = true;
+            active_pass = i;
+        } else if (std::holds_alternative<EndRenderPass>(command)) {
+            if (!render_pass) return ReplayResult::invalid_render_pass;
+            render_pass = false;
+            active_pass = SIZE_MAX;
         }
     }
+    if (render_pass) return ReplayResult::invalid_render_pass;
     if (ordinary_active) return ReplayResult::invalid_query;
     plan_statistics_segments(out);
     if (overlaps) {
@@ -2666,6 +2913,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     const bool predicates = vk.begin_conditional_rendering != nullptr;
     VkConditionalRenderingBeginInfoEXT predicate{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
     std::size_t next_query = 0;
+    bool in_render_pass = false;  // a draw inside a pass must not open a second Vulkan rendering scope
     // A dispatch honours conditional rendering and a copy does not (the layer runs copies unpredicated), so the
     // conversion around a copy must run whatever the predicate says: end it for the dispatch and begin it again.
     const auto run_depth24 = [&](const Depth24Job& job) {
@@ -3238,8 +3486,63 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                         &p.pipeline.bindless_set, 0, nullptr);
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+        } else if (std::holds_alternative<BeginRenderPass>(command)) {
+            auto& prepared_pass = const_cast<detail::Prepared&>(p);
+            constexpr VkAccessFlags color_access =
+                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            constexpr VkAccessFlags depth_access =
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            constexpr VkPipelineStageFlags depth_stages =
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            // Every layout transition is issued here, before vkCmdBeginRendering (VUID 09553). A passive slot keeps
+            // a null image view: it is neither resolved nor transitioned, and Vulkan leaves it unwritten.
+            std::vector<VkRenderingAttachmentInfo> colors(prepared_pass.pass.colors.size(),
+                                                          {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO});
+            for (std::size_t slot = 0; slot < prepared_pass.pass.colors.size(); ++slot) {
+                auto& a = prepared_pass.pass.colors[slot];
+                if (!a.view) continue;  // passive NO_ACCESS slot: keep the null image view
+                const VkImageLayout layout = image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                detail::to_attachment(vk, command_buffer, a, layout, color_access,
+                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, tracker, separate);
+                colors[slot].imageView = a.view;
+                colors[slot].imageLayout = layout;
+                colors[slot].loadOp = a.load;
+                colors[slot].storeOp = a.store;
+                colors[slot].clearValue = a.clear;
+            }
+            VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            if (prepared_pass.pass.depth_active || prepared_pass.pass.stencil_active) {
+                const VkImageLayout layout = image_layout(prepared_pass.pass.depth.binding,
+                                                          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+                detail::to_attachment(vk, command_buffer, prepared_pass.pass.depth, layout, depth_access, depth_stages,
+                                      tracker, separate);
+                depth.imageView = stencil.imageView = prepared_pass.pass.depth.view;
+                depth.imageLayout = stencil.imageLayout = layout;
+                depth.loadOp = prepared_pass.pass.depth.load;
+                depth.storeOp = prepared_pass.pass.depth.store;
+                stencil.loadOp = prepared_pass.pass.stencil.load;
+                stencil.storeOp = prepared_pass.pass.stencil.store;
+                depth.clearValue = prepared_pass.pass.depth.clear;
+                stencil.clearValue = prepared_pass.pass.stencil.clear;
+            }
+            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            rendering.renderArea = {{0, 0}, p.area};
+            rendering.layerCount = p.layers;
+            rendering.colorAttachmentCount = std::uint32_t(colors.size());
+            rendering.pColorAttachments = colors.data();
+            if (prepared_pass.pass.depth_active) rendering.pDepthAttachment = &depth;
+            if (prepared_pass.pass.stencil_active) rendering.pStencilAttachment = &stencil;
+            vk.begin_rendering(command_buffer, &rendering);
+            in_render_pass = true;
+        } else if (std::holds_alternative<EndRenderPass>(command)) {
+            vk.end_rendering(command_buffer);
+            in_render_pass = false;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             auto& prepared_draw = const_cast<detail::Prepared&>(p);
+            // Inside a render pass the scope and its layout transitions were already issued at BeginRenderPass.
+            // Opening a second scope or emitting a barrier here is invalid Vulkan (VUID 09553); only bind and draw.
+            if (!in_render_pass) {
             constexpr VkAccessFlags color_access =
                 VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             constexpr VkAccessFlags depth_access =
@@ -3275,7 +3578,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             rendering.pColorAttachments = colors.data();
             if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (p.depth.id && (p.graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
-            vk.begin_rendering(command_buffer, &rendering);
+            // A draw inside a BeginRenderPass scope uses that scope's attachments; Vulkan forbids nesting.
+            if (!in_render_pass) vk.begin_rendering(command_buffer, &rendering);
+            }
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
@@ -3317,7 +3622,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
-            vk.end_rendering(command_buffer);
+            if (!in_render_pass) vk.end_rendering(command_buffer);
         }
     }
     // Predication does not carry over to the next command list.
