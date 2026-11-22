@@ -9,6 +9,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
 #include <array>
@@ -1238,6 +1239,111 @@ int main() {
         EXPECT(SUCCEEDED(upload->GetHeapProperties(&heap_properties, nullptr)) &&
                heap_properties.Type == D3D12_HEAP_TYPE_UPLOAD);
 
+        // Buffer resources report non-zero GPU virtual addresses; textures report 0.
+        EXPECT(upload->GetGPUVirtualAddress() != 0);
+        EXPECT(readback->GetGPUVirtualAddress() != 0);
+        EXPECT(rt_resource->GetGPUVirtualAddress() == 0);
+
+        // CBV/SRV/UAV and Sampler descriptor heaps.
+        D3D12_DESCRIPTOR_HEAP_DESC cbv_srv_uav_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                                         D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        Ref<ID3D12DescriptorHeap> cbv_srv_uav_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&cbv_srv_uav_heap_desc, IID_PPV_ARGS(&cbv_srv_uav_heap.p))));
+        const std::uint64_t cbv_srv_start =
+            reinterpret_cast<XboxHeapHandleFn>(slot(cbv_srv_uav_heap.p, 9))(cbv_srv_uav_heap.p);
+        const UINT cbv_srv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        EXPECT(cbv_srv_start && cbv_srv_inc >= 32);
+
+        D3D12_DESCRIPTOR_HEAP_DESC sampler_heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4,
+                                                     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        Ref<ID3D12DescriptorHeap> sampler_heap;
+        EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&sampler_heap_desc, IID_PPV_ARGS(&sampler_heap.p))));
+        const std::uint64_t sampler_start =
+            reinterpret_cast<XboxHeapHandleFn>(slot(sampler_heap.p, 9))(sampler_heap.p);
+        const UINT sampler_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+        EXPECT(sampler_start && sampler_inc >= 32);
+
+        // Constant Buffer View (CBV)
+        const D3D12_CPU_DESCRIPTOR_HANDLE cbv_handle{SIZE_T(cbv_srv_start)};
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc{upload->GetGPUVirtualAddress(), 512};
+        device->CreateConstantBufferView(&cbv_desc, cbv_handle);
+        const auto* cbv = reinterpret_cast<const rt::d3d12::ConstantBufferView*>(cbv_handle.ptr);
+        EXPECT(cbv->buffer_location == upload->GetGPUVirtualAddress() && cbv->size_in_bytes == 512);
+        EXPECT(cbv->buffer_desc.gpu_address() == upload->GetGPUVirtualAddress());
+        EXPECT(cbv->buffer_desc.num_records == 512);
+        EXPECT(cbv->buffer_desc.dst_sel_format == 0x0FAC);
+
+        // Shader Resource View (SRV) - texture (GFX10 T#) and buffer (GFX10 V#)
+        const D3D12_CPU_DESCRIPTOR_HANDLE srv_tex_handle{SIZE_T(cbv_srv_start + cbv_srv_inc)};
+        device->CreateShaderResourceView(rt_resource.p, nullptr, srv_tex_handle);
+        leonida::gfx10::ImageWords srv_tex_words{};
+        std::memcpy(srv_tex_words.data(), reinterpret_cast<const void*>(srv_tex_handle.ptr), sizeof(srv_tex_words));
+        leonida::gfx10::Image srv_img{};
+        EXPECT(leonida::gfx10::decode(srv_tex_words, srv_img));
+        EXPECT(srv_img.type == leonida::gfx10::ImageType::image_2d && srv_img.width == size && srv_img.height == size);
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE srv_buf_handle{SIZE_T(cbv_srv_start + 2 * cbv_srv_inc)};
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_buf_desc{};
+        srv_buf_desc.Format = DXGI_FORMAT_R32_UINT;
+        srv_buf_desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv_buf_desc.Buffer.NumElements = 2048;
+        srv_buf_desc.Buffer.StructureByteStride = 4;
+        device->CreateShaderResourceView(upload.p, &srv_buf_desc, srv_buf_handle);
+        const auto* srv_buf = reinterpret_cast<const rt::d3d12::ShaderResourceView*>(srv_buf_handle.ptr);
+        EXPECT(srv_buf->buffer_resource == rt::d3d12::resource_id(upload.p) &&
+               srv_buf->buffer_dimension == D3D12_SRV_DIMENSION_BUFFER);
+        EXPECT(srv_buf->buffer_desc.gpu_address() == upload->GetGPUVirtualAddress());
+        EXPECT(srv_buf->buffer_desc.stride() == 4);
+        EXPECT(srv_buf->buffer_desc.num_records == 2048);
+        EXPECT(srv_buf->buffer_desc.format_code() == 20); // GFX10 R32_UINT
+        EXPECT(srv_buf->buffer_desc.dst_sel() == 0x0FAC); // XYZW identity swizzle
+
+        // Direct GFX10 V# pointer interpretation for shaders
+        const auto* vsharp_srv = reinterpret_cast<const rt::d3d12::BufferDescriptor*>(srv_buf_handle.ptr);
+        EXPECT(vsharp_srv->gpu_address() == upload->GetGPUVirtualAddress());
+        EXPECT(vsharp_srv->stride() == 4 && vsharp_srv->num_records == 2048 && vsharp_srv->format_code() == 20);
+
+        // Unordered Access View (UAV) - buffer (GFX10 V#)
+        const D3D12_CPU_DESCRIPTOR_HANDLE uav_buf_handle{SIZE_T(cbv_srv_start + 3 * cbv_srv_inc)};
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav_buf_desc{};
+        uav_buf_desc.Format = DXGI_FORMAT_UNKNOWN;
+        uav_buf_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uav_buf_desc.Buffer.FirstElement = 128;
+        uav_buf_desc.Buffer.NumElements = 1024;
+        device->CreateUnorderedAccessView(upload.p, nullptr, &uav_buf_desc, uav_buf_handle);
+        const auto* uav_buf = reinterpret_cast<const rt::d3d12::UnorderedAccessView*>(uav_buf_handle.ptr);
+        EXPECT(uav_buf->buffer_resource == rt::d3d12::resource_id(upload.p) &&
+               uav_buf->buffer_dimension == D3D12_UAV_DIMENSION_BUFFER);
+        EXPECT(uav_buf->buffer_desc.gpu_address() == upload->GetGPUVirtualAddress() + 128);
+        EXPECT(uav_buf->buffer_desc.num_records == 1024);
+        EXPECT(uav_buf->buffer_desc.stride() == 0);
+        EXPECT(uav_buf->buffer_desc.format_code() == 0);
+
+        // Sampler View (GFX10 S#)
+        const D3D12_CPU_DESCRIPTOR_HANDLE sampler_handle{SIZE_T(sampler_start)};
+        D3D12_SAMPLER_DESC samp_desc{};
+        samp_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp_desc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp_desc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        samp_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        samp_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp_desc.MaxAnisotropy = 8;
+        samp_desc.MinLOD = 0.5f;
+        samp_desc.MaxLOD = 12.0f;
+        samp_desc.MipLODBias = 1.0f;
+        samp_desc.BorderColor[0] = 0.0f;
+        samp_desc.BorderColor[1] = 0.0f;
+        samp_desc.BorderColor[2] = 0.0f;
+        samp_desc.BorderColor[3] = 1.0f;
+        device->CreateSampler(&samp_desc, sampler_handle);
+        leonida::gfx10::SamplerWords samp_words{};
+        std::memcpy(samp_words.data(), reinterpret_cast<const void*>(sampler_handle.ptr), sizeof(samp_words));
+        const leonida::gfx10::Sampler samp = leonida::gfx10::decode(samp_words);
+        EXPECT(samp.address_u == leonida::gfx10::AddressMode::clamp_last_texel &&
+               samp.address_v == leonida::gfx10::AddressMode::wrap &&
+               samp.address_w == leonida::gfx10::AddressMode::clamp_border &&
+               samp.min_lod == 0.5f && samp.max_lod == 12.0f);
+
         // Views into the heaps.
         device->CreateRenderTargetView(rt_resource.p, nullptr, rtv0);
         D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
@@ -1773,6 +1879,8 @@ int main() {
         fence.reset();
         rtv_heap.reset();
         dsv_heap.reset();
+        cbv_srv_uav_heap.reset();
+        sampler_heap.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }  // the device is released here, before the Vulkan device it runs on
     EXPECT(!mismatches);

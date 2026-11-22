@@ -31,6 +31,10 @@ namespace {
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = 32;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
+static_assert(sizeof(ConstantBufferView) <= kDescriptorSize);
+static_assert(sizeof(ShaderResourceView) <= kDescriptorSize);
+static_assert(sizeof(UnorderedAccessView) <= kDescriptorSize);
+static_assert(sizeof(SamplerView) <= kDescriptorSize);
 
 void log_once(const char* what, int value) {
     static std::mutex mutex;
@@ -653,6 +657,13 @@ public:
     HRESULT STDMETHODCALLTYPE ReadFromSubresource(void* data, UINT row_pitch, UINT depth_pitch, UINT subresource,
                                                   const D3D12_BOX* box) override {
         return cpu_copy(false, subresource, box, data, row_pitch, depth_pitch);
+    }
+
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override {
+        if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return 0;
+        return mapped_ ? reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(mapped_)
+                       : reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(this);
+    }
     }
 
 private:
@@ -1317,9 +1328,20 @@ public:
                      std::size_t(count) * kDescriptorSize);
     }
 
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc,
+                                                    D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
+        if (!destination.ptr) return;
+        ConstantBufferView view{};
+        if (desc) {
+            view.buffer_desc = make_buffer_descriptor(desc->BufferLocation, 0, desc->SizeInBytes);
+        }
+        std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+    }
+
     // A shader-resource view of a texture is a T# in the slot (docs section 3.4): the shader loads those eight
     // dwords through its descriptor table and finds the image by them. A slot left as zeros is a null descriptor:
-    // nothing is registered for it, so the shader gets the fallback image. Buffer views are not implemented.
+    // nothing is registered for it, so the shader gets the fallback image. A buffer view writes a 16-byte GFX10
+    // V# descriptor directly into the slot.
     void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* resource,
                                                     const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -1330,7 +1352,23 @@ public:
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
             return;
         }
-        if (!r->image()) return stub("ID3D12Device::CreateShaderResourceView(buffer)");
+        if (!r->image()) {
+            const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+            const DXGI_FORMAT fmt = desc ? desc->Format : rd.Format;
+            std::uint32_t stride = desc ? desc->Buffer.StructureByteStride : 0;
+            if (!stride && fmt != DXGI_FORMAT_UNKNOWN) stride = dxgi_format_stride(fmt);
+            const std::uint64_t first_elem = desc ? desc->Buffer.FirstElement : 0;
+            const std::uint32_t num_elems = desc ? desc->Buffer.NumElements : static_cast<std::uint32_t>(rd.Width);
+            const std::uint64_t va = const_cast<Resource*>(r)->GetGPUVirtualAddress() + first_elem * (stride ? stride : 1);
+
+            ShaderResourceView view{};
+            view.buffer_desc = make_buffer_descriptor(va, stride, num_elems, fmt);
+            view.buffer_resource = r->id();
+            view.buffer_dimension = D3D12_SRV_DIMENSION_BUFFER;
+            view.buffer_format = fmt;
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+            return;
+        }
         TextureView view{};
         if (!desc) {
             if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
@@ -1378,6 +1416,7 @@ public:
     }
 
     // An unordered-access view of a texture is a T# too, of one mip; set 0 also holds it as a storage image.
+    // An unordered-access view of a buffer writes a 16-byte GFX10 V# descriptor directly into the slot.
     void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* resource, ID3D12Resource* counter,
                                                      const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
@@ -1388,7 +1427,31 @@ public:
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
-        if (!r->image() || counter) return stub("ID3D12Device::CreateUnorderedAccessView(buffer)");
+        if (!r->image()) {
+            const D3D12_RESOURCE_DESC rd = const_cast<Resource*>(r)->GetDesc();
+            const DXGI_FORMAT fmt = desc ? desc->Format : rd.Format;
+            std::uint32_t stride = desc ? desc->Buffer.StructureByteStride : 0;
+            if (!stride && fmt != DXGI_FORMAT_UNKNOWN) stride = dxgi_format_stride(fmt);
+            const std::uint64_t first_elem = desc ? desc->Buffer.FirstElement : 0;
+            const std::uint32_t num_elems = desc ? desc->Buffer.NumElements : static_cast<std::uint32_t>(rd.Width);
+            const std::uint64_t va = const_cast<Resource*>(r)->GetGPUVirtualAddress() + first_elem * (stride ? stride : 1);
+
+            UnorderedAccessView view{};
+            view.buffer_desc = make_buffer_descriptor(va, stride, num_elems, fmt);
+            view.buffer_resource = r->id();
+            view.buffer_dimension = D3D12_UAV_DIMENSION_BUFFER;
+            view.buffer_format = fmt;
+            if (counter) {
+                if (const Resource* cr = Resource::from<Resource>(counter)) {
+                    view.counter_resource = cr->id();
+                } else {
+                    stub("ID3D12Device::CreateUnorderedAccessView(counter from another device)");
+                }
+            }
+            std::memcpy(reinterpret_cast<void*>(destination.ptr), &view, sizeof(view));
+            return;
+        }
+        if (counter) return stub("ID3D12Device::CreateUnorderedAccessView(texture with counter)");
         if (!(r->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
             log_once("unordered-access view of a texture created without ALLOW_UNORDERED_ACCESS; flags",
                      int(r->desc().Flags));

@@ -97,6 +97,14 @@ public:
         invalid_ = false;
         front_stencil_ref_ = back_stencil_ref_ = 0;  // Reset returns every list state to its default
         stencil_ref_set_ = false;
+        viewports_.clear();
+        scissor_rects_.clear();
+        primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        blend_factor_ = {1.0f, 1.0f, 1.0f, 1.0f};
+        stencil_ref_ = 0;
+        descriptor_heaps_.clear();
+        graphics_root_signature_ = nullptr;
+        compute_root_signature_ = nullptr;
         if (state) stub("ID3D12GraphicsCommandList::Reset(initial pipeline state)");
         return S_OK;
     }
@@ -113,10 +121,55 @@ public:
         if (bundle->stencil_ref_set_) {
             front_stencil_ref_ = bundle->front_stencil_ref_;
             back_stencil_ref_ = bundle->back_stencil_ref_;
+            stencil_ref_ = bundle->stencil_ref_;
             stencil_ref_set_ = true;
         }
     }
 
+    void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE || (count && !viewports)) {
+            return check(false);
+        }
+        viewports_.assign(viewports, viewports + count);
+    }
+
+    void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE || (count && !rects)) {
+            return check(false);
+        }
+        scissor_rects_.assign(rects, rects + count);
+    }
+
+    void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) override {
+        primitive_topology_ = topology;
+    }
+
+    void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT blend_factor[4]) override {
+        if (blend_factor) {
+            blend_factor_ = {blend_factor[0], blend_factor[1], blend_factor[2], blend_factor[3]};
+        } else {
+            blend_factor_ = {1.0f, 1.0f, 1.0f, 1.0f};
+        }
+    }
+
+    void STDMETHODCALLTYPE OMSetStencilRef(UINT stencil_ref) override {
+        stencil_ref_ = stencil_ref;
+        front_stencil_ref_ = back_stencil_ref_ = stencil_ref;
+        stencil_ref_set_ = true;
+    }
+
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT count, ID3D12DescriptorHeap* const* heaps) override {
+        if (count && !heaps) return check(false);
+        descriptor_heaps_.assign(heaps, heaps + count);
+    }
+
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* root_signature) override {
+        graphics_root_signature_ = root_signature;
+    }
+
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* root_signature) override {
+        compute_root_signature_ = root_signature;
+    }
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         for (UINT i = 0; i < count; ++i) {
@@ -271,6 +324,15 @@ public:
 
     static GraphicsCommandList* from(IUnknown* object) { return Child::from<GraphicsCommandList>(object); }
 
+    std::span<const D3D12_VIEWPORT> viewports() const { return viewports_; }
+    std::span<const D3D12_RECT> scissor_rects() const { return scissor_rects_; }
+    D3D12_PRIMITIVE_TOPOLOGY primitive_topology() const { return primitive_topology_; }
+    std::array<float, 4> blend_factor() const { return blend_factor_; }
+    UINT stencil_ref() const { return stencil_ref_; }
+    std::span<ID3D12DescriptorHeap* const> descriptor_heaps() const { return descriptor_heaps_; }
+    ID3D12RootSignature* graphics_root_signature() const { return graphics_root_signature_; }
+    ID3D12RootSignature* compute_root_signature() const { return compute_root_signature_; }
+
 private:
     template<class E>
     static std::uint32_t u(E value) {
@@ -364,6 +426,14 @@ private:
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     bool stencil_ref_set_ = false;
+    std::vector<D3D12_VIEWPORT> viewports_;
+    std::vector<D3D12_RECT> scissor_rects_;
+    D3D12_PRIMITIVE_TOPOLOGY primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    std::array<float, 4> blend_factor_{1.0f, 1.0f, 1.0f, 1.0f};
+    UINT stencil_ref_ = 0;
+    std::vector<ID3D12DescriptorHeap*> descriptor_heaps_;
+    ID3D12RootSignature* graphics_root_signature_ = nullptr;
+    ID3D12RootSignature* compute_root_signature_ = nullptr;
 };
 
 class Fence final

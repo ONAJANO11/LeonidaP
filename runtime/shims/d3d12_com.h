@@ -6,7 +6,11 @@
 //
 // Contracts with the rest of the layer (the device proxy that will hand these objects out):
 // - an ID3D12Resource's leonida::ResourceId is its pointer value; the device registers it with the VulkanContext;
-// - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap.
+// - the CPU handle of an RTV or DSV points at a leonida::TargetView in the device's descriptor heap;
+// - the CPU handle of a CBV points at a ConstantBufferView;
+// - the CPU handle of an SRV points at a ShaderResourceView;
+// - the CPU handle of a UAV points at an UnorderedAccessView;
+// - the CPU handle of a Sampler points at a SamplerView.
 #pragma once
 
 #include <windows.h>
@@ -98,5 +102,195 @@ bool front_back_stencil_ref(ID3D12GraphicsCommandList8* list, UINT& front, UINT&
 inline leonida::ResourceId resource_id(const ID3D12Resource* resource) {
     return reinterpret_cast<leonida::ResourceId>(resource);
 }
+
+// GFX10 Buffer Resource Descriptor (V#): 16 bytes (4 dwords).
+// Matches RDNA2 hardware ISA and tools/rdna2spirv.py (buffer_address / scalar_load).
+struct BufferDescriptor {
+    std::uint32_t base_lo = 0;              // dword 0: base VA [31:0]
+    std::uint32_t base_hi_stride = 0;       // dword 1: base VA [47:32] | (stride[13:0] << 16)
+    std::uint32_t num_records = 0;          // dword 2: number of records / byte size
+    std::uint32_t dst_sel_format = 0x0FAC;  // dword 3: dst_sel [11:0] | (format[6:0] << 12)
+
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_address() const {
+        return static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(base_lo) |
+               (static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(base_hi_stride & 0xFFFFu) << 32);
+    }
+    std::uint32_t stride() const {
+        return (base_hi_stride >> 16) & 0x3FFFu;
+    }
+    std::uint32_t format_code() const {
+        return (dst_sel_format >> 12) & 0x7Fu;
+    }
+    std::uint32_t dst_sel() const {
+        return dst_sel_format & 0x0FFFu;
+    }
+};
+static_assert(sizeof(BufferDescriptor) == 16);
+
+// GFX10 buffer formats (matching Mesa src/amd/registers/gfx10-rsrc.json and tools/rdna2spirv.py)
+inline constexpr std::uint32_t dxgi_to_gfx10_buffer_format(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 77;
+    case DXGI_FORMAT_R32G32B32A32_UINT:  return 75;
+    case DXGI_FORMAT_R32G32B32_FLOAT:    return 74;
+    case DXGI_FORMAT_R32G32_FLOAT:       return 64;
+    case DXGI_FORMAT_R32G32_UINT:        return 62;
+    case DXGI_FORMAT_R32_FLOAT:          return 22;
+    case DXGI_FORMAT_R32_UINT:           return 20;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 67;
+    case DXGI_FORMAT_R16G16_FLOAT:       return 29;
+    case DXGI_FORMAT_R16_FLOAT:          return 13;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:     return 25;
+    default:                             return 0; // Raw / unknown / byte buffer
+    }
+}
+
+inline constexpr std::uint32_t dxgi_format_stride(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+        return 16;
+    case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32B32_UINT:
+    case DXGI_FORMAT_R32G32B32_SINT:
+        return 12;
+    case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
+        return 8;
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_UINT:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_SINT:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
+        return 4;
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_SINT:
+        return 2;
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_UINT:
+    case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+inline BufferDescriptor make_buffer_descriptor(D3D12_GPU_VIRTUAL_ADDRESS va,
+                                               std::uint32_t stride,
+                                               std::uint32_t num_records,
+                                               DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN) {
+    BufferDescriptor d{};
+    d.base_lo = static_cast<std::uint32_t>(va & 0xFFFFFFFFu);
+    d.base_hi_stride = static_cast<std::uint32_t>(((va >> 32) & 0xFFFFu) | ((stride & 0x3FFFu) << 16));
+    d.num_records = num_records;
+    const std::uint32_t fmt = dxgi_to_gfx10_buffer_format(format);
+    d.dst_sel_format = 0x0FACu | ((fmt & 0x7Fu) << 12);
+    return d;
+}
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4201)  // nonstandard extension used: nameless struct/union
+#endif
+
+// A CBV captured into the descriptor heap slot: exactly a 16-byte GFX10 V# descriptor.
+struct ConstantBufferView {
+    union {
+        BufferDescriptor buffer_desc;
+        struct {
+            D3D12_GPU_VIRTUAL_ADDRESS buffer_location;
+            std::uint32_t size_in_bytes;
+            std::uint32_t dst_sel_format;
+        };
+    };
+    std::uint32_t pad[4] = {};
+};
+static_assert(sizeof(ConstantBufferView) == 32);
+
+// An SRV captured into the descriptor heap slot (V# for buffers, T# for textures).
+struct ShaderResourceView {
+    union {
+        // GFX10 Buffer Resource Descriptor (V#) when dimension == D3D12_SRV_DIMENSION_BUFFER
+        struct {
+            BufferDescriptor buffer_desc;
+            leonida::ResourceId buffer_resource;
+            std::uint32_t buffer_dimension;
+            std::uint32_t buffer_format;
+        };
+        // Texture SRV descriptor metadata (T#)
+        struct {
+            leonida::ResourceId resource;
+            std::uint32_t format;
+            std::uint32_t dimension;
+            std::uint32_t most_detailed_mip;
+            std::uint32_t mip_levels;
+            std::uint32_t first_array_slice;
+            std::uint32_t array_size;
+        };
+    };
+};
+static_assert(sizeof(ShaderResourceView) == 32);
+
+// A UAV captured into the descriptor heap slot (V# for buffers, T# for textures).
+struct UnorderedAccessView {
+    union {
+        // GFX10 Buffer Resource Descriptor (V#) when dimension == D3D12_UAV_DIMENSION_BUFFER
+        struct {
+            BufferDescriptor buffer_desc;
+            leonida::ResourceId buffer_resource;
+            std::uint32_t buffer_dimension;
+            std::uint32_t buffer_format;
+        };
+        // Texture UAV descriptor metadata
+        struct {
+            leonida::ResourceId resource;
+            leonida::ResourceId counter_resource;
+            std::uint32_t format;
+            std::uint32_t dimension;
+            std::uint32_t mip_slice;
+            std::uint32_t first_array_slice;
+        };
+    };
+};
+static_assert(sizeof(UnorderedAccessView) == 32);
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+// A Sampler captured into the descriptor heap slot.
+struct SamplerView {
+    std::uint32_t filter = 0;
+    std::uint8_t address_u = 0;
+    std::uint8_t address_v = 0;
+    std::uint8_t address_w = 0;
+    std::uint8_t comparison_func = 0;
+    std::uint16_t max_anisotropy = 0;
+    std::uint16_t pad = 0;
+    float min_lod = 0.0f;
+    float max_lod = 0.0f;
+    float mip_lod_bias = 0.0f;
+    std::uint32_t border_color = 0;
+    std::uint32_t flags = 0;
+};
+static_assert(sizeof(SamplerView) <= 32);
 
 }  // namespace rt::d3d12

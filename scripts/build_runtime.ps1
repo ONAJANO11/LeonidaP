@@ -28,6 +28,20 @@ if ((Test-Path $cmake) -and (Test-Path $ninja)) {
     # Keep this list in step with runtime\CMakeLists.txt.
     $files = "src\main.cpp", "src\pe_loader.cpp", "shims\registry.cpp", "shims\xmem.cpp", "shims\d3d12_xs.cpp", "shims\d3d12_xs_device.cpp", "shims\d3d12_xs_rootsig.cpp" | ForEach-Object { "`"$src\$_`"" }
     $opt = if ($Debug) { "/Od /MDd" } else { "/O2 /MD" }
+    $vkDir = if ($env:VULKAN_SDK) { "$env:VULKAN_SDK" } elseif (Test-Path "$env:LOCALAPPDATA\VulkanSDK") { "$env:LOCALAPPDATA\VulkanSDK" } else { "" }
+    $vkInc = if ($vkDir) { if (Test-Path "$vkDir\Include") { "$vkDir\Include" } else { "$vkDir\include" } } else { "" }
+    $vkLines = if ($vkInc) {
+        @"
+if exist "$out\generated\d3d12_stubs.h" (
+    cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /c "$src\shims\d3d12_com.cpp" /I "$out\generated" /I "$vkInc" /Fo:"$out\d3d12_com.obj" || exit /b 1
+    cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /c "$src\shims\d3d12_vulkan_device.cpp" /I "$out\generated" /I "$vkInc" /Fo:"$out\d3d12_vulkan_device.obj" || exit /b 1
+    cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" /I "$src\src" /I "$out\generated" /I "$vkInc" "$src\test\d3d12_com_test.cpp" "$out\d3d12_com.obj" "$out\d3d12_vulkan_device.obj" /Fe:d3d12_com_test.exe /link /OPT:NOREF || exit /b 1
+    cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$src\shims" /I "$src\src" /I "$out\generated" /I "$vkInc" "$src\test\d3d12_vulkan_device_test.cpp" "$src\shims\d3d12_xs_device.cpp" "$out\d3d12_com.obj" "$out\d3d12_vulkan_device.obj" /Fe:d3d12_vulkan_device_test.exe /link /OPT:NOREF || exit /b 1
+)
+cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "$vkInc" "$src\test\vk_pipeline_check.cpp" /Fe:vk_pipeline_check.exe || exit /b 1
+"@
+    } else { "" }
+
     $body = @"
 cd /d "$out" || exit /b 1
 cl /nologo /std:c++20 /EHsc /W4 /permissive- /utf-8 /Zi $opt /MP$jobs /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE $($files -join ' ') /Fe:gta6rt.exe /link /OPT:NOREF psapi.lib || exit /b 1
@@ -41,6 +55,7 @@ if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNO
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\gfx10_descriptors_test.cpp" /Fe:gfx10_descriptors_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_bindless_test.cpp" /Fe:vk_bindless_test.exe || exit /b 1
 if defined VULKAN_SDK cl /nologo /std:c++20 /EHsc /O2 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I "%VULKAN_SDK%\Include" /I "$src\src" "$src\test\vk_descriptor_bench.cpp" /Fe:vk_descriptor_bench.exe || exit /b 1
+$vkLines
 "@
 }
 

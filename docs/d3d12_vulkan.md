@@ -1,9 +1,9 @@
 # Xbox D3D12 (`d3d12_xs`) to Vulkan
 
 **Status: in progress. A Vulkan-backed `ID3D12Device` (queues, allocators, command lists, fences, descriptor heaps,
-render-target and depth views, texture views and samplers, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
+render-target, depth, constant-buffer, shader-resource, unordered-access and sampler views, committed and reserved buffers, 2D textures and 3D texture transfers and color clears)
 runs behind the Xbox-ABI device proxy (section 3.2). `D3D12XboxCreateDevice` uses it when `LEONIDA_D3D12=vulkan` is
-set and the host PC device otherwise. Buffer views, root signatures, PSOs, draws and the swapchain are not
+set and the host PC device otherwise. Root signatures, PSOs, draws and the swapchain are not
 implemented.** This is the plan for replacing the console's
 `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on Vulkan, while producing
 exactly the shader-visible contract that `tools/rdna2spirv.py` already emits against (see

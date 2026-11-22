@@ -267,6 +267,22 @@ int main() {
         EXPECT(invalid_bundle_call([&](auto* b) { b->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO); }));
 
         list->Barrier(1, &group);
+
+        // State setters
+        const D3D12_VIEWPORT vp{0.0f, 0.0f, 800.0f, 600.0f, 0.0f, 1.0f};
+        const D3D12_RECT scissor{0, 0, 800, 600};
+        list->RSSetViewports(1, &vp);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const FLOAT blend[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+        list->OMSetBlendFactor(blend);
+        list->OMSetStencilRef(42);
+        auto* fake_heap = reinterpret_cast<ID3D12DescriptorHeap*>(std::uintptr_t{0x3000});
+        list->SetDescriptorHeaps(1, &fake_heap);
+        auto* fake_sig = reinterpret_cast<ID3D12RootSignature*>(std::uintptr_t{0x4000});
+        list->SetGraphicsRootSignature(fake_sig);
+        list->SetComputeRootSignature(fake_sig);
+
         list->DrawInstanced(3, 1, 0, 0);  // not implemented: reported once by its generated stub, recording continues
         EXPECT(list->Close() == S_OK);
         EXPECT(list->Close() == E_FAIL);  // already closed
@@ -298,6 +314,16 @@ int main() {
         EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         list->ClearDepthStencilView(dsv_handle, D3D12_CLEAR_FLAG_DEPTH, 2.0f, 0, 0, nullptr);
         EXPECT(list->Close() == E_INVALIDARG);
+
+        // Setting more than 16 viewports causes Close to report invalid argument.
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->RSSetViewports(17, &vp);
+        EXPECT(list->Close() == E_INVALIDARG);
+
+        // Reset clears invalid status and allows valid recording.
+        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        list->RSSetViewports(1, &vp);
+        EXPECT(SUCCEEDED(list->Close()));
     }
 
     EXPECT(d.run([&](VkCommandBuffer cb) {
