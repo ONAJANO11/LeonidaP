@@ -857,6 +857,24 @@ def clip_test(tools, spirv, name):
     return ""
 
 
+def texture_uav_test(tools, spv):
+    """The Windows D3D12 test compares every texel itself, through both Vulkan and WARP."""
+    if os.name != "nt":
+        return Skip("SKIP (needs the Windows D3D12 runtime)")
+    exe = os.path.join(tools, "d3d12_texture_uav_test" + EXE)
+    if not os.path.isfile(exe):
+        return f"missing {exe}"
+    code, out = run(exe, spv)
+    if code == UNSUPPORTED:
+        reason = next((line for line in out.splitlines() if line.startswith("SKIP:")), "unsupported device")
+        return Skip(reason)
+    return "" if code == 0 else failure(code, out, 8)
+
+
+IMAGE_STORE_CASES = {"cs_imgstore": (), "cs_imgload": ("load",),
+                     "cs_imgload_d16": ("load",), "cs_imgload_mip": ("load-mip",)}
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -891,7 +909,7 @@ def main():
     results.append(("ms_wave_info_s3", mesh_w64x_test(tools, spirv, "ms_wave_info_s3")))
     with tempfile.TemporaryDirectory(prefix="leonida-mesh-") as tmp:
         results.append(("ms_v5_workgroup", mesh_v5_test(tools, spirv, Path(tmp) / "groups.raw")))
-    for name, args in (("cs_imgstore", []), ("cs_imgload", ["load"]), ("cs_imgload_d16", ["load"])):
+    for name, args in IMAGE_STORE_CASES.items():
         code, out = run(os.path.join(tools, "vk_store_test" + EXE), os.path.join(spirv, name + ".spv"), *args)
         if code == UNSUPPORTED:   # vk_store_test: the device lacks a feature this test needs
             m = re.search(r"unsupported: .*", out)
@@ -899,6 +917,9 @@ def main():
             continue
         bad = re.findall(r"(\d+) bad", out)
         results.append((name, "" if code == 0 and len(bad) == 3 and set(bad) == {"0"} else failure(code, out, 3)))
+    texture_uav_spv = os.path.join(spirv, "cs_texture_uav.spv")
+    if os.path.isfile(texture_uav_spv):
+        results.append(("cs_texture_uav", texture_uav_test(tools, texture_uav_spv)))
     for name in CLIP_TESTS:
         results.append((name, clip_test(tools, spirv, name)))
     for name in PIXEL_TESTS:

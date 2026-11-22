@@ -402,7 +402,8 @@ What is implemented (all of it testable without the game):
 
 Descriptors and the bindless set (milestone M2, without the pipelines that will bind the set), from the shader's
 side inwards:
-- **`runtime/src/vulkan_bindless.h`**: set 0 includes the twenty bindings the translator declares, and
+- **`runtime/src/vulkan_bindless.h`**: set 0 includes the single-sample bindings the translator declares, optional
+  multisample bindings, and
   `DescriptorTable` (`runtime/src/descriptor_table.h`, section 5.1) behind binding 2. One set for the device.
   The translator declares every array as a runtime array, so the counts are the runtime's choice. Details:
   - The device sizes the arrays once, when it creates the set. It does not recreate the set, because pipeline
@@ -424,11 +425,12 @@ side inwards:
     and 4000 samplers) the set has 65536 2D images, 3936 samplers and 4096 storage indices in 2D: 93793
     descriptors, 3-6 MiB at 32-64 bytes a descriptor. The device prints the counts it chose, and
     `bindless_sizing_test` checks the rules on synthetic limits.
-  - An image has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS or 2DMS array), shared by the
+  - An image view has one index in its dimension (2D, 2D array, 3D, 1D, 2DMS, 2DMS array or 1D array), shared by the
     bindings for that dimension. The runtime adds sampled-image bindings in pairs for 2DMS and 2DMS array:
     20/21 for floating-point and normalized color, 22/23 for unsigned integers, and 24/25 for signed integers.
     The runtime enables pairs that fit the device's descriptor limits and have a multisampled zero fallback
     of the matching numeric class. A missed key reads zero at texel (0, 0), layer 0, sample 0.
+    The 1D-array dimension uses storage bindings 26–28 and has no sampled binding.
   - The storage arrays are shorter (`BindlessSet::storage_capacity`). Each array holds at most as many images
     as its dimension, and the 2D r32ui array is the same size as the other 2D storage arrays. So an image with a
     storage view gets an index the storage arrays hold, and a read-only one goes above where there is room.
@@ -449,8 +451,8 @@ side inwards:
   written as zero.
 - **Device**: `CreateShaderResourceView` and `CreateUnorderedAccessView` of textures write a T# into the slot,
   `CreateSampler` an S#; each then makes sure set 0 has the view or sampler and the table has the key. Details:
-  - The key is the descriptor's bytes, so a copied descriptor needs nothing more, and an unordered-access view
-    and a shader-resource view of the same mip are one entry.
+  - The key is the descriptor's bytes, so a copied descriptor needs nothing more. An SRV and UAV with identical
+    bytes can share an entry; a partial 3D UAV carries a W-range tag and remains separate from the unsliced SRV.
   - A D3D12 comparison sampler with function NEVER and an ordinary sampler both encode zero in the hardware
     depth comparison field. The layer marks the NEVER comparison in S# word 3, bit 12 (unused with
     DERIV_ADJUST_EN clear) to give it a separate lookup key and a comparison-enabled Vulkan sampler.
@@ -485,9 +487,8 @@ volume. A nonzero `ResourceMinLODClamp` on a 3D view is logged and leaves a null
 
 Known gaps in the descriptor path: buffer shader-resource and unordered-access views and constant-buffer views
 (the V# a shader would load for them; the structure is in `gfx10_descriptors.h`, the views are not written);
-views of 1D textures, 3D storage views and typeless volume SRVs, multisampled depth/stencil and typeless color SRVs, and shader-translator lowering
-for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
-views of 1D and multisampled textures, 3D storage views and other typeless volume formats; depth-plane views (`R24_UNORM_X8_TYPELESS`,
+shader-resource views of 1D textures, other typeless volume formats, and multisampled depth/stencil and typeless
+color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as
 `D32_SFLOAT_S8_UINT`), each on its own family only (the other family's is a null
@@ -501,9 +502,7 @@ which `rt::d3d12::register_samplers` registers without a heap slot but which not
 pipeline creation comes with the shader index, #291);
 custom border colours, minimum/maximum filters, and anisotropy or mirror-once addressing without the Vulkan
 feature, each logged and approximated; the storage arrays hold 255 images a dimension at the default counts, more
-where the device has room (4095 2D and 1023 2D-array on an RTX 5070); nothing writes through a
-storage view in a D3D12-level test yet (`vk_bindless_test` goes through the storage bindings at the Vulkan
-level). The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
+where the device has room. The set is flushed at every `ExecuteCommandLists`; a flush that erases keys or moves the table to a larger
 buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle and then frees the retired table
 buffers, so no running lookup misses (D3D-76). That wait stalls every queue, which is correct but slow if the game
 destroys textures every frame; a per-queue wait is open.
@@ -675,6 +674,12 @@ and any validation error fails them.
     this one in Vulkan and binds the device's set. It reads the texture through the view's own slot and through
     a copy of it, and gets the fallback from a slot of bytes no view was made for and, after the texture is
     destroyed, from the view's own bytes.
+- `d3d12_texture_uav_test` (D3D-78): creates 1D, 1D-array, 3D and 2D control UAVs through the D3D12 device,
+  checks rejected descriptors, copies descriptors between slots, and dispatches a translated hand-written
+  shader from a Vulkan compute pipeline on the actual set 0, not through D3D12 `Dispatch`. It reads back every
+  texel; the UINT read/modify/write cases (not atomics) also run on Windows WARP. The D3D12 command-list path
+  is used separately to flush the set and to test clears.
+  The tests dispatch past the selected array/W range, so writes to an adjacent layer or slice fail the check.
   - Capacity: 5000 distinct SRVs of that texture and one more, and 2100 distinct wrapping samplers in two
     2048-slot heaps. The last view through the last sampler reads the texture one tile to the right. With the
     sizes of before, both were past their arrays ("array is full") and the shader read the fallback.
@@ -820,6 +825,26 @@ The layer's descriptor model:
   If the logical device lacks the feature, the runtime logs the unsupported view
   and its descriptor resolves to the fallback. A clamp at or below the first mip needs no extension. Above the
   last mip, the view retains its dimensions and maps sampled channels to zero while preserving constant channels.
+- D3D-78: a `Texture1DArray` UAV gets a 1D-array view with the requested array subrange and storage bindings
+  26–28 (float, UINT, SINT); `ArraySize = UINT_MAX` selects the remaining layers. A non-array `Texture1D`
+  view of a 1D array selects layer 0, as checked on native D3D12. A `Texture3D` UAV gets a 3D view with a single mip
+  and Vulkan array range `{0, 1}`.
+  A partial W range requires `VK_EXT_image_sliced_view_of_3d` and `robustImageAccess` on the logical device:
+  `VkImageViewSlicedCreateInfoEXT` rebases storage-image Z to `FirstWSlice` and limits it to `WSize` (UINT_MAX
+   means the remaining mip depth). It does not slice the sampled view. The generated T# tags the W range for
+   whole-mip and partial UAVs, distinguishes them from SRVs in the hash table, and rebases all typed sampled fetches;
+   see the contract in `docs/design.md`.
+  Without those features a partial W view is logged and left null, not made writable across the whole mip.
+   These new dimensions require storage-write-without-format support for the typed view format and, for the
+   storage-only 1D array bindings, storage-read-without-format as well. Vulkan 1.3 permits the
+  SPIR-V capabilities even when the legacy `shaderStorageImage{Read,Write}WithoutFormat` bits are not enabled;
+  the caller-owned device test leaves both bits off and checks the per-format path.
+  `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
+  cannot target a slice interval or guarantee preserving the reinterpreted bits.
+  Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
+  A separate native D3D12 probe on the RTX 4090 and UHD 770 clipped typed writes to the view's W range.
+  WARP 10.0.26100.9818 rebased the view but did not clip writes past a finite `WSize` in that probe. The
+  regression compares in-range writes with WARP and checks preservation of out-of-range slices independently.
 - Set 0 is a fixed bindless layout, sized once when the device creates it. The defaults are 4096 sampled 2D
   images, 1024 samplers, 1024 2D-array images, 256 1D, 256 3D and 256 per storage dimension/class. The 2D, sampler and
   storage arrays grow to what the device's limits allow, up to 65536, 4096 and 4096 (see `vulkan_bindless.h`

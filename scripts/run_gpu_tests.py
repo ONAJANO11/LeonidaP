@@ -25,11 +25,12 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import mc_command  # noqa: E402
 sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
-from check import Skip, clip_test, fmt_1010102_test
+from check import IMAGE_STORE_CASES, Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
-                   pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
+                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS,
+                   mesh_v5_test, not_found_message, pick_build_dir, start_failure, texture_gradient_a16_test,
+                   texture_mip_test, texture_uav_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -855,12 +856,16 @@ def run_suite(a, work: str) -> int:
                 ok, detail = judge_cs_dump(rc, msg, want, wave64=wave64, partial=partial, emulated=emulated,
                                            hexwords=name in ("cs_store", "cs_smem_soffset_imm", "cs_w32_lds_u8_d16"))
             results.append((name, ok, detail))
-        elif name == "cs_imgstore":
-            rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
-        elif name in ("cs_imgload", "cs_imgload_d16"):
-            rc, msg = run_cmd([vk_store, spv, "load"])
-            results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name in IMAGE_STORE_CASES:
+            rc, msg = run_cmd([vk_store, spv, *IMAGE_STORE_CASES[name]])
+            if rc == UNSUPPORTED:
+                results.append((name, None, unsupported_skip(msg)))
+            else:
+                results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
+        elif name == "cs_texture_uav":
+            problem = texture_uav_test(a.build, spv)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "D3D12/Vulkan storage-image readback matched"))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem

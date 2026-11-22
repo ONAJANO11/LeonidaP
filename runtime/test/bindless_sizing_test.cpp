@@ -84,6 +84,13 @@ bool storage_consistent(const BindlessFeatures& f) {
             f.counts[bindless::r32ui_binding(dimension)] != held)
             return false;
     }
+    // 1D arrays have no sampled capacity, but all three storage classes are always present.
+    const auto array = ImageDimension::dim_1d_array;
+    const auto held = storage(f, array);
+    for (std::uint32_t c = 0; c < 3; ++c) {
+        const auto binding = bindless::storage_binding(array, c);
+        if (!held || !bindless::binding_enabled(binding, f) || f.counts[binding] != held) return false;
+    }
     return true;
 }
 
@@ -112,12 +119,12 @@ int main() {
                         count(f, D::dim_2d), f.counts[bindless::sampler_binding], storage(f, D::dim_2d), totals(f).all);
     }
 
-    // At today's sizes exactly (5632 sampled images, 1024 samplers, 3584 storage images): today's set, no MS pairs.
+    // At today's sizes exactly (5632 sampled images, 1024 samplers, 4352 storage images): no MS pairs.
     {
         Device d = uniform(1048576, 1048576);
         d.v12.maxPerStageDescriptorUpdateAfterBindSampledImages = 5632;
         d.v12.maxPerStageDescriptorUpdateAfterBindSamplers = 1024;
-        d.v12.maxPerStageDescriptorUpdateAfterBindStorageImages = 3584;
+        d.v12.maxPerStageDescriptorUpdateAfterBindStorageImages = 4352;
         BindlessFeatures f = with_ms(true);
         EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
         EXPECT(count(f, D::dim_2d) == 4096 && f.counts[bindless::sampler_binding] == 1024 &&
@@ -125,6 +132,7 @@ int main() {
         for (std::uint32_t b = 0; b < bindless::first_ms_binding; ++b)
             if (bindless::bindings[b].type != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) EXPECT(f.counts[b] == defaults[b]);
         EXPECT(f.ms_samples == (std::array{VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT}));
+        EXPECT(totals(f).storage == 4352 && storage(f, D::dim_1d_array) == 256);
         EXPECT(storage_consistent(f));
     }
 

@@ -361,6 +361,14 @@ struct DeviceState {
         return S_OK;
     }
 
+    VkFormatFeatureFlags2 optimal_features(VkFormat format) const {
+        if (!format_properties2) return 0;
+        VkFormatProperties3 features{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &features};
+        format_properties2(info.physical, format, &properties);
+        return features.optimalTilingFeatures;
+    }
+
     // D3D12_OPTIONS1's wave facts, from the physical device: which subgroup operations exist and what wave sizes it
     // can run. Zeros and false when the device cannot be asked, which the query then reports as unsupported.
     const SubgroupFacts& subgroup_facts() {
@@ -509,19 +517,27 @@ struct DeviceState {
         const std::uint64_t slot_handle =
             (static_cast<std::uint64_t>(entry.dimension) << 32) | static_cast<std::uint64_t>(entry.index);
         context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, slot_handle);
-        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
+        if (entry.sampled) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.sampled);
         if (entry.storage) context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image_view, entry.storage);
     }
+
+    struct VolumeSlices {
+        UINT first = 0;
+        UINT count = 0;  // 0: no restriction (ordinary view of the whole mip)
+    };
 
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
-                    VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool r9g9b9e5_as_r32_uint = false) {
+                    VkFormat view_format, VkFormat storage_format, VkImageAspectFlags aspects,
+                    bool sampled, bool storage, VolumeSlices slices) {
         namespace g = leonida::gfx10;
         std::lock_guard lock(descriptor_mutex);
-        if (!bindless) return false;
+        if (!bindless) {
+            if (storage) log_once("unordered-access view needs the Vulkan bindless set; type", int(image.type));
+            return false;
+        }
         const auto existing = image_entries.find(words);
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
 
@@ -532,6 +548,7 @@ struct DeviceState {
         case g::ImageType::cube: dimension = leonida::ImageDimension::dim_2d_array; break;
         case g::ImageType::image_3d: dimension = leonida::ImageDimension::dim_3d; break;
         case g::ImageType::image_1d: dimension = leonida::ImageDimension::dim_1d; break;
+        case g::ImageType::image_1d_array: dimension = leonida::ImageDimension::dim_1d_array; break;
         case g::ImageType::image_2d_msaa: dimension = leonida::ImageDimension::dim_2d_ms; break;
         case g::ImageType::image_2d_msaa_array: dimension = leonida::ImageDimension::dim_2d_ms_array; break;
         default:
@@ -542,27 +559,19 @@ struct DeviceState {
         // views it in the image's own format with the stencil aspect, and returns the value in R, as a T# whose
         // format is 8_UINT reads it from X.
         const bool stencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && image.format == g::stencil_format;
-        const VkFormat logical_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : image_format;
-        const VkFormat view_format = stencil ? image_format : g::vulkan_view_format(logical_format, image.format);
-        if (view_format == VK_FORMAT_UNDEFINED) {
-            log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
-            return false;
-        }
         const unsigned sampled_class = g::multisampled(image.type) ? numeric_class(view_format) : 0;
         if (g::multisampled(image.type) && !bindless->supports_ms_class(sampled_class)) {
             log_once("set 0 has no multisample binding for this numeric class:", int(sampled_class));
             return false;
         }
         auto& vk = context->vk;
+        VkImageViewUsageCreateInfo view_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        view_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
         VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view_info.pNext = &view_usage;
         view_info.image = vk_image;
         view_info.viewType = g::vulkan_view_type(image.type);
         view_info.format = view_format;
-        VkImageViewUsageCreateInfo sampled_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        if (r9g9b9e5_as_r32_uint) {
-            sampled_usage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
-            view_info.pNext = &sampled_usage;
-        }
         auto swizzle = image.swizzle;
         VkImageViewMinLodCreateInfoEXT clamp{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         const bool color_2d = (image.type == g::ImageType::image_2d || image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube) &&
@@ -579,8 +588,7 @@ struct DeviceState {
                     log_once("2D SRV requires VK_EXT_image_view_min_lod; first mip", int(image.first_mip));
                     return false;
                 }
-                clamp.pNext = view_info.pNext;
-                view_info.pNext = &clamp;
+                view_usage.pNext = &clamp;
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, view_format);
@@ -591,20 +599,31 @@ struct DeviceState {
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
-        if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
+        if (sampled) {
+            const VkResult result = vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled);
+            if (result != VK_SUCCESS) {
+                log_once("sampled image view creation failed:", result);
+                return false;
+            }
+        }
         leonida::StorageViews views{};
         if (storage) {
             VkImageViewCreateInfo storage_info = view_info;
             storage_info.components = {};
+            storage_info.format = storage_format;
             VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-            const VkFormat storage_format = r9g9b9e5_as_r32_uint ? VK_FORMAT_R32_UINT : view_format;
-            if (r9g9b9e5_as_r32_uint) {
-                storage_info.format = storage_format;
-                storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
-                storage_info.pNext = &storage_usage;
+            storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+            VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
+            if (slices.count) {
+                sliced.sliceOffset = slices.first;
+                sliced.sliceCount = slices.count;
+                storage_usage.pNext = &sliced;
             }
-            if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
-                vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+            storage_info.pNext = &storage_usage;
+            const VkResult result = vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage);
+            if (result != VK_SUCCESS) {
+                log_once("storage image view creation failed:", result);
+                if (entry.sampled) vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
                 return false;
             }
             const int numeric = numeric_class(storage_format);
@@ -615,7 +634,7 @@ struct DeviceState {
         entry.index = bindless->add_image(dimension, entry.sampled, VK_IMAGE_LAYOUT_GENERAL, views, sampled_class);
         if (!entry.index) {
             log_once("a bindless image array is full; dimension", int(dimension));
-            vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
+            if (entry.sampled) vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
             return false;
         }
@@ -866,7 +885,15 @@ public:
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT depth = volume ? desc_.DepthOrArraySize : 1;
         const bool one_d = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
-        if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
+        const UINT16 mips = full_mips(desc_.Width, desc_.Height, depth);
+        if (desc_.MipLevels == 0) desc_.MipLevels = mips;
+        if ((volume || one_d) && (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+            const UINT extent_limit = volume ? D3D12_REQ_TEXTURE3D_U_V_OR_W_DIMENSION : D3D12_REQ_TEXTURE1D_U_DIMENSION;
+            const UINT slice_limit = volume ? extent_limit : D3D12_REQ_TEXTURE1D_ARRAY_AXIS_DIMENSION;
+            if (!desc_.Width || desc_.Width > extent_limit || !desc_.Height || desc_.Height > extent_limit ||
+                !desc_.DepthOrArraySize || desc_.DepthOrArraySize > slice_limit || desc_.MipLevels > mips)
+                return E_INVALIDARG;
+        }
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
         VkImageCreateInfo& info = create.info;
         const std::uint32_t samples = info.samples;
@@ -935,6 +962,7 @@ public:
         }
         return desc;
     }
+    bool belongs_to(const DeviceState& device) const { return &device_ == &device; }
 
     // A reserved resource is a committed one underneath (docs/d3d12_vulkan.md section 4.2); it reports the layout it
     // was created with and has no heap of its own.
@@ -1245,16 +1273,39 @@ struct TextureView {
     float min_lod = 0.0f;
 };
 
+// The existing mutable Vulkan formats come from these DXGI typeless families. A typed resource cannot be
+// reinterpreted here (relaxed format casts are not implemented); equal texel sizes alone don't make a cast legal.
+bool uav_format_compatible(DXGI_FORMAT resource, DXGI_FORMAT view) {
+    if (resource == view) return true;
+    switch (resource) {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return view >= DXGI_FORMAT_R32G32B32A32_FLOAT && view <= DXGI_FORMAT_R32G32B32A32_SINT;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return view >= DXGI_FORMAT_R16G16B16A16_FLOAT && view <= DXGI_FORMAT_R16G16B16A16_SINT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return view >= DXGI_FORMAT_R32G32_FLOAT && view <= DXGI_FORMAT_R32G32_SINT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return view == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                                                 view == DXGI_FORMAT_R10G10B10A2_UINT;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return view >= DXGI_FORMAT_R8G8B8A8_UNORM && view <= DXGI_FORMAT_R8G8B8A8_SINT;
+    case DXGI_FORMAT_R16G16_TYPELESS: return view >= DXGI_FORMAT_R16G16_FLOAT && view <= DXGI_FORMAT_R16G16_SINT;
+    case DXGI_FORMAT_R8G8_TYPELESS: return view >= DXGI_FORMAT_R8G8_UNORM && view <= DXGI_FORMAT_R8G8_SINT;
+    case DXGI_FORMAT_R32_TYPELESS: return view >= DXGI_FORMAT_R32_FLOAT && view <= DXGI_FORMAT_R32_SINT;
+    case DXGI_FORMAT_R16_TYPELESS: return view >= DXGI_FORMAT_R16_FLOAT && view <= DXGI_FORMAT_R16_SINT;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return view == DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return false;
+    }
+}
+
 // The T# of a view: what the shader gets to know about it, in the structure the console's shaders read.
 // False (with a log) for a view set 0 cannot show yet.
-bool image_descriptor(const Resource& resource, const TextureView& view, leonida::gfx10::Image& out) {
+bool image_descriptor(const Resource& resource, const TextureView& view, bool storage, leonida::gfx10::Image& out,
+                      VkFormat& view_format, DeviceState::VolumeSlices& slices) {
     namespace g = leonida::gfx10;
     const D3D12_RESOURCE_DESC& desc = resource.desc();
     // Plane 1 of a depth-stencil texture is its stencil, viewed as X24_TYPELESS_G8_UINT (D24S8) or
     // X32_TYPELESS_G8X24_UINT (D32S8): eight unsigned bits in G, as D3D12 returns them. The T# is 8_UINT, the
     // format of the console's separate stencil surface, and bind_image views the stencil aspect for it.
     const bool stencil = view.plane == 1;
-    if (view.plane > 1 || (stencil && !(resource.aspects() & VK_IMAGE_ASPECT_STENCIL_BIT))) {
+    if (view.plane > 1 || (stencil && (storage || !(resource.aspects() & VK_IMAGE_ASPECT_STENCIL_BIT)))) {
         log_once("no such plane in this texture; plane", int(view.plane));
         return false;
     }
@@ -1269,14 +1320,17 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("a stencil-plane view needs its texture family's stencil view format; format", int(view.format));
         return false;
     }
-    const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const bool volume = view.type == g::ImageType::image_3d;
+    const bool one_d = view.type == g::ImageType::image_1d || view.type == g::ImageType::image_1d_array;
     const bool msaa = g::multisampled(view.type);
-    if ((volume != (view.type == g::ImageType::image_3d)) ||
-        (!volume && desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) || msaa != (desc.SampleDesc.Count > 1)) {
+    const auto dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D :
+                           one_d ? D3D12_RESOURCE_DIMENSION_TEXTURE1D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    if (desc.Dimension != dimension || (msaa ? desc.SampleDesc.Count <= 1 : desc.SampleDesc.Count != 1) ||
+        (storage ? msaa : one_d)) {
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
-    if (volume && view.min_lod != 0) {
+    if (volume && !storage && view.min_lod != 0) {
         log_once("volume SRV requires a zero ResourceMinLODClamp; format", int(desc.Format));
         return false;
     }
@@ -1297,7 +1351,7 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const VkFormat resource_format =
         resource.r9g9b9e5_as_r32_uint() ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : resource.format();
     VkFormat named = resource_format;
-    if (volume) {
+    if (volume && !storage) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
             ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
               (view.format == DXGI_FORMAT_R8G8B8A8_UNORM || view.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
@@ -1318,7 +1372,16 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     const bool depth_plane = ((view.format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS && d24_family) ||
                               (view.format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS && d32s8_family)) &&
                              (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT);
-    if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane) {
+    const bool new_uav = storage && (volume || one_d);
+    if (new_uav) {
+        const DXGI_FORMAT dxgi = view.format == DXGI_FORMAT_UNKNOWN ? desc.Format : view.format;
+        const Format format = texture_storage_format(dxgi, false);
+        if (format.typeless || format.aspects != VK_IMAGE_ASPECT_COLOR_BIT || !uav_format_compatible(desc.Format, dxgi)) {
+            log_once("unordered-access view format is not compatible with the resource:", dxgi);
+            return false;
+        }
+        named = format.format;
+    } else if (view.format != DXGI_FORMAT_UNKNOWN && !stencil && !depth_plane) {
         if ((view.format == DXGI_FORMAT_A8_UNORM) != (desc.Format == DXGI_FORMAT_A8_UNORM)) {
             log_once("incompatible typed A8 view format:", int(view.format));
             return false;
@@ -1330,19 +1393,30 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         named = texture_storage_format(view.format, false).format;
     }
     const std::uint32_t code = stencil ? g::stencil_format : g::format_from_vulkan(named);
-    const VkFormat view_format = stencil ? resource.format()
-                                 : code  ? g::vulkan_view_format(resource_format, code)
-                                         : VK_FORMAT_UNDEFINED;
+    view_format = stencil ? resource.format() : !code ? VK_FORMAT_UNDEFINED :
+                  new_uav ? named : g::vulkan_view_format(resource_format, code);
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
         return false;
     }
-    const UINT layers = volume ? 1 : desc.DepthOrArraySize;
-    if (view.first_mip >= desc.MipLevels || view.first_layer >= layers) {
+    if (view.first_mip >= desc.MipLevels) {
+        log_once("view starts past the texture's mips; first mip", int(view.first_mip));
+        return false;
+    }
+    // SRVs address an entire volume; only a UAV descriptor can specify a W range within its mip.
+    const UINT layers = volume ? (storage ? std::max(1u, UINT(desc.DepthOrArraySize) >> view.first_mip) : 1u)
+                               : desc.DepthOrArraySize;
+    if (view.first_layer >= layers) {
         log_once("view starts past the texture's mips or layers; first mip", int(view.first_mip));
         return false;
     }
-    if (msaa && view.layer_count != UINT_MAX && view.layer_count > UINT(desc.DepthOrArraySize) - view.first_layer) {
+    const UINT remaining = layers - view.first_layer;
+    const UINT layer_count = view.layer_count == ~0u ? remaining : view.layer_count;
+    if (new_uav && (!layer_count || layer_count > remaining)) {
+        log_once("unordered-access view slice count is outside the selected mip:", int(view.layer_count));
+        return false;
+    }
+    if (msaa && layer_count > remaining) {
         log_once("multisample shader view ends past the texture array; layers", int(view.layer_count));
         return false;
     }
@@ -1356,8 +1430,13 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     out.samples = desc.SampleDesc.Count;
     out.first_mip = view.first_mip;
     out.mip_count = std::min<UINT>(view.mip_count, desc.MipLevels - view.first_mip);
-    out.first_layer = view.first_layer;
-    out.layer_count = std::min<UINT>(view.layer_count, layers - view.first_layer);
+    if (volume) {
+        if (storage && (view.first_layer != 0 || layer_count != layers))
+            slices = {view.first_layer, layer_count};
+    } else {
+        out.first_layer = view.first_layer;
+        out.layer_count = std::min(layer_count, remaining);
+    }
     if (view.type == g::ImageType::cube) out.layer_count -= out.layer_count % 6;  // whole cubes
     out.resource_mips = desc.MipLevels;
     out.min_lod = view.min_lod;
@@ -1531,6 +1610,8 @@ public:
             info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
         state_.format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties"));
+        state_.format_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties2"));
         state_.image_format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(
             info.get_instance_proc(info.instance, "vkGetPhysicalDeviceImageFormatProperties"));
         state_.image_format_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
@@ -2275,7 +2356,7 @@ public:
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
-        if (!r) {
+        if (!r || !r->belongs_to(state_)) {
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
             return;
         }
@@ -2287,22 +2368,46 @@ public:
         }
         TextureView view{};
         view.mip_count = 1;
+        namespace g = leonida::gfx10;
         if (!desc) {
-            if (r->desc().DepthOrArraySize > 1) view.type = leonida::gfx10::ImageType::image_2d_array;
+            const auto& shape = r->desc();
+            if (shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                view.type = g::ImageType::image_3d;
+            else if (shape.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D)
+                view.type = shape.DepthOrArraySize > 1 ? g::ImageType::image_1d_array : g::ImageType::image_1d;
+            else if (shape.DepthOrArraySize > 1)
+                view.type = g::ImageType::image_2d_array;
         } else {
             view.format = desc->Format;
             switch (desc->ViewDimension) {
+            case D3D12_UAV_DIMENSION_TEXTURE1D:
+                view.type = g::ImageType::image_1d;
+                view.first_mip = desc->Texture1D.MipSlice;
+                view.layer_count = 1;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE1DARRAY:
+                view.type = g::ImageType::image_1d_array;
+                view.first_mip = desc->Texture1DArray.MipSlice;
+                view.first_layer = desc->Texture1DArray.FirstArraySlice;
+                view.layer_count = desc->Texture1DArray.ArraySize;
+                break;
             case D3D12_UAV_DIMENSION_TEXTURE2D:
                 view.first_mip = desc->Texture2D.MipSlice;
                 view.layer_count = 1;
                 view.plane = desc->Texture2D.PlaneSlice;
                 break;
             case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
-                view.type = leonida::gfx10::ImageType::image_2d_array;
+                view.type = g::ImageType::image_2d_array;
                 view.first_mip = desc->Texture2DArray.MipSlice;
                 view.first_layer = desc->Texture2DArray.FirstArraySlice;
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                view.type = g::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MipSlice;
+                view.first_layer = desc->Texture3D.FirstWSlice;
+                view.layer_count = desc->Texture3D.WSize;
                 break;
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
@@ -3017,7 +3122,7 @@ public:
             }
             if (optimal & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
                 s1 |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
-                // A D3D12 multisample resolve needs the same image usages as texture_create_info(): colour
+                // A D3D12 multisample resolve needs the same image usages as TextureCreateInfo: colour
                 // attachment plus transfer source/destination (and the ordinary sampled usage).
                 VkImageFormatProperties image_properties{};
                 const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -3263,12 +3368,62 @@ private:
     // shown leaves the slot a null descriptor.
     void write_image_descriptor(const Resource& resource, const TextureView& view,
                                 D3D12_CPU_DESCRIPTOR_HANDLE destination, bool storage) {
-        leonida::gfx10::Image image{};
-        if (!image_descriptor(resource, view, image)) return;
-        const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
-        const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
-                                                  resource.aspects(), storage, resource.r9g9b9e5_as_r32_uint());
-        if (leonida::gfx10::multisampled(image.type) && !registered) return;
+        namespace g = leonida::gfx10;
+        g::Image image{};
+        VkFormat view_format{};
+        DeviceState::VolumeSlices slices{};
+        if (!image_descriptor(resource, view, storage, image, view_format, slices)) return;
+        const bool sampled = view.type != g::ImageType::image_1d_array &&
+                             !(resource.desc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+        const bool new_uav = storage && (view.type == g::ImageType::image_3d || view.type == g::ImageType::image_1d ||
+                                         view.type == g::ImageType::image_1d_array);
+        const bool packed_storage = storage && resource.r9g9b9e5_as_r32_uint();
+        const VkFormat storage_format = packed_storage ? VK_FORMAT_R32_UINT : view_format;
+        if (storage) {
+            const auto features = state_.optimal_features(storage_format);
+            if (!(features & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT)) {
+                log_once("texture view format does not support storage images:", storage_format);
+                return;
+            }
+            if (new_uav) {
+                const bool storage_read = view.type == g::ImageType::image_1d_array;
+                if (sampled && !(state_.optimal_features(view_format) & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)) {
+                    log_once("texture view format does not support sampled access:", view_format);
+                    return;
+                }
+                // Vulkan 1.3 allows formatless access based on the actual view's features, even on caller-owned
+                // devices. Packed RGB9E5 only exposes formatted raw R32_UINT storage, so it does not need these.
+                if (!packed_storage && (!(features & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) ||
+                    (storage_read && !(features & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT)))) {
+                    log_once("texture view format lacks the required formatless storage image access:", storage_format);
+                    return;
+                }
+            }
+        }
+        if (slices.count && !(state_.info.sliced_3d_uav && state_.info.robust_image_access)) {
+            log_once("partial Texture3D UAV requires imageSlicedViewOf3D and robustImageAccess; mip", view.first_mip);
+            return;
+        }
+        g::ImageWords words = g::encode(image);
+        if (storage && view.type == g::ImageType::image_3d) {
+            words[4] |= g::volume_uav_flag;
+            const UINT mip_depth = std::max(1u, image.depth >> image.first_mip);
+            words[7] = g::volume_uav_word(slices.first, slices.count ? slices.count : mip_depth);
+        }
+        if (new_uav && packed_storage) {
+            words[4] |= g::volume_uav_flag;
+            if (view.type != g::ImageType::image_3d) words[7] = g::volume_uav_word(0, 1);
+            words[7] |= g::packed_uav_flag;
+            log_once("packed RGB9E5 UAV: translated storage operations are not implemented; type", int(view.type));
+        }
+        if (new_uav && !state_.info.robust_image_access) {
+            log_once("shader access to 1D and 3D UAVs requires robustImageAccess; type", int(view.type));
+        } else if (!state_.bind_image(words, image, resource.image(), view_format, storage_format, resource.aspects(),
+                                      sampled, storage, slices) && g::multisampled(image.type)) {
+            // Unlike a CPU UAV, an MS SRV is usable only once its class and index are in set 0.
+            return;
+        }
+        // The CPU UAV used by ClearUnorderedAccessView is independent of set 0.
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
     }
 
@@ -3396,8 +3551,6 @@ private:
         const VkDevice dev = state_.info.device;
         const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
             state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceProperties2"));
-        state_.format_properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
-            state_.info.get_instance_proc(state_.info.instance, "vkGetPhysicalDeviceFormatProperties2"));
         const auto to_image = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(get_device(dev, "vkCopyMemoryToImageEXT"));
         const auto to_memory = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(get_device(dev, "vkCopyImageToMemoryEXT"));
         const auto transition =
@@ -3726,6 +3879,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     bool chosen_bc = false;
     VkPhysicalDeviceFeatures chosen_features{};
     VkPhysicalDeviceVulkan12Features chosen12{};
+    bool chosen_robust_image_access = false;
     for (VkPhysicalDevice candidate : physicals) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(candidate, &props);
@@ -3751,6 +3905,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
                 chosen_bc = bc;
                 chosen_features = features.features;
                 chosen12 = f12;
+                chosen_robust_image_access = f13.robustImageAccess == VK_TRUE;
             }
             break;
         }
@@ -3823,6 +3978,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     VkPhysicalDeviceVulkan13Features enable13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, ext_chain};
     enable13.dynamicRendering = VK_TRUE;
     enable13.synchronization2 = VK_TRUE;
+    info.robust_image_access = chosen_robust_image_access;
+    enable13.robustImageAccess = info.robust_image_access;
     VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
     enable12.timelineSemaphore = VK_TRUE;
     enable12.separateDepthStencilLayouts = VK_TRUE;
@@ -3858,6 +4015,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     enable.textureCompressionBC = chosen_bc ? VK_TRUE : VK_FALSE;  // the game's textures are BC1-7
     enable.shaderSampledImageArrayDynamicIndexing = info.bindless;
     enable.shaderStorageImageArrayDynamicIndexing = info.bindless;
+    enable.shaderStorageImageReadWithoutFormat = chosen_features.shaderStorageImageReadWithoutFormat;
+    enable.shaderStorageImageWriteWithoutFormat = chosen_features.shaderStorageImageWriteWithoutFormat;
     enable.samplerAnisotropy = info.sampler_anisotropy;
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
@@ -3900,6 +4059,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
 
+    const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
+    VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+    if (chosen_robust_image_access && std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) {
+            return std::strcmp(e.extensionName, sliced_name) == 0;
+        })) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.sliced_3d_uav = sliced.imageSlicedViewOf3D == VK_TRUE;
+        if (info.sliced_3d_uav) {
+            sliced.pNext = enable13.pNext;
+            enable13.pNext = &sliced;
+        }
+    }
+
     // GetClockCalibration reads both clocks at once with calibrated timestamps (KHR, or the older EXT).
     const char* calibrated = nullptr;
     for (const char* name :
@@ -3918,6 +4092,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.sliced_3d_uav) device_extensions.push_back(sliced_name);
     if (calibrated) device_extensions.push_back(calibrated);
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);

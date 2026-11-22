@@ -97,6 +97,10 @@ struct VulkanDeviceInfo {
     // Optional VK_KHR_acceleration_structure + VK_KHR_deferred_host_operations + VK_KHR_ray_query are enabled:
     // GetRaytracingAccelerationStructurePrebuildInfo and BuildRaytracingAccelerationStructure (BLAS + TLAS) work.
     bool ray_tracing = false;
+    // robustImageAccess is enabled on `device`, so typed 1D-family and 3D UAV loads are range checked.
+    bool robust_image_access = false;
+    // VK_EXT_image_sliced_view_of_3d (imageSlicedViewOf3D) is also enabled for partial 3D UAVs.
+    bool sliced_3d_uav = false;
 };
 
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive

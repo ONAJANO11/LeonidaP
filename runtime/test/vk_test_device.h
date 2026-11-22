@@ -66,6 +66,8 @@ public:
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled
     bool conditional_rendering = false;  // VK_EXT_conditional_rendering enabled, where available
     bool host_image_copy = false;  // VK_EXT_host_image_copy and hostImageCopy enabled
+    bool sliced_3d_uav = false;    // imageSlicedViewOf3D and robustImageAccess enabled
+    bool robust_image_access = false;
     bool occlusion_query_precise = false;    // occlusionQueryPrecise enabled
     bool pipeline_statistics_query = false;  // pipelineStatisticsQuery enabled
     bool request_debug_utils = false;  // set before create(): enable VK_EXT_debug_utils when the loader has it
@@ -112,9 +114,11 @@ public:
 
     unsigned validation_errors() const { return validation_error_count(); }
 
-    bool create() { return initialize() == DeviceStatus::ready; }
+    bool create(bool enable_sliced_3d_uav = false, bool enable_legacy_formatless_features = true) {
+        return initialize(enable_sliced_3d_uav, enable_legacy_formatless_features) == DeviceStatus::ready;
+    }
 
-    DeviceStatus initialize() {
+    DeviceStatus initialize(bool enable_sliced_3d_uav = false, bool enable_legacy_formatless_features = true) {
         const auto failure = [](const char* call, VkResult result) {
             std::fprintf(stderr, "%s failed (VkResult %d)\n", call, static_cast<int>(result));
             return DeviceStatus::failed;
@@ -268,6 +272,8 @@ public:
                                                   conditional_rendering ? &enable_conditional : nullptr};
         enable13.dynamicRendering = VK_TRUE;
         enable13.synchronization2 = VK_TRUE;
+        robust_image_access = features13.robustImageAccess == VK_TRUE;
+        enable13.robustImageAccess = robust_image_access;
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable13};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
@@ -298,6 +304,10 @@ public:
         bc = features.features.textureCompressionBC == VK_TRUE;
         enable.shaderSampledImageArrayDynamicIndexing = bindless;
         enable.shaderStorageImageArrayDynamicIndexing = bindless;
+        enable.shaderStorageImageReadWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageReadWithoutFormat;
+        enable.shaderStorageImageWriteWithoutFormat =
+            enable_legacy_formatless_features && features.features.shaderStorageImageWriteWithoutFormat;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -333,6 +343,22 @@ public:
             enable13.pNext = &host_copy;
         }
 
+        const char* sliced_name = VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME;
+        VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+        if (enable_sliced_3d_uav && robust_image_access &&
+            std::any_of(extensions.begin(), extensions.end(), [&](const auto& e) {
+                return std::strcmp(e.extensionName, sliced_name) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            sliced_3d_uav = sliced.imageSlicedViewOf3D == VK_TRUE;
+            if (sliced_3d_uav) {
+                sliced.pNext = enable13.pNext;
+                enable13.pNext = &sliced;
+            }
+        }
+
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -345,6 +371,7 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (sliced_3d_uav) device_extensions.push_back(sliced_name);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

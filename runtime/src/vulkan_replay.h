@@ -1568,6 +1568,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_subresource;
             // The view's format turns the values into bytes; the image's own format clears them in.
             const VkFormat view_format = view.format ? VkFormat(view.format) : p.binding.format;
+            // A Vulkan clear in the backing format can change the bits (e.g. canonicalize FLOAT NaNs).
+            // RGB9E5 emulation intentionally stores that packed word verbatim in the R32_UINT backing image.
+            const bool packed_rgb9e5 = view_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 &&
+                                       p.binding.format == VK_FORMAT_R32_UINT;
+            if (view.exact_clear_format && view_format != p.binding.format && !packed_rgb9e5)
+                return ReplayResult::unsupported;
             if (!uav_clear::encode(view_format, uav->is_float, uav->values, p.element) ||
                 !uav_clear::decode(p.binding.format, p.element, p.clear_color))
                 return ReplayResult::unsupported;
