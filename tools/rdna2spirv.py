@@ -4529,10 +4529,12 @@ class Gen:
             r = self.clamp_mods(r, mods)
             self.f16_out(a[0], r, hi=(op == "v_fma_mixhi_f16"))
         elif op == "v_cvt_pk_u8_f32":
-            # Convert src0 to u8 (round to nearest even, clamp) and insert it at byte src1 of src2.
+            # Convert src0 to u8 (round to nearest even, clamp; NaN -> 0) and insert it at byte src1 of src2.
+            # NMin(NMax(x, 0), 255) avoids FClamp's undefined NaN rule: NMax(NaN, 0) = 0 -> NMin(0, 255) = 0.
             x, byte, base = self.src_f(a[1]), self.src_u(a[2]), self.src_u(a[3])
-            c, rn, u, sh, mask, nmask, keep, ins_, r = (self.tmp() for _ in range(9))
-            self.emit(f"{c} = OpExtInst %float %glsl FClamp {x} %f0 {self.fconst(255.0)}")
+            lo, c, rn, u, sh, mask, nmask, keep, ins_, r = (self.tmp() for _ in range(10))
+            self.emit(f"{lo} = OpExtInst %float %glsl NMax {x} %f0")
+            self.emit(f"{c} = OpExtInst %float %glsl NMin {lo} {self.fconst(255.0)}")
             self.emit(f"{rn} = OpExtInst %float %glsl RoundEven {c}")
             self.emit(f"{u} = OpConvertFToU %uint {rn}")
             b3 = self.tmp()
