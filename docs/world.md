@@ -269,7 +269,8 @@ on every entity count. SixNG also counts 7,257 `0x7a` resources that have `CEnti
 space) and 6,296 `35abc248` entity groups (39,622 entities in group-local space). It misses 7 maps
 (1,239 entities) whose entity data is in a continuation page. 7,257 − 7 = 7,250 maps and 580,287 −
 1,239 = 579,048 entities. The 23,535 / 1,670,442 census figure is the count of world placement
-lists; interiors and entity groups need the transform of whatever places them.
+lists; interiors and entity groups need the transform of whatever places them (for interiors, see
+[Interiors](#interiors)).
 
 ## What is readable, what is hash-only
 
@@ -329,6 +330,8 @@ The place names shown to the player come from one `GameShape__Data__LocationName
    placement files.
 3. **Transforms.** Apply `position`, conjugate the stored quaternion for world rotation, and use `scaleXY` /
    `scaleZ`. The source is RAGE Z-up; glTF-style Y-up is `(x, z, -y)` with the vector part rotated accordingly.
+   Interior entities are in interior space and go through their interior instance first, whose quaternion is
+   stored unconjugated (see [Interiors](#interiors)).
 4. **Archetype keys.** Resolve the 32-bit `archetypeName` hash to an exported model. Confirm the match with the
    per-archetype 64-bit key at +0x20 (MurmurHash3 x64 low 64); do not use the +0x08 per-entity id as a name key.
    Hash-only records are normal; the runtime needs a hash→model table, with the bbox/archive-order fallback for
@@ -538,6 +541,114 @@ node --test tests\test_viewer_streaming.cjs
 ```
 
 The entity rows and the placed chunks come from your own copy of the game; keep them in the local work folder.
+
+## Interiors
+
+Interiors (MLOs, in GTA V terms) are not in the map placement lists. Their entities are stored in interior
+archetypes, in interior space, and a map file places each interior through an instance record. Every struct and
+member name below is the case-sensitive joaat of the GTA V name, and matches the member tables of every
+interior resource in `levels.rpf`.
+
+| Struct | Hash | Size | Members used |
+|---|---|---:|---|
+| `CMloArchetypeDef` | `10506455` | 544 | `name` +0x78, `bbMin`/`bbMax` +0x40/+0x4C, `entities` +0xC0 (pointer list), `entitySets` +0xF0 (list of `CMloEntitySet`) |
+| `CMloEntitySet` | `d6a799f9` | 40 | `name` +0x00, `entities` +0x18 (pointer list) |
+| `CMloInstanceDef` | `09cc28be` | 592 | the `CEntityDef` members at the same offsets (its `archetypeName` is the interior's `name`), `groupId` +0x90, `floorId` +0x94, `defaultEntitySets` +0xA0 (list of set-name hashes) |
+
+The archetype also has `rooms` (+0xD0, `CMloRoomDef` `0b1811f1`, 112 bytes), `portals` (+0xE0, `CMloPortalDef`
+`995072ca`, 88 bytes, with `corners` and `attachedObjects`) and `timeCycleModifiers`. The instance also has
+`numExitPortals` and `MLOInstflags`. Placement does not use them. The pointer lists hold pool references, the
+same as the light extensions in [world_lights_paths.md](world_lights_paths.md): the block number is in bits 0 to
+11 and the byte offset starts at bit 20. Each one leads to a `CEntityDef` in the same resource.
+
+Measured on the whole `levels.rpf` data area:
+
+| | Count |
+|---|---:|
+| resources with `CMloArchetypeDef` | 1,141. 961 of them carry entities: these are the 961 resources with `CEntityDef` but no `CMapData` in *How many are there?*. The other 180 hold 348 interiors with no entities |
+| interior archetypes | 1,706, all with distinct names |
+| interior entities | 540,665: 401,155 in `entities` and 139,510 in 5,148 entity sets. Every `CEntityDef` in these resources is reached, and no reference fails to resolve |
+| interior entity fields | `parentIndex` −1 on all of them, so there is no LOD chain inside an interior. `lodLevel`: ORPHAN_HD 534,294, HD 6,371. `lodDist` −1 |
+| `CMloInstanceDef` | 2,590, each in its own map file. All of them name an interior that exists, and they place 1,704 of the 1,706 |
+| instances with `defaultEntitySets` | 1,424, with 7,760 names, every one a set of its own interior |
+| instance scale | 1.0, except for 6 instances with `scaleZ` 0.998 |
+
+**The instance quaternion is stored as is.** It is the instance's world rotation, while `CEntityDef` stores the
+inverse. 379 map files hold only an instance, and their `entitiesExtentsMin/Max` is the interior's `bbMin/bbMax`
+box turned by the instance and moved to its position. For the 203 of those turned more than 5° off an axis, the
+stored rotation reproduces the extents within 0.1 m on 202. The conjugate reproduces them on 51.
+
+**Interior entities store the inverse, like map entities.** 200 doors are attached to portals at an angle to
+the interior axes; these are elongated models exported for the placed city. With the conjugate of the stored
+rotation, 194 of them have their long side within 2° of the portal's horizontal edge. With the stored
+rotation unconjugated, none do, and the median angle is 60°.
+
+An interior entity's world position is the instance position plus the instance rotation q applied to the
+entity's position. Its world rotation is q · conj(s), where s is the entity's stored quaternion.
+
+### Placing interiors (`--interiors`)
+
+1. `world_index.py <levels.rpf> --entities-out <entities.jsonl> --interiors-out <interiors.jsonl>` writes, as JSON
+   lines, one row per interior (its name hash, bounds, entity rows and entity sets, in interior space) and one per
+   instance (the interior's name hash, its position and stored rotation, `default_sets`, `group_id`,
+   `floor_id`). Entity rows have the `--entities-out` format. Interior entities are not written to
+   `--entities-out`.
+2. `world_build.py <assets> --out <world> --placements <entities.jsonl> --interiors <interiors.jsonl>` composes
+   each instance's entities into world space. A composed entity is a placement row like any other, in the
+   stored (inverse) form s · conj(q). It then goes through `--lod-levels`, `--region` (on its world position),
+   the name and key match, instancing and `--lod-sets`. `--interiors` can be repeated, for example once per scan
+   window. An interior listed in two files is used once.
+3. `--interior-sets` picks the entity sets: `default` (the default) places the sets the instance names,
+   `all` places every set and `none` places only the interior's `entities` list. Sets that the instance does not
+   name are optional states (in GTA V, alternative furnishings), so `all` can draw alternatives on top of each
+   other.
+
+`stats.placements` adds `interior_instances`, `interior_instances_unresolved` (instances whose interior is in no
+`--interiors` file) and `interior_entities` (composed rows). `rows` counts the lines of both files.
+
+### Measured with interiors
+
+The 1.0.2.1 package, `levels.rpf`, Linux, `--no-textures`, 256 m chunks, gpu instancing. The models come from
+the city exports above, plus the 28,980 resources of the interior archetypes that were still missing. Those were
+exported at the current pin, rpf9-explorer e293917, with 0 failures in 36 s (16 GB of OBJ).
+
+| Step | Result |
+|---|---|
+| `--interiors-out` with `--entities-out`, whole data area, 24 windows | 1,706 interiors and 2,590 instances in 68 s; the map entity rows are unchanged at 1,670,435 |
+| entities placed by the 2,590 instances, `--interior-sets default` | 605,070: 453,463 from `entities` and 151,607 from default sets. All sets would be 1,679,058 more than `entities` |
+| entities with an exported model | 604,535. The other 535 are `unresolved_archetype`: 70 archetypes whose model name was not recovered |
+| 700 m × 700 m downtown box (`--region -900,500,-200,1200`), `--jobs 16` | without interiors: 29,229 placed, 86.1 M triangles, 63 s, 1.2 GB in the largest process. With interiors: 48,042 placed (18,813 interior entities, all with a model), 119.4 M triangles, 90 s, 1.8 GB. Still 16 chunks |
+| **all interiors of the city** (empty `--placements`, `--interiors` only), `--jobs 24` | 604,535 placed (535 `unresolved_archetype`, 0 `key_mismatch`, 0 `mirrored`), 36,359 distinct models → 597 chunks. 1.27 G triangles drawn, 0.70 G stored. 25.9 GB of GLB, median chunk 24.6 MB, largest 310 MB. 4 min 52 s, 1.8 GB in the largest process |
+
+Checks:
+- SixNG's per-instance totals are 453,258 interior entities and 1,678,915 set entities. The tool's are 453,463
+  and 1,679,058. SixNG reads a value as a `0x5` page pointer before it tries a pool reference. Emulating that
+  order on the same resources gives exactly 453,258 and 1,678,915. The difference is the pool
+  references whose value looks like a page pointer, the same cause as the light count difference in
+  [world_lights_paths.md](world_lights_paths.md).
+- Each composed entity position was checked against its instance's `bbMin/bbMax`, turned and moved by the
+  instance, with 0.5 m of slack. 374,415 of 374,419 are inside for instances turned off an axis, and 230,645
+  of 230,651 for the others. Conjugating the instance rotation as for map entities leaves 361,042 and 214,685
+  inside.
+- The 16 chunks of the box and the 597 chunks of the interiors-only city pass the structural check above. The
+  instance and drawn-triangle totals recomputed from the GLBs equal `world.json`. three r160's `GLTFLoader` parses
+  all 16 box chunks and 34 of the city chunks (30 random and the 5 largest). The drawn triangles and bounds
+  match `world.json`.
+
+**Not verified or limited:** nothing here was viewed in a browser. Rooms, portals and `groupId`/`floorId` are not
+used, so an interior is drawn whole and at all times, not room by room through its portals. Interior entities are
+almost all ORPHAN_HD, so with `--lod-sets` they share the ORPHAN_HD band. The instance scale (6 instances at
+`scaleZ` 0.998) is not applied.
+
+```powershell
+python -I tools\world_index.py <levels.rpf> --out work\world\index.json --entities-out work\world\entities.jsonl `
+    --interiors-out work\world\interiors.jsonl
+python -I tools\world_build.py work\assets --out work\world\placed --no-textures --jobs 16 `
+    --placements work\world\entities.jsonl --interiors work\world\interiors.jsonl
+python -I tests\test_world_interiors.py
+```
+
+The interior rows come from your own copy of the game, like the entity rows; keep them in the local work folder.
 ## Trains (`CTrainConfigs`)
 
 Trains are configured by one `CTrainConfigs` XML document in `common.rpf` (see [gamedata.md](gamedata.md)).

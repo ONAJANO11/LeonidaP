@@ -12,7 +12,7 @@ It does not decrypt the archive table and does not extract models or textures.
 Usage:
     python -I world_index.py <archive.rpf|folder> [--out FILE] [--csv FILE]
                              [--start N] [--limit BYTES] [--max-inflate BYTES]
-                             [--archetypes-out FILE] [--entities-out FILE]
+                             [--archetypes-out FILE] [--entities-out FILE] [--interiors-out FILE]
 
 ``--archetypes-out`` also writes the aggregate archetype file that ``world_names.py resolve --archetypes``
 reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype key. Counts and hashes only.
@@ -21,6 +21,11 @@ reads: entity count per ``archetypeName`` hash and the entity's 64-bit archetype
 stored rotation, scales and LOD fields), the placement input of ``world_build.py --placements``. The rows are
 derived from your own copy of the game: keep the file in your local work folder. The placement report is
 replaced after the scan and other report writes succeed.
+
+``--interiors-out`` writes one JSON line per interior archetype (``CMloArchetypeDef``: its entities and entity sets,
+in interior space) and one per interior instance (``CMloInstanceDef``: where a map places an interior, and which
+entity sets it shows by default), the ``world_build.py --interiors`` input. Interior entities are not in
+``--entities-out``: they have no world position until an instance places them. Keep this file local too.
 
 For a 76 GB archive, bound the run with --start/--limit. Coverage and the scanned window are written to the
 JSON summary. Place reports outside a directory input if you want to overwrite them on a later run.
@@ -75,6 +80,22 @@ FIELD = {
 # Per-entity 64-bit archetype key (Murmur3-64 of the archetype name, docs/world_names.md); the engine name of
 # this member is not recovered.
 ARCHETYPE_KEY = 0xC8A7B90A
+# Interiors (docs/world.md#interiors). Struct and member names are case-sensitive joaat of the names below,
+# confirmed by the member tables of every interior resource in levels.rpf. CMloInstanceDef starts with the
+# CEntityDef members, so FIELD reads its placement.
+MLO_ARCHETYPE = 0x10506455   # CMloArchetypeDef
+MLO_INSTANCE = 0x09CC28BE    # CMloInstanceDef
+MLO_ENTITY_SET = 0xD6A799F9  # CMloEntitySet
+MLO_FIELD = {
+    "name": 0xE6E17F14,
+    "bbMin": 0xD9EF8236,
+    "bbMax": 0xE78AA618,
+    "entities": 0xCCAB9307,
+    "entitySets": 0x45BCB930,
+    "defaultEntitySets": 0x53DF8649,
+    "groupId": 0x951BDD14,
+    "floorId": 0x8264E631,
+}
 LOD_NAMES = {0: "HD", 1: "LOD", 2: "SLOD1", 3: "SLOD2", 4: "SLOD3", 5: "ORPHAN_HD", 6: "SLOD4"}
 
 
@@ -148,13 +169,35 @@ def _r4(values):
     return [round(v, 4) for v in values] if values else None
 
 
+def _entity_record(b, o, em, entity_size):
+    """The placement fields of the CEntityDef (or CEntityDef-prefixed) object at ``o``, read through member table ``em``."""
+    return {
+        "complete": o + entity_size <= len(b),
+        "archetype": _value(b, o, em.get(FIELD["archetypeName"])),
+        "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
+        "position": _value(b, o, em.get(FIELD["position"])),
+        "rotation": _value(b, o, em.get(FIELD["rotation"])),
+        "scale_xy": _value(b, o, em.get(FIELD["scaleXY"])),
+        "scale_z": _value(b, o, em.get(FIELD["scaleZ"])),
+        "flags": _value(b, o, em.get(FIELD["flags"])),
+        "guid": _value(b, o, em.get(FIELD["guid"])),
+        "lod_level": _value(b, o, em.get(FIELD["lodLevel"])),
+        "parent_index": _value(b, o, em.get(FIELD["parentIndex"])),
+        "parent_instance": _value(b, o, em.get(FIELD["parentInstance"])),
+        "num_children": _value(b, o, em.get(FIELD["numChildren"])),
+        "lod_dist": _value(b, o, em.get(FIELD["lodDist"])),
+        "child_lod_dist": _value(b, o, em.get(FIELD["childLodDist"])),
+    }
+
+
 def parse_resource(b, collect=None):
     """Return a row dict for a 0x7a resource, or None if the header/schema does not validate.
 
     When ``collect`` is given (a list, or an object with ``append`` such as ``ArchetypeCounts``), one dict per
     CEntityDef is appended to it. ``complete`` is False for an entity whose record is not entirely inside ``b``,
     including every entity of a block whose start lies past the end of ``b``. The CLI uses it only for
-    ``--archetypes-out``, which writes aggregate counts.
+    ``--archetypes-out``, which writes aggregate counts. A ``collect`` object with a ``resource`` method (such as
+    ``InteriorRows``) is also handed every accepted resource's bytes, struct table and block table.
     """
     if len(b) < 0x50 or b[0x10:0x14] != SIGNATURE or b[0x14] != VERSION:
         return None
@@ -187,6 +230,8 @@ def parse_resource(b, collect=None):
         blocks.append((name, size, off))
     if not any(name in structs and off is not None for name, _, off in blocks):
         return None
+    if collect is not None and hasattr(collect, "resource"):
+        collect.resource(b, structs, blocks)
 
     entity_size = structs.get(ENTITY, (0, {}))[0]
     map_size = structs.get(MAPDATA, (0, {}))[0]
@@ -219,36 +264,21 @@ def parse_resource(b, collect=None):
             continue
         for k in range(size // entity_size):
             o = off + k * entity_size
-            a = _value(b, o, em.get(FIELD["archetypeName"]))
+            entity = _entity_record(b, o, em, entity_size)
+            a = entity["archetype"]
             if a is not None:
                 archetypes.add(a)
-            pos = _value(b, o, em.get(FIELD["position"]))
+            pos = entity["position"]
             if pos:
                 positions.append(pos)
-            level = _value(b, o, em.get(FIELD["lodLevel"]))
+            level = entity["lod_level"]
             if level in LOD_NAMES:
                 lod[LOD_NAMES[level]] = lod.get(LOD_NAMES[level], 0) + 1
-            dist = _value(b, o, em.get(FIELD["lodDist"]))
+            dist = entity["lod_dist"]
             if isinstance(dist, float) and dist >= 0:
                 lod_dists.append(dist)
             if collect is not None:
-                collect.append({
-                    "complete": o + entity_size <= len(b),
-                    "archetype": a,
-                    "archetype_key": _value(b, o, em.get(ARCHETYPE_KEY)),
-                    "position": pos,
-                    "rotation": _value(b, o, em.get(FIELD["rotation"])),
-                    "scale_xy": _value(b, o, em.get(FIELD["scaleXY"])),
-                    "scale_z": _value(b, o, em.get(FIELD["scaleZ"])),
-                    "flags": _value(b, o, em.get(FIELD["flags"])),
-                    "guid": _value(b, o, em.get(FIELD["guid"])),
-                    "lod_level": level,
-                    "parent_index": _value(b, o, em.get(FIELD["parentIndex"])),
-                    "parent_instance": _value(b, o, em.get(FIELD["parentInstance"])),
-                    "num_children": _value(b, o, em.get(FIELD["numChildren"])),
-                    "lod_dist": dist,
-                    "child_lod_dist": _value(b, o, em.get(FIELD["childLodDist"])),
-                })
+                collect.append(entity)
     row.update({
         "kind": "map",
         "entity_size": entity_size,
@@ -542,21 +572,163 @@ class EntityRows:
         self.written = 0
         self.incomplete = 0
 
-    def append(self, entity):
+    @classmethod
+    def row(cls, entity):
+        """The JSON row for one ``_entity_record`` dict, or None when it is incomplete or has no archetype."""
         if not entity.get("complete", True) or entity.get("archetype") is None:
-            self.incomplete += 1
-            return
+            return None
         row = {"archetype": f"{entity['archetype']:08x}"}
         if entity.get("archetype_key"):
             row["key"] = f"{entity['archetype_key']:016x}"
-        for k in self.FIELDS:
+        for k in cls.FIELDS:
             row[k] = entity.get(k)
+        return row
+
+    def append(self, entity):
+        row = self.row(entity)
+        if row is None:
+            self.incomplete += 1
+            return
         self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         self.written += 1
 
 
+def _ref(b, blocks, value):
+    """Resolve a pointer inside a 0x7a resource to (struct hash of its block or None, byte offset), or None.
+
+    A pointer is either a pool reference (1-based block number in bits 0..11, bits 12..19 zero, byte offset in the
+    block from bit 20) or a ``0x5xxxxxxx`` pointer into the system page."""
+    number = value & 0xFFF
+    if (value >> 12) & 0xFF == 0 and 1 <= number <= len(blocks):
+        name, size, base = blocks[number - 1]
+        off = value >> 20
+        return (name, base + off) if base is not None and off < size else None
+    p = _ptr(value, len(b))
+    if p is None:
+        return None
+    for name, size, base in blocks:
+        if base is not None and base <= p < base + size:
+            return name, p
+    return None, p
+
+
+def _list(b, o):
+    """A {u64 pointer, u16 count} list member at ``o``: (pointer, count), or (0, 0) when it lies past ``b``."""
+    if o + 10 > len(b):
+        return 0, 0
+    return _u64(b, o), _u16(b, o + 8)
+
+
+def _objects(b, structs, blocks, name):
+    """Offsets of every complete object of struct ``name`` in its own blocks."""
+    size = structs.get(name, (0, {}))[0]
+    if not size:
+        return []
+    return [base + k * size for n, bsize, base in blocks if n == name and base is not None and bsize % size == 0
+            for k in range(bsize // size) if base + (k + 1) * size <= len(b)]
+
+
+def interior_records(b, structs, blocks):
+    """The interior archetypes and interior instances in one parsed 0x7a resource.
+
+    Returns (records, unresolved). An archetype record is ``{"interior", "bb_min", "bb_max", "entities", "sets"}``:
+    its entity list and each ``{"name", "entities"}`` entity set, every entity an ``--entities-out`` row in interior
+    space. An instance record is ``{"instance", ...}``: the interior's name hash, its placement as stored (the
+    rotation is the instance's world rotation, not its inverse; docs/world.md#interiors) and its default entity
+    sets. ``unresolved`` counts entity references that do not lead to a complete ``CEntityDef``.
+    """
+    records, unresolved = [], 0
+    entity_size, em = structs.get(ENTITY, (0, {}))
+
+    def entity_rows(list_at):
+        nonlocal unresolved
+        rows = []
+        pointer, count = _list(b, list_at)
+        target = _ref(b, blocks, pointer) if count else None
+        if count and target is None:
+            unresolved += count
+            return rows
+        for i in range(count):
+            at = target[1] + 8 * i
+            ref = _ref(b, blocks, _u64(b, at)) if at + 8 <= len(b) else None
+            row = EntityRows.row(_entity_record(b, ref[1], em, entity_size)) \
+                if ref is not None and ref[0] == ENTITY and entity_size else None
+            if row is None:
+                unresolved += 1
+            else:
+                rows.append(row)
+        return rows
+
+    am = structs.get(MLO_ARCHETYPE, (0, {}))[1]
+    set_size, sm = structs.get(MLO_ENTITY_SET, (0, {}))
+    for o in _objects(b, structs, blocks, MLO_ARCHETYPE):
+        name = _value(b, o, am.get(MLO_FIELD["name"]))
+        if name is None:
+            continue
+        rec = {"interior": f"{name:08x}", "bb_min": _value(b, o, am.get(MLO_FIELD["bbMin"])),
+               "bb_max": _value(b, o, am.get(MLO_FIELD["bbMax"])), "entities": [], "sets": []}
+        if MLO_FIELD["entities"] in am:
+            rec["entities"] = entity_rows(o + am[MLO_FIELD["entities"]][0])
+        pointer, count = _list(b, o + am[MLO_FIELD["entitySets"]][0]) if MLO_FIELD["entitySets"] in am else (0, 0)
+        target = _ref(b, blocks, pointer) if count and set_size else None
+        for k in range(count if target is not None else 0):
+            s = target[1] + k * set_size
+            if s + set_size > len(b):
+                break
+            set_name = _value(b, s, sm.get(MLO_FIELD["name"]))
+            rows = entity_rows(s + sm[MLO_FIELD["entities"]][0]) if MLO_FIELD["entities"] in sm else []
+            rec["sets"].append({"name": None if set_name is None else f"{set_name:08x}", "entities": rows})
+        records.append(rec)
+
+    im = structs.get(MLO_INSTANCE, (0, {}))[1]
+    for o in _objects(b, structs, blocks, MLO_INSTANCE):
+        placed = EntityRows.row(_entity_record(b, o, im, structs[MLO_INSTANCE][0]))
+        if placed is None:
+            continue
+        rec = {"instance": placed.pop("archetype")}
+        rec.update(placed)
+        defaults = []
+        if MLO_FIELD["defaultEntitySets"] in im:
+            pointer, count = _list(b, o + im[MLO_FIELD["defaultEntitySets"]][0])
+            target = _ref(b, blocks, pointer) if count else None
+            if target is not None and target[1] + 4 * count <= len(b):
+                defaults = [f"{_u32(b, target[1] + 4 * i):08x}" for i in range(count)]
+        rec["default_sets"] = defaults
+        rec["group_id"] = _value(b, o, im.get(MLO_FIELD["groupId"]))
+        rec["floor_id"] = _value(b, o, im.get(MLO_FIELD["floorId"]))
+        records.append(rec)
+    return records, unresolved
+
+
+class InteriorRows:
+    """A ``parse_resource`` collector that writes ``interior_records`` as JSON lines (``--interiors-out``)."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.counts = {"interiors": 0, "interior_entities": 0, "entity_sets": 0, "set_entities": 0,
+                       "instances": 0, "unresolved_entities": 0}
+
+    def append(self, entity):
+        pass   # map entities go to --entities-out
+
+    def resource(self, b, structs, blocks):
+        if MLO_ARCHETYPE not in structs and MLO_INSTANCE not in structs:
+            return
+        records, unresolved = interior_records(b, structs, blocks)
+        self.counts["unresolved_entities"] += unresolved
+        for rec in records:
+            if "interior" in rec:
+                self.counts["interiors"] += 1
+                self.counts["interior_entities"] += len(rec["entities"])
+                self.counts["entity_sets"] += len(rec["sets"])
+                self.counts["set_entities"] += sum(len(s["entities"]) for s in rec["sets"])
+            else:
+                self.counts["instances"] += 1
+            self.handle.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+
 class _Both:
-    """Feed one entity stream to two collectors."""
+    """Feed one entity stream to several collectors."""
 
     def __init__(self, *sinks):
         self.sinks = [x for x in sinks if x is not None]
@@ -564,6 +736,11 @@ class _Both:
     def append(self, entity):
         for x in self.sinks:
             x.append(entity)
+
+    def resource(self, b, structs, blocks):
+        for x in self.sinks:
+            if hasattr(x, "resource"):
+                x.resource(b, structs, blocks)
 
 
 def _count(minimum):
@@ -675,10 +852,12 @@ def _check_report_paths(parser, reports, source, directory_files):
 
 
 @contextmanager
-def _staged_entity_report(path):
+def _staged_entity_report(path, sink=None, what="placement"):
+    """Yield a ``sink`` (default ``EntityRows``) writing to a staged file that replaces ``path`` only on success."""
     if not path:
         yield None
         return
+    sink = sink or EntityRows
 
     destination = _resolve_report_path(path)
     parent = os.path.dirname(destination)
@@ -688,14 +867,14 @@ def _staged_entity_report(path):
     except FileNotFoundError:
         mode = None
     if mode is not None and not stat.S_ISREG(mode):
-        raise OSError(f"placement report destination is not a regular file: {path}")
+        raise OSError(f"{what} report destination is not a regular file: {path}")
 
     # mkdtemp may normalize the returned parent on Windows. Keep the spelling used to create it.
     directory = os.path.join(parent, os.path.basename(tempfile.mkdtemp(dir=parent, prefix=".world-index-")))
     staged = os.path.join(directory, "entities.jsonl")
     try:
         with open(staged, "w", encoding="utf-8", newline="\n") as handle:
-            yield EntityRows(handle)
+            yield sink(handle)
         if mode is not None:
             os.chmod(staged, mode & 0o777)
         os.replace(staged, destination)
@@ -721,20 +900,27 @@ def main(argv=None):
                     help="also write entity counts and 64-bit keys per archetype hash (world_names resolve input)")
     ap.add_argument("--entities-out",
                     help="also write one JSON line per complete entity (world_build --placements input; local only)")
+    ap.add_argument("--interiors-out",
+                    help="also write one JSON line per interior archetype and per interior instance "
+                         "(world_build --interiors input; local only)")
     a = ap.parse_args(argv)
     reports = (("--out", a.out), ("--csv", a.csv), ("--archetypes-out", a.archetypes_out),
-               ("--entities-out", a.entities_out))
+               ("--entities-out", a.entities_out), ("--interiors-out", a.interiors_out))
     agg = ArchetypeCounts() if a.archetypes_out else None
     try:
         # Check the same inputs the directory scan will read, before the streaming report exists.
         directory_files = list(_directory_files(a.path)) if os.path.isdir(a.path) else None
         _check_report_paths(ap, reports, a.path, directory_files)
-        with _staged_entity_report(a.entities_out) as ent:
-            sink = _Both(agg, ent) if agg is not None and ent is not None else (agg if agg is not None else ent)
+        with _staged_entity_report(a.entities_out) as ent, \
+                _staged_entity_report(a.interiors_out, InteriorRows, "interior") as interiors:
+            sinks = [x for x in (agg, ent, interiors) if x is not None]
+            sink = sinks[0] if len(sinks) == 1 else (_Both(*sinks) if sinks else None)
             rows, stats = scan_path(a.path, a.start, a.limit, a.max_inflate, sink, directory_files=directory_files)
             summary = _write_reports(a, rows, stats, agg)
             if ent is not None:
                 summary["entity_rows"] = {"written": ent.written, "incomplete": ent.incomplete}
+            if interiors is not None:
+                summary["interior_rows"] = dict(interiors.counts)
     except (OSError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2

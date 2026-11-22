@@ -16,10 +16,15 @@ Each placed model is parsed once and stored once per chunk; its placements in th
 transforms (EXT_mesh_gpu_instancing by default, or plain glTF nodes with --instancing nodes), and every chunk is
 written as soon as it is built, so memory stays bounded by the largest chunk rather than the size of the map.
 
+With --interiors, the interiors of buildings are placed too: each interior instance from
+``world_index.py --interiors-out`` places its interior's entities (and its default entity sets) by the instance's
+rotation and position, and they then go through the same selection and model matching as map entities.
+
 Usage:
     python -I tools/world_build.py <assets_dir> --out <world_dir> [options]
     python -I tools/world_build.py <assets_dir> --out <world_dir> --placements <entities.jsonl>
         [--lod-levels 0,5] [--region MINX,MINY,MAXX,MAXY] [--instancing gpu|nodes|bake]
+        [--interiors <interiors.jsonl>] [--interior-sets default|all|none]
 """
 from __future__ import annotations
 
@@ -90,6 +95,52 @@ def _parse_archetype(value) -> int:
     raise TypeError("archetype must be an integer or a hex string")
 
 
+def _select_placement(row, counts: dict, levels, region, place=None) -> dict | None:
+    """Apply the placement row checks to one parsed row: the row with its ``_arch``/``_pos``/``_rot``/``_sxy``/``_sz``
+    fields set, or None (counted in ``counts``). ``place`` maps (position, stored rotation) to world space first;
+    interior entities use it (``compose_interior``)."""
+    try:
+        arch = _parse_archetype(row["archetype"])
+        pos = [float(v) for v in row["position"]]
+        rot = [float(v) for v in row["rotation"]]
+        selected_lod = row.get("lod_level") in levels
+    except (ValueError, KeyError, TypeError, OverflowError, AttributeError):
+        counts["malformed"] += 1
+        return None
+    if len(pos) != 3 or len(rot) != 4 or not all(math.isfinite(v) for v in pos + rot):
+        counts["malformed"] += 1
+        return None
+    if place is not None:
+        pos, rot = place(pos, rot)
+    if not selected_lod:
+        counts["other_lod_level"] += 1
+        return None
+    if region is not None and not (region[0] <= pos[0] <= region[2] and region[1] <= pos[1] <= region[3]):
+        counts["outside_region"] += 1
+        return None
+    sxy, sz = row.get("scale_xy"), row.get("scale_z")
+    row["_arch"] = arch & 0xFFFFFFFF
+    row["_pos"], row["_rot"] = pos, rot
+    row["_sxy"] = _placement_scale(sxy)
+    row["_sz"] = _placement_scale(sz)
+    counts["selected"] += 1
+    return row
+
+
+def _json_rows(path: str, counts: dict):
+    """Parsed JSON lines of ``path``; a line that is not JSON is counted as malformed."""
+    with open(path, encoding="utf-8-sig") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            counts["rows"] += 1
+            try:
+                yield json.loads(line)
+            except ValueError:
+                counts["malformed"] += 1
+
+
 def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
     """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
 
@@ -98,41 +149,8 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
     counted as malformed and skipped, as are unhashable LOD values. Optional scales that are missing,
     non-numeric or not representable as finite floats default to 1.0.
     """
-    levels = set(lod_levels)
-    counts = {"rows": 0, "malformed": 0, "other_lod_level": 0, "outside_region": 0, "selected": 0}
-    rows: list[dict] = []
-    with open(path, encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            counts["rows"] += 1
-            try:
-                row = json.loads(line)
-                arch = _parse_archetype(row["archetype"])
-                pos = [float(v) for v in row["position"]]
-                rot = [float(v) for v in row["rotation"]]
-                selected_lod = row.get("lod_level") in levels
-            except (ValueError, KeyError, TypeError, OverflowError):
-                counts["malformed"] += 1
-                continue
-            if len(pos) != 3 or len(rot) != 4 or not all(math.isfinite(v) for v in pos + rot):
-                counts["malformed"] += 1
-                continue
-            if not selected_lod:
-                counts["other_lod_level"] += 1
-                continue
-            if region is not None and not (region[0] <= pos[0] <= region[2] and region[1] <= pos[1] <= region[3]):
-                counts["outside_region"] += 1
-                continue
-            sxy, sz = row.get("scale_xy"), row.get("scale_z")
-            row["_arch"] = arch & 0xFFFFFFFF
-            row["_pos"], row["_rot"] = pos, rot
-            row["_sxy"] = _placement_scale(sxy)
-            row["_sz"] = _placement_scale(sz)
-            rows.append(row)
-            counts["selected"] += 1
-    return rows, counts
+    counts = _placement_counts()
+    return list(iter_placements(path, counts, lod_levels, region)), counts
 
 
 def _placement_counts() -> dict:
@@ -140,42 +158,122 @@ def _placement_counts() -> dict:
 
 
 def iter_placements(path: str, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, region=None):
-    """The rows ``load_placements`` selects, one at a time, adding to ``counts`` (a whole city need not be held).
-
-    The row checks are the same as ``load_placements``'; keep the two in step.
-    """
+    """The rows ``load_placements`` selects, one at a time, adding to ``counts`` (a whole city need not be held)."""
     levels = set(lod_levels)
-    with open(path, encoding="utf-8-sig") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            counts["rows"] += 1
-            try:
-                row = json.loads(line)
-                arch = _parse_archetype(row["archetype"])
-                pos = [float(v) for v in row["position"]]
-                rot = [float(v) for v in row["rotation"]]
-                selected_lod = row.get("lod_level") in levels
-            except (ValueError, KeyError, TypeError, OverflowError):
-                counts["malformed"] += 1
-                continue
-            if len(pos) != 3 or len(rot) != 4 or not all(math.isfinite(v) for v in pos + rot):
-                counts["malformed"] += 1
-                continue
-            if not selected_lod:
-                counts["other_lod_level"] += 1
-                continue
-            if region is not None and not (region[0] <= pos[0] <= region[2] and region[1] <= pos[1] <= region[3]):
-                counts["outside_region"] += 1
-                continue
-            sxy, sz = row.get("scale_xy"), row.get("scale_z")
-            row["_arch"] = arch & 0xFFFFFFFF
-            row["_pos"], row["_rot"] = pos, rot
-            row["_sxy"] = _placement_scale(sxy)
-            row["_sz"] = _placement_scale(sz)
-            counts["selected"] += 1
+    for row in _json_rows(path, counts):
+        row = _select_placement(row, counts, levels, region)
+        if row is not None:
             yield row
+
+
+# --interior-sets: which entity sets of an interior to place besides its entity list.
+INTERIOR_SETS = ("default", "all", "none")
+
+
+def _qmul(a, b):
+    """Hamilton product of two (x, y, z, w) quaternions."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def compose_interior(inst_position, inst_rotation, position, rotation):
+    """World position and stored rotation of an interior entity that an interior instance places.
+
+    ``CMloInstanceDef`` stores the instance's world rotation q itself, while interior entities store the inverse
+    s of their rotation in interior space, as map entities do (docs/world.md#interiors). The entity's world
+    rotation is q * conj(s), returned in the stored form conj(q * conj(s)) = s * conj(q), so the result reads like
+    any ``--entities-out`` row. The position is the instance position plus q applied to the interior-space one.
+    """
+    x, y, z, w = (float(v) for v in inst_rotation)
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    q = (0.0, 0.0, 0.0, 1.0) if n == 0 or not math.isfinite(n) else (x / n, y / n, z / n, w / n)
+    px, py, pz = (float(v) for v in position)
+    t = _qmul(_qmul(q, (px, py, pz, 0.0)), (-q[0], -q[1], -q[2], q[3]))
+    world = [float(inst_position[0]) + t[0], float(inst_position[1]) + t[1], float(inst_position[2]) + t[2]]
+    stored = _qmul(tuple(float(v) for v in rotation), (-q[0], -q[1], -q[2], q[3]))
+    return world, list(stored)
+
+
+def load_interiors(paths, counts: dict) -> tuple[dict, list[dict]]:
+    """Read ``world_index.py --interiors-out`` files: ({interior name hash: record}, [instance records]).
+
+    Lines that are neither an interior nor an instance record are counted as malformed. An interior listed in
+    several files (overlapping scan windows) is kept once."""
+    interiors: dict[int, dict] = {}
+    instances: list[dict] = []
+    for path in paths:
+        for rec in _json_rows(path, counts):
+            try:
+                if "interior" in rec:
+                    interiors.setdefault(_parse_archetype(rec["interior"]) & 0xFFFFFFFF, rec)
+                elif "instance" in rec:
+                    rec["_arch"] = _parse_archetype(rec["instance"]) & 0xFFFFFFFF
+                    instances.append(rec)
+                else:
+                    counts["malformed"] += 1
+            except (ValueError, TypeError, OverflowError):
+                counts["malformed"] += 1
+    return interiors, instances
+
+
+def interior_placements(paths, counts: dict, lod_levels=DEFAULT_LOD_LEVELS, region=None, sets: str = "default"):
+    """The interior entities the instances in ``paths`` place, as selected placement rows in world space.
+
+    Each instance places its interior's entity list plus, with ``sets`` = "default", the entity sets named in its
+    ``default_sets``; "all" places every set and "none" none. LOD and region selection apply to the placed
+    entity, as for ``iter_placements``. Adds interior_instances, interior_instances_unresolved and
+    interior_entities to ``counts``."""
+    if sets not in INTERIOR_SETS:
+        raise ValueError(f"interior sets must be one of {INTERIOR_SETS}, got {sets!r}")
+    for k in ("interior_instances", "interior_instances_unresolved", "interior_entities"):
+        counts.setdefault(k, 0)
+    interiors, instances = load_interiors(paths, counts)
+    levels = set(lod_levels)
+    for inst in instances:
+        counts["interior_instances"] += 1
+        interior = interiors.get(inst["_arch"])
+        try:
+            ipos = [float(v) for v in inst["position"]]
+            irot = [float(v) for v in inst["rotation"]]
+            ok = len(ipos) == 3 and len(irot) == 4 and all(math.isfinite(v) for v in ipos + irot)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            ok = False
+        if not ok:
+            counts["malformed"] += 1
+            continue
+        if not isinstance(interior, dict):
+            counts["interior_instances_unresolved"] += 1
+            continue
+        groups = [interior.get("entities")]
+        wanted = set(inst.get("default_sets") or ()) if sets == "default" else None
+        if sets != "none":
+            for entity_set in interior.get("sets") or ():
+                if isinstance(entity_set, dict) and (wanted is None or entity_set.get("name") in wanted):
+                    groups.append(entity_set.get("entities"))
+
+        def place(pos, rot, ipos=ipos, irot=irot):
+            return compose_interior(ipos, irot, pos, rot)
+
+        for group in groups:
+            for row in group if isinstance(group, list) else ():
+                counts["interior_entities"] += 1
+                if not isinstance(row, dict):
+                    counts["malformed"] += 1
+                    continue
+                row = _select_placement(dict(row), counts, levels, region, place)
+                if row is not None:
+                    yield row
+
+
+def _placement_rows(placements: str, counts: dict, lod_levels, region, interiors=None, interior_sets="default"):
+    """The selected map placements, then the selected interior entities."""
+    yield from iter_placements(placements, counts, lod_levels, region)
+    if interiors:
+        yield from interior_placements(interiors, counts, lod_levels, region, interior_sets)
 
 
 def entity_transform(rotation, scale_xy: float, scale_z: float) -> tuple[list[list[float]], list[list[float]], bool]:
@@ -532,7 +630,7 @@ def _run_jobs(fn, jobs, workers: int):
 
 def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, region, out_dir, chunk_size,
                            textures, max_tex_size, base_color_param, workers, mode, glb_mod, limit,
-                           lod_sets=False) -> dict:
+                           lod_sets=False, interiors=None, interior_sets="default") -> dict:
     """``build_world --placements`` with shared geometry: memory holds about 100 bytes per placement plus the
     models of the chunk being written, not a copy of every placed model."""
     counts = _placement_counts()
@@ -548,7 +646,7 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
     inst_tier = array.array("b")           # lodLevel, used with lod_sets
     child_lod: dict[int, array.array] = {}
     lod_dist: dict[int, array.array] = {}
-    for row in iter_placements(placements, counts, lod_levels, region):
+    for row in _placement_rows(placements, counts, lod_levels, region, interiors, interior_sets):
         lvl = row.get("lod_level")
         if lod_sets:
             for src, dst in (("child_lod_dist", child_lod), ("lod_dist", lod_dist)):
@@ -1343,12 +1441,16 @@ def build_world(
     region=None,
     instancing: str = "gpu",
     lod_sets: bool = False,
+    interiors=None,
+    interior_sets: str = "default",
 ) -> dict:
     """Build world.json and chunk .glb files from rpf9dump asset exports.
 
     With ``placements`` (a ``world_index.py --entities-out`` file), every selected entity whose archetype
     resolves to an exported model becomes one placed instance; models are not placed at their own coordinates.
-    world.json's stats then carry a ``placements`` block with the counts of each outcome.
+    world.json's stats then carry a ``placements`` block with the counts of each outcome. ``interiors`` (a list of
+    ``world_index.py --interiors-out`` files) also places the interior entities of every interior instance, with
+    the entity sets ``interior_sets`` selects (``interior_placements``).
 
     Unless limit=0 explicitly requests an empty world, raise ValueError before changing
     the output if no readable model manifests or no usable selected models are found.
@@ -1385,8 +1487,15 @@ def build_world(
             raise ValueError(f"instancing must be one of {INSTANCING_MODES}, got {instancing!r}")
         if lod_sets and instancing == "bake":
             raise ValueError("--lod-sets needs --instancing gpu or nodes")
+        for path in interiors or ():
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"interiors file does not exist: {path}")
+        if interior_sets not in INTERIOR_SETS:
+            raise ValueError(f"interior_sets must be one of {INTERIOR_SETS}, got {interior_sets!r}")
     elif lod_sets:
         raise ValueError("--lod-sets needs --placements")
+    elif interiors:
+        raise ValueError("--interiors needs --placements")
     workers = max(1, int(jobs))
 
     if not os.path.exists(assets_dir):
@@ -1421,7 +1530,7 @@ def build_world(
             entries, ttpf_index, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
             chunk_size=chunk_size, textures=textures, max_tex_size=max_tex_size,
             base_color_param=base_color_param, workers=workers, mode=instancing, glb_mod=glb_mod, limit=limit,
-            lod_sets=lod_sets,
+            lod_sets=lod_sets, interiors=interiors, interior_sets=interior_sets,
         )
 
     def load_model(models_dir: str, item: dict, axis: str) -> dict | None:
@@ -1458,6 +1567,8 @@ def build_world(
                 loaded_models.append(model)
     else:
         rows, placement_stats = load_placements(placements, lod_levels, region)
+        if interiors:
+            rows.extend(interior_placements(interiors, placement_stats, lod_levels, region, interior_sets))
         index = model_name_index(entries, _get_world_names())
         cache: dict[tuple[str, str], dict | None] = {}
         used: set[tuple[str, str]] = set()
@@ -1840,6 +1951,21 @@ def main(argv: list[str] | None = None) -> int:
         "unless --lod-levels is given), plus each tier's camera distance band in world.json, measured from the "
         "entities' childLodDist/lodDist, so the viewer shows one tier per grid cell.",
     )
+    ap.add_argument(
+        "--interiors",
+        action="append",
+        default=None,
+        metavar="INTERIORS",
+        help="With --placements: also place interior entities from a world_index.py --interiors-out file, at the "
+        "interior instances it lists (repeat for several files, e.g. one per scan window).",
+    )
+    ap.add_argument(
+        "--interior-sets",
+        choices=INTERIOR_SETS,
+        default="default",
+        help="With --interiors: the entity sets to place besides each interior's entity list: 'default' the ones "
+        "the instance names (default), 'all' every set, 'none' no set.",
+    )
     args = ap.parse_args(argv)
     lod_levels = args.lod_levels
     if args.lod_sets and not any(a == "--lod-levels" or a.startswith("--lod-levels=") for a in (argv or sys.argv[1:])):
@@ -1862,6 +1988,8 @@ def main(argv: list[str] | None = None) -> int:
             region=args.region,
             instancing=args.instancing,
             lod_sets=args.lod_sets,
+            interiors=args.interiors,
+            interior_sets=args.interior_sets,
         )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
