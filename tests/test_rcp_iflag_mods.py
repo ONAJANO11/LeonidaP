@@ -69,6 +69,10 @@ class RcpIflagModsTest(unittest.TestCase):
             return m.group(1)
 
         if scale_bits is not None:
+            word = match_result(rf"OpBitcast %uint {value}")
+            neg_zero = match_result(r"OpConstant %uint 2147483648")
+            is_neg_zero = match_result(rf"OpIEqual %bool {word} {neg_zero}")
+            value = match_result(rf"OpSelect %float {is_neg_zero} %f0 {value}")
             const = match_result(rf"OpConstant %uint {scale_bits}")
             scale = match_result(rf"OpBitcast %float {const}")
             value = match_result(rf"OpFMul %float {value} {scale}")

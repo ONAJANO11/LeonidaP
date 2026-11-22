@@ -126,8 +126,8 @@ class HardwareOracle(unittest.TestCase):
         self.assertEqual(ff.hw_verdict(a, [ff.bits(3.0), 0])[0], "match")
         self.assertEqual(ff.hw_verdict(a, [ff.bits(3.0) ^ 1, 0])[0], "mismatch")
         d = self.case("v_ceil_f32", [ff.bits(-0.75)], [(0, {})], ["mul:2"], True)
-        self.assertEqual(ff.hw_verdict(d, [0, 0])[0], "deviation:omod_neg_zero")     # omod: -0 becomes +0
-        self.assertEqual(ff.hw_verdict(d, [0x80000000, 0])[0], "match")
+        self.assertEqual(ff.hw_verdict(d, [0, 0])[0], "match")     # active omod canonicalizes -0
+        self.assertEqual(ff.hw_verdict(d, [0x80000000, 0])[0], "mismatch")
         self.assertEqual(ff.hw_verdict(d, [ff.bits(1.0), 0])[0], "mismatch")
         dn = self.case("v_add_f32", [1, ff.bits(1.0)], [(0, {}), (1, {})])
         self.assertEqual(ff.hw_verdict(dn, [ff.bits(1.0), 0])[0], "skip")

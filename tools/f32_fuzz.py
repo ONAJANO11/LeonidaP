@@ -382,9 +382,11 @@ OMOD = {"mul:2": 2, "mul:4": 4, "div:2": Fraction(1, 2)}
 
 
 def apply_out_mods(r, mods):
-    """VOP3 output modifiers: omod scales the rounded result, then clamp to [0, 1] (NaN -> 0)."""
+    """VOP3 f32 output modifiers: canonicalize -0, scale the rounded result, then clamp if requested."""
     for m in mods:
         if m in OMOD:
+            if r == 0x80000000:
+                r = 0
             if not is_nan(r):
                 r = mul(r, round_f32(Fraction(OMOD[m])))
     if "clamp" in mods:
@@ -1545,6 +1547,7 @@ def self_test():
         (cube("v_cubeid_f32", bits(1.0), bits(-3.0), bits(2.0)), bits(3.0)),
         (cmp_class(0xFFC00000, 1 << 1), 1),
         (apply_out_mods(bits(0.75), ["mul:2", "clamp"]), bits(1.0)),
+        (apply_out_mods(0x80000000, ["div:2"]), 0),
         (round_f32(Fraction(1, 3)), 0x3EAAAAAB),
     ]
     for i, (got, want) in enumerate(checks):

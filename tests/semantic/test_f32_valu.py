@@ -77,6 +77,10 @@ class ReferenceTests(unittest.TestCase):
 
 
 class F32ValuTests(unittest.TestCase):
+    def test_omod_canonicalizes_negative_zero(self):
+        words = support.mrt0_words(support.translate_fixture("ps_f32_omod_zero"))
+        self.assertEqual(words, [0, 0, 0, 0x80000000])
+
     def test_mac_unfused_and_conversion_output_modifiers(self):
         words = support.mrt0_words(support.translate_fixture("ps_f32_mods"))
         for i, (got, want) in enumerate(zip(words, EXPECTED_F32_MODS)):

@@ -42,6 +42,10 @@ class F64ConversionTest(unittest.TestCase):
 
         value = result(r"OpFConvert %float %\w+")
         if scale_bits is not None:
+            word = result(rf"OpBitcast %uint {value}")
+            neg_zero = result(r"OpConstant %uint 2147483648")
+            is_neg_zero = result(rf"OpIEqual %bool {word} {neg_zero}")
+            value = result(rf"OpSelect %float {is_neg_zero} %f0 {value}")
             constant = result(rf"OpConstant %uint {scale_bits}")
             scale = result(rf"OpBitcast %float {constant}")
             value = result(rf"OpFMul %float {value} {scale}")
