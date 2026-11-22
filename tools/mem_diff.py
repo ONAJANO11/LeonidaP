@@ -16,9 +16,9 @@ Addressing modelled (AMD RDNA2 ISA, buffer resource descriptor and MUBUF/SMEM ad
 
 Every generated access lies inside its buffer (index < num_records for structured buffers, the whole access
 below num_records for raw ones) and is dword aligned. Untyped buffer accesses use a word3 with only OOB_SELECT
-(STRUCTURED with a stride, RAW without). Out-of-bounds behaviour, the
-s_buffer_load alignment truncation and swizzling depend on descriptor fields docs/design.md lists as not modelled,
-so they are left to a GPU-confirmed follow-up instead of being guessed here.
+(STRUCTURED with a stride, RAW without), except raw MUBUF descriptors set FORMAT=32_FLOAT to keep access enabled.
+Out-of-bounds behaviour, the s_buffer_load alignment truncation and swizzling depend on descriptor fields
+docs/design.md lists as not modelled, so they are left to a GPU-confirmed follow-up instead of being guessed here.
 
 Typed buffer loads (buffer_load_format_*, tbuffer_load_format_*) are decoded from the GFX10 format names in
 tools/gfx10_formats.json, not from the translator's table. MUBUF applies DST_SEL and repeats missing channels
@@ -365,9 +365,8 @@ def _soffset(rng, prog, budget):
 
 def _emit_vsharp(rng, prog, base, stride, num_records):
     word1 = (base >> 32) & 0xFFFF | (stride & 0x3FFF) << 16
-    # word3: only OOB_SELECT (bits 29:28), the bounds check the accesses stay inside of: STRUCTURED for a stride,
-    # RAW without (the two RADV uses); every generated access is in range under either
-    for i, w in enumerate((base & MASK32, word1, num_records, OOB_STRUCTURED if stride else OOB_RAW)):
+    word3 = RAW_WORD3 | (OOB_STRUCTURED if stride else OOB_RAW)
+    for i, w in enumerate((base & MASK32, word1, num_records, word3)):
         prog.lines.append(f"s_mov_b32 s{VSHARP + i}, {w:#x}")
 
 
@@ -545,6 +544,7 @@ def gen_global(rng, prog):
 TBUFFER_FORMATS = ("16_16_SNORM", "8_8_8_8_UNORM", "8_8_8_8_UINT", "2_10_10_10_UNORM", "16_16_16_16_UINT")
 XYZW = 4 | 5 << 3 | 6 << 6 | 7 << 9
 OOB_STRUCTURED, OOB_RAW = 1 << 28, 3 << 28       # V# word3 OOB_SELECT
+RAW_WORD3 = 1 << 24 | 22 << 12 | XYZW           # RESOURCE_LEVEL, FORMAT 32_FLOAT, DST_SEL xyzw
 
 
 def _typed_codes():
@@ -699,7 +699,8 @@ def self_test():
     """Canaries: a hand-written case matches, and a corrupted reference is caught."""
     prog = Program()
     prog.memory = {0x2000: 0x11111111, 0x2004: 0x22222222, 0x2008: 0x33333333, 0x200C: 0x44444444}
-    prog.lines = ["s_mov_b32 s0, 0x2000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10", "s_mov_b32 s3, 0x30000000",
+    prog.lines = ["s_mov_b32 s0, 0x2000", "s_mov_b32 s1, 0", "s_mov_b32 s2, 0x10",
+                  f"s_mov_b32 s3, {RAW_WORD3 | OOB_RAW:#x}",
                   "v_mov_b32 v2, 4", "buffer_load_dwordx3 v[8:10], v2, s[0:3], 0 offen", "s_waitcnt vmcnt(0)",
                   "v_mov_b32 v11, 7"]
     status, detail = run_one("ps_mem_canary", prog)
