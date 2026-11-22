@@ -3,6 +3,7 @@ import ast
 import contextlib
 import io
 import json
+import re
 import struct
 from pathlib import Path
 import sys
@@ -33,8 +34,8 @@ TOTAL = (len(check.COMPUTE) + 4 + len(check.CS_DUMPS) + len(check.W64X_DUMPS) + 
          + len(check.PIXEL_TESTS) + len(check.CLIP_TESTS) + len(check.BOUNDS) + len(check.GLOBAL_OFFSET)
          + len(check.MIP_TEST_PASSES) + len(check.GRADIENT_TESTS)
          + len(check.STORE_WORDS) + len(check.GET_LOD_TESTS)
-         + len(check.TEXTURE_CONSTANTS) + 10)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures and
-         # ps_ssharp
+         + len(check.TEXTURE_CONSTANTS) + len(check.TEXTURE_MODES)
+         + 11)  # three mesh fixtures, ps_tex, ps_imgatomic, four compute fixtures, ps_ssharp and ps_texture_sample_d16
 CVT = {bits: [u, s] for bits, u, s in check.CVT_F32_SAT_CASES}
 
 
@@ -156,6 +157,8 @@ class Wave64Checks(unittest.TestCase):
                   patch.object(check, "texture_constant_test", return_value=""),
                   patch.object(check, "get_lod_test", return_value=""),
                   patch.object(check, "sampler_test", return_value=""),
+                  patch.object(check, "texture_mode_test", return_value=""),
+                  patch.object(check, "texture_sample_d16_test", return_value=""),
                   contextlib.redirect_stdout(output)):
                 status = check.main()
         return status, output.getvalue()
@@ -610,6 +613,87 @@ class GetLodChecks(unittest.TestCase):
         self.assertIn("exit 1", result)
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(check.get_lod_test(tmp, tmp, "ps_get_lod"), "missing vk_texture_test" + check.EXE)
+
+
+class TextureModeChecks(unittest.TestCase):
+    """The TEXTURE_MODES shaders run vk_texture_test in their mode, from the directory with the shaders."""
+
+    def run_mode(self, answer, name="ps_sample_c_lz"):
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vs_ids", name):
+                (Path(tmp) / f"{shader}.spv").touch()
+            with patch.object(check, "run", return_value=answer) as run:
+                problem = check.texture_mode_test("tools", tmp, name)
+            mode = check.TEXTURE_MODES[name]
+            self.assertEqual(run.call_args.args[1:-1], (mode,) if mode else ())    # then the dump path
+            self.assertEqual(run.call_args.kwargs["cwd"], tmp)
+            self.assertTrue(Path(run.call_args.args[0]).is_absolute())
+        return problem
+
+    def test_passed_is_ok(self):
+        self.assertEqual(self.run_mode((0, "ok -> pixels.raw\nvk_texture_test dref: PASSED (4096 pixels)\n")), "")
+
+    def test_the_default_mode_takes_no_mode_argument(self):
+        # vk_texture_test [out] draws ps_texture_sample; a mode word there would be read as the dump path
+        self.assertEqual(self.run_mode((0, "vk_texture_test: PASSED\n"), name="ps_texture_sample"), "")
+
+    def test_failure_and_missing_passed_fail(self):
+        problem = self.run_mode((1, "vk_texture_test dref: FAILED, 0 pixels wrong in the f32 result and 2048 in the d16"))
+        self.assertNotIsInstance(problem, check.Skip)
+        self.assertIn("FAILED", problem)
+        self.assertTrue(self.run_mode((0, "ok -> pixels.raw\n")))
+
+    def test_unsupported_device_skips(self):
+        problem = self.run_mode((77, "unsupported: no Vulkan physical device\n"))
+        self.assertIsInstance(problem, check.Skip)
+        self.assertIn("no Vulkan physical device", problem)
+
+
+class TextureSampleD16Checks(unittest.TestCase):
+    """ps_texture_sample_d16: every pixel is its gradient texel narrowed to f16 and widened back."""
+
+    @staticmethod
+    def f16(x):
+        return struct.unpack("<e", struct.pack("<e", x))[0]
+
+    def frame(self, damage=None):
+        pixels = [(self.f16(32 * (i % 64 // 8) / 255), self.f16(32 * (i // 64 // 8) / 255), self.f16(128 / 255), 1.0)
+                  for i in range(64 * 64)]
+        if damage is not None:
+            pixels[damage] = (32 * (damage % 64 // 8) / 255,) + pixels[damage][1:]     # f32, not narrowed
+        return b"".join(struct.pack("<4f", *p) for p in pixels)
+
+    def run_d16(self, data, code=0, out=""):
+        def harness(_tool, _vs, _fs, raw, *words, env=None, cwd=None):
+            self.words = words
+            if data is not None:
+                Path(raw).write_bytes(data)
+            return code, out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for shader in ("vs_ids", "ps_texture_sample_d16"):
+                (Path(tmp) / f"{shader}.spv").touch()
+            with patch.object(check, "run", side_effect=harness):
+                return check.texture_sample_d16_test("tools", tmp)
+
+    def test_narrowed_frame_passes(self):
+        self.assertEqual(self.run_d16(self.frame()), "")
+
+    def test_an_unnarrowed_texel_fails(self):
+        problem = self.run_d16(self.frame(damage=64 * 40 + 9))
+        self.assertIn("1/4096 mismatches; at (9,40)", problem)
+
+    def test_unsupported_device_skips(self):
+        self.assertIsInstance(self.run_d16(None, 77, "unsupported: no Vulkan physical device\n"), check.Skip)
+
+    def test_binds_the_sampler_the_shader_names(self):
+        # vk_texture_test registers the words after ptr_sgpr as sampler 1: they must be the S# the shader builds in
+        # s[16:19], or the draw samples fallback sampler 0
+        asm = (Path(check.__file__).parent / "ps_texture_sample_d16.asm").read_text()
+        built = dict(re.findall(r"s_mov_b32 s(1[6-9]), (\w+)", asm))
+        self.assertEqual(check.D16_SAMPLER, tuple(f"{int(built[str(r)], 0):x}" for r in range(16, 20)))
+        self.run_d16(self.frame())
+        self.assertEqual(self.words, ("0",) + check.D16_SAMPLER)
 
 
 class TexelOffsetChecks(unittest.TestCase):

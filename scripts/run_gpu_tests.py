@@ -32,6 +32,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PRO
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
+from check import D16_SAMPLER, check_d16_texture   # ps_texture_sample_d16, drawn and judged as in check.py
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -469,24 +470,6 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     if not n80:
         return False, "no bit=0 pixel got s5=8: the branch was decided per lane, not by the wave; " + detail
     return (n8 - n80 > 0 and n7 > 0), detail
-
-
-def check_d16_texture(raw_path: str) -> tuple[bool, str]:
-    """Point-sample the 8x8 UNORM gradient and round each component to binary16 before widening."""
-    data = Path(raw_path).read_bytes()
-    if len(data) != 64 * 64 * 16:
-        return False, f"expected a 64x64 RGBA32F frame, got {len(data)} bytes"
-    levels = [struct.unpack("<e", struct.pack("<e", i * 32 / 255.0))[0] for i in range(8)]
-    bad = 0
-    first = ""
-    for i, pixel in enumerate(struct.iter_unpack("<4f", data)):
-        x, y = i % 64, i // 64
-        expected = (levels[x // 8], levels[y // 8], levels[4], 1.0)
-        if pixel != expected:
-            if not bad:
-                first = f"at ({x},{y}): got {pixel}, want {expected}"
-            bad += 1
-    return (False, f"{bad}/4096 mismatches; {first}") if bad else (True, "4096/4096 RGBA pixels exact")
 
 
 def check_grad(raw_path: str, want_b: float, want_a: float) -> tuple[bool, str]:
@@ -1004,7 +987,7 @@ def run_suite(a, work: str) -> int:
             raw = os.path.join(raw_dir, f"{name}.raw")
             if name == "ps_texture_sample_d16":
                 Path(raw).unlink(missing_ok=True)
-                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", "0", "0", "0", "0"]
+                cmd = [tool, os.path.join(spirv_dir, "vs_ids.spv"), spv, raw, "0", *D16_SAMPLER]
             else:
                 mode = {"ps_cube_sample": ["cube"], "ps_sample_c_lz": ["dref"],
                         "ps_sample_c_lz_a16": ["dref_a16"]}.get(name, [])
