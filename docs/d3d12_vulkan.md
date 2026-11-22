@@ -380,7 +380,8 @@ What is implemented (all of it testable without the game):
     | `CreateCommandQueue1`'s creator ID | ignored |
 
     `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
-    remains a stub.
+    wraps `CreateHeap`: the PC runtime answers both alike without a session (measured on an RX 5700 and WARP), and a
+    session is refused as above.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
     take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
@@ -896,7 +897,9 @@ and any validation error fails them.
   one; protected sessions are checked on the layer alone, and castable lists have their own success/refusal
   checks. `GetCopyableFootprints1` must match `GetCopyableFootprints` field by field, including the failure
   answer. A texture from `CreateCommittedResource3`
-  is uploaded, copied back and compared on a queue from `CreateCommandQueue1`.
+  is uploaded, copied back and compared on a queue from `CreateCommandQueue1`. On a standalone device (heaps need
+  the GPU address arena), `CreateHeap1` must give `CreateHeap`'s answer and description for six heaps (one
+  refused), the host runtime's answers when there is one, `S_FALSE` for a null output, and refuse a session.
 - `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
   - 10 descriptions without flags, which must be byte for byte the same;
   - 6 UINT and float-bit border colours against their float equivalents (the three built-in UINT colours with

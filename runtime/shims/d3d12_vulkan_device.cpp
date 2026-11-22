@@ -4161,7 +4161,7 @@ public:
                                                        ID3D12ProtectedResourceSession* session, REFIID riid,
                                                        void** out) override {
         if (out) *out = nullptr;
-        if (session) return refuse_protected_session(1);
+        if (session) return refuse_protected_session("CreateCommittedResource", 1);
         return CreateCommittedResource(heap, heap_flags, desc, state, clear, riid, out);
     }
 
@@ -4172,7 +4172,7 @@ public:
                                                        void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        if (session) return refuse_protected_session(2);
+        if (session) return refuse_protected_session("CreateCommittedResource", 2);
         if (texture_mip_region(*desc)) return E_INVALIDARG;
         const D3D12_RESOURCE_DESC base = resource_desc(*desc);
         return CreateCommittedResource(heap, heap_flags, &base, state, clear, riid, out);
@@ -4185,7 +4185,7 @@ public:
                                                        const DXGI_FORMAT* castable, REFIID riid, void** out) override {
         if (out) *out = nullptr;
         if (!desc) return E_INVALIDARG;
-        if (session) return refuse_protected_session(3);
+        if (session) return refuse_protected_session("CreateCommittedResource", 3);
         if (texture_mip_region(*desc)) return E_INVALIDARG;
         // Enhanced barriers: a buffer has no layout, so its initial layout must be UNDEFINED.
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && layout != D3D12_BARRIER_LAYOUT_UNDEFINED)
@@ -4237,6 +4237,15 @@ public:
             return S_FALSE;
         }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4. CreateHeap with a protected session; the PC runtime answers both alike without one. A session is
+    // refused as CreateCommittedResource1-3 refuse it, since the layer reports no protected-session support.
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) return refuse_protected_session("CreateHeap", 1);
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
@@ -5397,9 +5406,10 @@ private:
     }
 
     // The layer reports no protected-session support, so a session is refused, as D3D12 refuses one on a device
-    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT. `variant` is the method's number.
-    static HRESULT refuse_protected_session(int variant) {
-        log_once("protected resource session refused (not supported) by CreateCommittedResource", variant);
+    // without D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT. `method` and `variant` name the method (variant 1 of
+    // CreateHeap is CreateHeap1).
+    static HRESULT refuse_protected_session(const char* method, int variant) {
+        log_once((std::string("protected resource session refused (not supported) by ") + method).c_str(), variant);
         return E_INVALIDARG;
     }
 

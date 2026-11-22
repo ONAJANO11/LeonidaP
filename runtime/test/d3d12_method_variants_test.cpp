@@ -518,12 +518,79 @@ int main() {
             for (const UINT64 base : {UINT64(0), UINT64(1024)})
                 EXPECT(same_footprints(device.p, &f.desc, f.first, f.count, base));
         EXPECT(same_footprints(device.p, nullptr, 0, 1, 0));
+
+        // CreateHeap1 against CreateHeap, on a device of its own: heaps need the GPU address arena, which the device
+        // above is not made with (they answer E_NOTIMPL there). The same answer for each description, the same
+        // description back from a created heap, a protected session refused with nothing handed out, and the PC
+        // runtime's answers where the host has a D3D12 device: it answers CreateHeap1 as CreateHeap for each of
+        // these (measured on an RX 5700 and WARP).
+        {
+            Ref<ID3D12Device> standalone;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
+            Ref<ID3D12Device4> heaps_device;
+            EXPECT(SUCCEEDED(standalone->QueryInterface(IID_PPV_ARGS(&heaps_device.p))));
+            const auto heap_desc = [](UINT64 size, D3D12_HEAP_TYPE type, UINT64 alignment, D3D12_HEAP_FLAGS flags) {
+                D3D12_HEAP_DESC desc{};
+                desc.SizeInBytes = size;
+                desc.Properties.Type = type;
+                desc.Alignment = alignment;
+                desc.Flags = flags;
+                return desc;
+            };
+            const D3D12_HEAP_DESC heaps[] = {
+                heap_desc(65536, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
+                heap_desc(1000, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
+                heap_desc(4u << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
+                          D3D12_HEAP_FLAG_NONE),
+                heap_desc(65536, D3D12_HEAP_TYPE_UPLOAD, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+                heap_desc(65536, D3D12_HEAP_TYPE_READBACK, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+                heap_desc(0, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
+            };
+            const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
+                                                 reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                           : nullptr;
+            Ref<ID3D12Device4> host;
+            if (!create_host || FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
+                std::printf("no host D3D12 device: CreateHeap1 checked against CreateHeap only\n");
+            for (const D3D12_HEAP_DESC& desc : heaps) {
+                Ref<ID3D12Heap> base, variant;
+                const HRESULT want = heaps_device->CreateHeap(&desc, IID_PPV_ARGS(&base.p));
+                const HRESULT got = heaps_device->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&variant.p));
+                EXPECT(got == want);
+                EXPECT(!variant.p == !base.p);
+                if (host.p) {
+                    Ref<ID3D12Heap> theirs;
+                    const HRESULT host_answer = host->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&theirs.p));
+                    if (host_answer != got) {
+                        std::fprintf(stderr, "CreateHeap1 of %llu bytes: ours %08lx, host runtime %08lx\n",
+                                     static_cast<unsigned long long>(desc.SizeInBytes), got, host_answer);
+                        return 1;
+                    }
+                }
+                if (!variant.p) continue;
+                const D3D12_HEAP_DESC back = variant->GetDesc();
+                EXPECT(back.SizeInBytes == desc.SizeInBytes && back.Properties.Type == desc.Properties.Type &&
+                       back.Flags == desc.Flags);
+            }
+            const auto null_output = [&](ID3D12Device4* on) {
+                return on->CreateHeap1(&heaps[0], nullptr, __uuidof(ID3D12Heap), nullptr);
+            };
+            EXPECT(null_output(heaps_device.p) == S_FALSE);
+            EXPECT(!host.p || null_output(host.p) == S_FALSE);
+            EXPECT(heaps_device->CreateHeap1(nullptr, nullptr, __uuidof(ID3D12Heap), nullptr) ==
+                   heaps_device->CreateHeap(nullptr, __uuidof(ID3D12Heap), nullptr));
+            void* out = reinterpret_cast<void*>(1);
+            EXPECT(heaps_device->CreateHeap1(&heaps[0], fake_session(), __uuidof(ID3D12Heap), &out) == E_INVALIDARG);
+            EXPECT(out == nullptr);
+        }
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("D3D12 method variants: CreateCommittedResource1/2/3, CreateCommandQueue1 and GetCopyableFootprints1 "
-                "matched their base methods and the PC runtime's edge-case answers; a texture round-tripped\n");
+    std::printf("D3D12 method variants: CreateCommittedResource1/2/3, CreateCommandQueue1, GetCopyableFootprints1 and "
+                "CreateHeap1 matched their base methods and the PC runtime's edge-case answers; a texture "
+                "round-tripped\n");
     return 0;
 }
