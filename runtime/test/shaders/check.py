@@ -131,6 +131,28 @@ CVT_F32_SAT_CASES = (
     (0x4F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xCEFFFFFF, 0, 0x80000080), (0xCF000000, 0, 0x80000000),
     (0xCF000001, 0, 0x80000000), (0x7F800000, 0xFFFFFFFF, 0x7FFFFFFF), (0xFF800000, 0, 0x80000000),
     (0x7F800001, 0, 0), (0xFFC00000, 0, 0))
+# cs_f32_specials.asm: s4 is a binary32 input, out[0..5] = rcp, rsq, sqrt, log, exp, rcp_iflag.
+# Expected values are exact hex words, "nan" (any binary32 NaN), or None (approximate normal value not checked here).
+F32_SPECIAL_CASES = (
+    (0x00000000, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),  # +0
+    (0x80000000, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),  # -0
+    (0x00000001, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),  # +denorm min
+    (0x80000001, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),  # -denorm min
+    (0x007FFFFF, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),  # +denorm max
+    (0x807FFFFF, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),  # -denorm max
+    (0x7F7FFFFF, (0x00000000, None, None, None, 0x7F800000, 0x00000000)),                    # +FLT_MAX
+    (0xFF7FFFFF, (0x80000000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, 0x80000000)),  # -FLT_MAX
+    (0xC2FE0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, None)),              # -127.0
+    (0xC2FD0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, None)),              # -126.5 (denormal exp result flushed)
+    (0xC2FC0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00800000, None)),              # -126.0 (FLT_MIN kept)
+    (0x43000000, (0x3C000000, None, None, 0x40E00000, 0x7F800000, 0x3C000000)),              # 128.0
+    (0x40800000, (0x3E800000, 0x3F000000, 0x40000000, 0x40000000, 0x41800000, 0x3E800000)),  # 4.0
+    (0xBF800000, (0xBF800000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x3F000000, 0xBF800000)),  # -1.0
+    (0x7F800000, (0x00000000, 0x00000000, 0x7F800000, 0x7F800000, 0x7F800000, 0x00000000)),  # +inf
+    (0xFF800000, (0x80000000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, 0x80000000)),  # -inf
+    (0x7FC10001, ("nan", "nan", "nan", "nan", "nan", "nan")),                                # +qNaN
+    (0xFFC20002, ("nan", "nan", "nan", "nan", "nan", "nan")),                                # -qNaN
+)
 # Cross-half wave64 tests (x = cross-half): exact results need 64 lanes, or an emulation of them on narrower subgroups.
 W64_EMULATED = os.environ.get("LEONIDA_W64_EMULATE") == "1"
 # LEONIDA_BARY_FALLBACK=1 (set for build.py too): a pixel shader that reads raw barycentrics was translated with
@@ -408,6 +430,38 @@ def cvt_f32_sat_test(tools, spirv):
         if problem:
             wrong.append(f"{bits:#010x}: {problem}")
     return f"{len(wrong)} of {len(CVT_F32_SAT_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
+
+
+def f32_specials_match(words, wants):
+    """True when out[0..5] satisfy every non-None expectation in F32_SPECIAL_CASES and rcp == rcp_iflag."""
+    if len(words) < 6:
+        return False
+    if words[0] != words[5]:
+        return False
+    for got, want in zip(words[:6], wants):
+        if want is None:
+            continue
+        if want == "nan":
+            if not ((got & 0x7F800000) == 0x7F800000 and (got & 0x7FFFFF) != 0):
+                return False
+        elif got != want:
+            return False
+    return True
+
+
+def f32_specials_test(tools, spirv):
+    """cs_f32_specials once per input of F32_SPECIAL_CASES: empty string when every special and flush matches."""
+    shader = os.path.join(spirv, "cs_f32_specials.spv")
+    wrong = []
+    for bits, wants in F32_SPECIAL_CASES:
+        code, out = run(os.path.join(tools, "vk_compute_test" + EXE), shader, "1", "dump",
+                        env=dict(os.environ, VKC_SGPRS=f"{bits:#010x}"))
+        m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", out, re.MULTILINE)
+        words = [int(x) for x in m.group(1).split()] if m else []
+        if code != 0 or not f32_specials_match(words, wants):
+            got = " ".join(hex(w) for w in words[:6]) if words else (failure(code, out, 2) or "no output")
+            wrong.append(f"{bits:#010x} gave {got}")
+    return f"{len(wrong)} of {len(F32_SPECIAL_CASES)} inputs wrong, first {wrong[0]}" if wrong else ""
 
 
 def mesh_w64x_test(tools, spirv, name):
@@ -739,6 +793,7 @@ def main():
     results.append(("cs_user_sgprs", compute_test(tools, spirv, "cs_user_sgprs", "1", "dump",
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
+    results.append(("cs_f32_specials", f32_specials_test(tools, spirv)))
     for name, want in W64X_DUMPS:   # without --require-wave64 when LEONIDA_W64_EMULATE=1
         results.append((name, compute_test(tools, spirv, name, "1", "dump", require_wave64=not W64_EMULATED,
                                            expected_words=want)))

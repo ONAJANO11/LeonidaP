@@ -167,6 +167,7 @@ class Gen:
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
+        self.f32_fns = {}     # kind -> lines of shared f32 transcendental helper function (rcp/rsq/sqrt/log/exp)
         self.sgpr_imm = {}    # SGPR -> literal an s_mov_b32 put there earlier in this basic block (see gather_addr_modes)
         self.desc_cache = {}  # (first SGPR, dwords) -> id of the %desc_lookup_fn result in the current basic block
         self._scan = (None, 0, [])   # (body list, lines already seen, open merge labels): see desc_cache_ok
@@ -2428,6 +2429,127 @@ class Gen:
         self.emit(f"{r} = OpSelect %float {small} {z} {f}")
         return r
 
+    _F32_SPECIAL_OPS = {
+        "rcp": "rcp",
+        "InverseSqrt": "rsq",
+        "Sqrt": "sqrt",
+        "Log2": "log",
+        "Exp2": "exp",
+    }
+
+    def f32_transcendental_call(self, kind, x):
+        """Emit one shared OpFunction per op kind (rcp/rsq/sqrt/log/exp) and return OpFunctionCall result.
+
+        v_rcp_f32, v_rcp_iflag_f32 (kind='rcp'), v_rsq_f32, v_sqrt_f32, v_log_f32 and v_exp_f32 flush
+        denormal inputs and results to signed zero, avoid undefined SPIR-V inputs on OpFDiv/InverseSqrt/Sqrt/
+        Log2/Exp2, and return RDNA2 special words (+-inf, +-0, 0xffc00000 on negative inputs). Sharing one
+        function per op keeps call sites to one ID (#881)."""
+        if kind not in self.f32_fns:
+            fn_id = f"%f32_{kind}_fn"
+            prm = f"%f32_{kind}_x"
+            lbl = f"%f32_{kind}_entry"
+            saved, self.body = self.body, []
+            res = self._emit_f32_transcendental_body(kind, prm)
+            lines, self.body = self.body, saved
+            self.f32_fns[kind] = (
+                [f"{fn_id} = OpFunction %float None %fn_f32_unary",
+                 f"{prm} = OpFunctionParameter %float",
+                 f"{lbl} = OpLabel"] +
+                lines +
+                [f"         OpReturnValue {res}", "OpFunctionEnd"]
+            )
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %float %f32_{kind}_fn {x}")
+        return r
+
+    def _emit_f32_transcendental_body(self, kind, f_in):
+        # Integer bit classification keeps zero/denormal/inf/NaN exact regardless of driver float controls.
+        u = self.tou(f_in)
+        c_sign = self.cu(0x80000000)
+        c_abs = self.cu(0x7FFFFFFF)
+        c_min = self.cu(0x00800000)
+        c_inf = self.cu(0x7F800000)
+
+        sign, absu = self.tmp(), self.tmp()
+        self.emit(f"{sign} = OpBitwiseAnd %uint {u} {c_sign}")
+        self.emit(f"{absu} = OpBitwiseAnd %uint {u} {c_abs}")
+
+        is_neg, is_sub, is_inf, is_nan = (self.tmp() for _ in range(4))
+        self.emit(f"{is_neg} = OpINotEqual %bool {sign} {self.cu(0)}")
+        self.emit(f"{is_sub} = OpULessThan %bool {absu} {c_min}")
+        self.emit(f"{is_inf} = OpIEqual %bool {absu} {c_inf}")
+        self.emit(f"{is_nan} = OpUGreaterThan %bool {absu} {c_inf}")
+
+        fx_u = self.tmp()
+        self.emit(f"{fx_u} = OpSelect %uint {is_sub} {sign} {u}")
+        fx = self.tof(fx_u)
+
+        if kind == "exp":
+            ge128, le_m127, sp0, sp = (self.tmp() for _ in range(4))
+            self.emit(f"{ge128} = OpFOrdGreaterThanEqual %bool {fx} {self.fconst(128.0)}")
+            self.emit(f"{le_m127} = OpFOrdLessThanEqual %bool {fx} {self.fconst(-127.0)}")
+            self.emit(f"{sp0} = OpLogicalOr %bool {ge128} {le_m127}")
+            self.emit(f"{sp} = OpLogicalOr %bool {sp0} {is_nan}")
+            safe_x = self.tmp()
+            self.emit(f"{safe_x} = OpSelect %float {sp} %f0 {fx}")
+            raw = self.tmp()
+            self.emit(f"{raw} = OpExtInst %float %glsl Exp2 {safe_x}")
+        else:
+            bad0, bad1 = self.tmp(), self.tmp()
+            self.emit(f"{bad0} = OpLogicalOr %bool {is_sub} {is_inf}")
+            self.emit(f"{bad1} = OpLogicalOr %bool {bad0} {is_nan}")
+            if kind != "rcp":
+                bad2 = self.tmp()
+                self.emit(f"{bad2} = OpLogicalOr %bool {bad1} {is_neg}")
+                skip = bad2
+            else:
+                skip = bad1
+            safe_x = self.tmp()
+            self.emit(f"{safe_x} = OpSelect %float {skip} %f1 {fx}")
+            raw = self.tmp()
+            if kind == "rcp":
+                self.emit(f"{raw} = OpFDiv %float %f1 {safe_x}")
+            else:
+                gname = {"rsq": "InverseSqrt", "sqrt": "Sqrt", "log": "Log2"}[kind]
+                self.emit(f"{raw} = OpExtInst %float %glsl {gname} {safe_x}")
+
+        ru, rsign, rabsu, rsub, out = (self.tmp() for _ in range(5))
+        self.emit(f"{ru} = OpBitcast %uint {raw}")
+        self.emit(f"{rsign} = OpBitwiseAnd %uint {ru} {c_sign}")
+        self.emit(f"{rabsu} = OpBitwiseAnd %uint {ru} {c_abs}")
+        self.emit(f"{rsub} = OpULessThan %bool {rabsu} {c_min}")
+        self.emit(f"{out} = OpSelect %uint {rsub} {rsign} {ru}")
+
+        def sel(cond, val_u, cur):
+            nxt = self.tmp()
+            self.emit(f"{nxt} = OpSelect %uint {cond} {val_u} {cur}")
+            return nxt
+
+        if kind == "rcp":
+            signed_inf = self.tmp()
+            self.emit(f"{signed_inf} = OpBitwiseOr %uint {sign} {c_inf}")
+            out = sel(is_inf, sign, out)
+            out = sel(is_sub, signed_inf, out)
+        elif kind == "exp":
+            out = sel(ge128, c_inf, out)
+            out = sel(le_m127, self.cu(0), out)
+        else:
+            c_inv = self.cu(0xFFC00000)
+            inf_out = self.cu(0) if kind == "rsq" else c_inf
+            out = sel(is_inf, inf_out, out)
+            out = sel(is_neg, c_inv, out)
+            if kind == "rsq":
+                zero_out = self.tmp()
+                self.emit(f"{zero_out} = OpBitwiseOr %uint {sign} {c_inf}")
+            elif kind == "sqrt":
+                zero_out = sign
+            else:
+                zero_out = self.cu(0xFF800000)
+            out = sel(is_sub, zero_out, out)
+
+        out = sel(is_nan, u, out)
+        return self.tof(out)
+
     def clamp_mods_f64(self, v, mods):
         """clamp_mods for a %double result (VOP3 f64 arithmetic): omod scales first, then clamp to [0, 1]. As
         for f32 the clamp is GLSL.std.450 FClamp, so a NaN result and the sign of a -0 result are left to the
@@ -4592,8 +4714,7 @@ class Gen:
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rcp_iflag_f32":
             x = self.src_f(a[1])
-            r = self.tmp()
-            self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            r = self.f32_transcendental_call("rcp", x)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F2:
             x, y = self.src_f(a[1]), self.src_f(a[2])
@@ -4625,10 +4746,11 @@ class Gen:
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F1:
             x = self.src_f(a[1])
-            r = self.tmp()
-            if F1[op] == "rcp":
-                self.emit(f"{r} = OpFDiv %float %f1 {x}")
+            kind = self._F32_SPECIAL_OPS.get(F1[op])
+            if kind is not None:
+                r = self.f32_transcendental_call(kind, x)
             else:
+                r = self.tmp()
                 self.emit(f"{r} = OpExtInst %float %glsl {F1[op]} {x}")
                 if F1[op] == "Fract":
                     r = self.fract_below_one(r)
@@ -6693,6 +6815,8 @@ def assemble(gen):
     if gen.fmt_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
         types.append("%fn_fmt_decode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 5))
+    if gen.f32_fns:
+        types.append("%fn_f32_unary = OpTypeFunction %float %float")
     if gen.uses_ballot:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
@@ -6973,7 +7097,8 @@ def assemble(gen):
                    f"OpStore %vinp{reg}_{c} %vinb{reg}_{c}"]
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
+    f32_fns = [l for k in sorted(gen.f32_fns) for l in gen.f32_fns[k]]
+    out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + f32_fns + fn
     tree = cfg_structure.structure(gen.succ) if gen.blocks and STRUCTURED and not gen.emulate else None
     gen.control_flow = "structured" if tree is not None else "dispatch loop" if gen.blocks else "straight line"
     if gen.emulate:
@@ -7048,7 +7173,7 @@ def assemble(gen):
         fn = fn[:last_var + 1] + fn_vars + fn[last_var + 1:]
         if pops:
             fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
-        out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + fn
+        out = hdr + dec + types + gvars + (gen.desc_fn or []) + (gen.fmt_fn or []) + f32_fns + fn
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if ms:

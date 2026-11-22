@@ -15,6 +15,7 @@ hand and recomputed by the plain-Python references in ReferenceTests, which use 
 interpreter.
 """
 import math
+import re
 import struct
 import unittest
 from fractions import Fraction
@@ -193,6 +194,91 @@ class InterpreterFloatOpTests(unittest.TestCase):
         self.assertEqual(run_bool("%b = OpIsNan %bool %inf\n"), 0)
         self.assertEqual(run_bool("%b = OpIsInf %bool %ninf\n"), 1)
         self.assertEqual(run_bool("%b = OpIsInf %bool %f1\n"), 0)
+
+
+class F32TranscendentalSpecialTests(unittest.TestCase):
+    """Denormal flush and special results for v_rcp/rsq/sqrt/log/exp/rcp_iflag (docs/design.md)."""
+
+    def _run_six(self, word):
+        # s4..s7 unused; load from V# in s[0:3] -> 0x1000 and compute all 6 ops + v_rcp_iflag_f32 mul:2.
+        spv = support.translate_lines("ps_f32_spec", [
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v0, s4",
+            "v_rcp_f32_e32 v1, v0",
+            "v_rsq_f32_e32 v2, v0",
+            "v_sqrt_f32_e32 v3, v0",
+            "v_log_f32_e32 v4, v0",
+            "exp mrt0 v1, v2, v3, v4 done",
+            "v_exp_f32_e32 v5, v0",
+            "v_rcp_iflag_f32_e32 v6, v0",
+            "v_rcp_f32_e64 v7, v0 mul:2",
+            "v_rcp_iflag_f32_e64 v8, v0 mul:2",
+            "exp mrt1 v5, v6, v7, v8 done vm",
+            "s_endpgm",
+        ])
+        out = si.run_fragment(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28, memory={0x1000: word})
+        return tuple(out["%out_mrt0"]) + tuple(out["%out_mrt1"])
+
+    def test_denormal_flush_and_specials(self):
+        cases = (
+            # word -> (rcp, rsq, sqrt, log, exp, rcp_iflag)
+            (0x00000000, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),
+            (0x80000000, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),
+            (0x00000001, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),
+            (0x80000001, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),
+            (0x007FFFFF, (0x7F800000, 0x7F800000, 0x00000000, 0xFF800000, 0x3F800000, 0x7F800000)),
+            (0x807FFFFF, (0xFF800000, 0xFF800000, 0x80000000, 0xFF800000, 0x3F800000, 0xFF800000)),
+            (0x7F7FFFFF, (0x00000000, None, None, None, 0x7F800000, 0x00000000)),
+            (0xFF7FFFFF, (0x80000000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, 0x80000000)),
+            (0xC2FE0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, None)),
+            (0xC2FD0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, None)),
+            (0xC2FC0000, (None, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00800000, None)),
+            (0x43000000, (0x3C000000, None, None, 0x40E00000, 0x7F800000, 0x3C000000)),
+            (0x40800000, (0x3E800000, 0x3F000000, 0x40000000, 0x40000000, 0x41800000, 0x3E800000)),
+            (0xBF800000, (0xBF800000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x3F000000, 0xBF800000)),
+            (0x7F800000, (0x00000000, 0x00000000, 0x7F800000, 0x7F800000, 0x7F800000, 0x00000000)),
+            (0xFF800000, (0x80000000, 0xFFC00000, 0xFFC00000, 0xFFC00000, 0x00000000, 0x80000000)),
+        )
+        for word, wants in cases:
+            with self.subTest(word=f"{word:#010x}"):
+                res = self._run_six(word)
+                self.assertEqual(res[0], res[5])
+                self.assertEqual(res[6], res[7])
+                for idx, (got, want) in enumerate(zip(res[:6], wants)):
+                    if want is not None:
+                        self.assertEqual(f"{got:#010x}", f"{want:#010x}", f"op[{idx}] on {word:#010x}")
+        # Negative normal inputs must clamp output modifiers when invalid (0xffc00000 -> clamp -> 0) and keep NaN.
+        for nan_word in (0x7FC10001, 0xFFC20002):
+            res = self._run_six(nan_word)
+            self.assertEqual(res[0], res[5])
+            for idx in range(6):
+                self.assertTrue((res[idx] & 0x7F800000) == 0x7F800000 and (res[idx] & 0x7FFFFF) != 0,
+                                f"op[{idx}] on {nan_word:#010x} gave {res[idx]:#010x}")
+
+    def test_sabotage_detection(self):
+        spv = support.translate_lines("ps_f32_sab", [
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0",
+            "s_waitcnt lgkmcnt(0)",
+            "v_mov_b32_e32 v0, s4",
+            "v_rcp_f32_e32 v1, v0",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ])
+        self.assertEqual(
+            si.run_fragment(spv, push_constants=[0x1000, 0, 16, 0] + [0] * 28, memory={0x1000: 0x7F7FFFFF})["%out_mrt0"][0],
+            0,
+        )
+        # Replacing %f32_rcp_fn's final OpReturnValue operand with raw OpFDiv result exposes un-flushed subnormal on FLT_MAX.
+        m = re.search(r"^\s*(%\w+) = OpFDiv %float %f1 %\w+$", spv, re.M)
+        self.assertIsNotNone(m)
+        bad = re.sub(r"OpReturnValue %\w+\n\s*OpFunctionEnd",
+                     f"OpReturnValue {m.group(1)}\nOpFunctionEnd", spv, count=1)
+        self.assertNotEqual(bad, spv)
+        self.assertNotEqual(
+            si.run_fragment(bad, push_constants=[0x1000, 0, 16, 0] + [0] * 28, memory={0x1000: 0x7F7FFFFF})["%out_mrt0"][0],
+            0,
+        )
 
 
 if __name__ == "__main__":

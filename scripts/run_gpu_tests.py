@@ -26,8 +26,9 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import Skip, clip_test, fmt_1010102_test
 from compute_fixture import compute_header
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, F32_SPECIAL_CASES, GRADIENT_TESTS, TEST_PROGRAMS,
+                   TEXTURE_MIP_DEPENDENCIES, TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, GATHER_WRAP,
+                   USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, f32_specials_match, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import gpu_test_timeout, timed_out   # per-program time limit (LEONIDA_GPU_TEST_TIMEOUT)
@@ -695,6 +696,18 @@ def run_suite(a, work: str) -> int:
                     got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
+            results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
+                            else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+        elif name == "cs_f32_specials":
+            wrong = []
+            for bits, wants in F32_SPECIAL_CASES:
+                rc, msg = run_cmd([vk_compute, spv, "1", "dump"],
+                                  env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
+                words = dump_words(msg)
+                if rc != 0 or not f32_specials_match(words, wants):
+                    got = " ".join(hex(x) for x in words[:6]) if words else msg.splitlines()[-1] if msg else "no output"
+                    wrong.append(f"{bits:#010x} gave {got}")
+            n = len(F32_SPECIAL_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
                             else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
         elif name == "cs_wavemask":

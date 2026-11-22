@@ -1204,3 +1204,40 @@ def test_wave64_scmp_mask_halves_and_scalars_validate(emulate, make_shader, monk
         assert "OpGroupNonUniform" not in spv
     else:
         assert "OpGroupNonUniformBitwiseOr" in spv
+
+
+def test_f32_transcendental_helpers_reuse_and_validate(make_shader, monkeypatch):
+    """All six f32 transcendental ops emit one shared OpFunction helper per op kind and validate across CFGs."""
+    body = "".join(
+        "v_rcp_f32 v0, v1\nv_rcp_iflag_f32 v2, v0\nv_rsq_f32 v3, v2\n"
+        "v_sqrt_f32 v4, v3\nv_log_f32 v5, v4\nv_exp_f32 v1, v5\n"
+        for _ in range(15)
+    )
+    shader = make_shader(program(body), name="ps_f32_transcendental_reuse")
+    spv = shader.translate()
+    shader.validate(spv)
+    fns = re.findall(r"^(%\w+) = OpFunction %float None %fn_f32_unary$", spv, re.M)
+    assert len(fns) == 5  # rcp + rcp_iflag share one helper
+    calls = re.findall(r"OpFunctionCall %float %f32_\w+_fn ", spv)
+    assert len(calls) == 15 * 6
+
+    cs_asm = (
+        "; mattr: +wavefrontsize64,-wavefrontsize32\n"
+        "v_mov_b32 v1, s4\n"
+        "s_cmp_eq_u32 s5, 0\n"
+        "s_cbranch_scc0 3\n"
+        "v_rcp_f32 v2, v1\n"
+        "v_sqrt_f32 v3, v1\n"
+        "s_branch 2\n"
+        "v_rsq_f32 v2, v1\n"
+        "v_log_f32 v3, v1\n"
+        "v_readfirstlane_b32 s6, v2\n"
+        "v_exp_f32 v4, v2\n"
+        "v_rcp_iflag_f32 v5, v3\n"
+        "s_endpgm\n"
+    )
+    cs_shader = make_shader(cs_asm, name="cs_f32_transcendental_w64")
+    monkeypatch.setattr(rdna2spirv, "WAVE64_EMULATE", True)
+    spv_emu = cs_shader.translate()
+    cs_shader.validate(spv_emu)
+    assert len(re.findall(r"^(%\w+) = OpFunction %float None %fn_f32_unary$", spv_emu, re.M)) == 5
